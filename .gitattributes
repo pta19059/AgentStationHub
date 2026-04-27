@@ -1,0 +1,67 @@
+# =============================================================================
+# AgentStationHub - repo-wide line ending + encoding policy.
+#
+# Why this file exists:
+#   Windows editors default to CRLF and Windows-1252. Linux containers
+#   (Docker, WSL, CI) choke on both: the kernel fails to locate the
+#   interpreter referenced by '#!/usr/bin/env bash\r' with a carriage
+#   return, and YAML/JSON parsers reject non-UTF-8 bytes. Enforcing the
+#   line endings here — checked in LF, checked out LF on all platforms —
+#   prevents the "works on my Windows machine, breaks in Docker" cycle.
+# =============================================================================
+
+# 1) Default: let git detect text vs binary. Most files.
+* text=auto eol=lf
+
+# 2) Shell scripts and anything an in-container shebang touches MUST be LF.
+#    A single CR before 'bash' breaks the whole container boot.
+*.sh           text eol=lf
+entrypoint.sh  text eol=lf
+
+# 3) YAML / JSON / TOML / INI — parsers in Go/Python/Rust tooling are
+#    strict about UTF-8 encoding and often dislike CRLF in multi-line
+#    strings. Pin them to LF.
+*.yml          text eol=lf
+*.yaml         text eol=lf
+*.json         text eol=lf
+*.toml         text eol=lf
+*.ini          text eol=lf
+
+# 4) Dockerfile is parsed line-by-line by buildkit; CRLF is tolerated
+#    but forces extra 'sed -i' workarounds (see Dockerfile). Normalise.
+Dockerfile     text eol=lf
+*.dockerfile   text eol=lf
+.dockerignore  text eol=lf
+
+# 5) PowerShell + C# are Windows-native, LF is still preferred (cross-
+#    platform tooling is happier) and PS + VS read both fine.
+*.ps1          text eol=lf
+*.psm1         text eol=lf
+*.psd1         text eol=lf
+*.cs           text eol=lf
+*.csproj       text eol=lf
+*.razor        text eol=lf
+*.cshtml       text eol=lf
+
+# 6) Batch / cmd must keep CRLF — Windows' cmd.exe is the one parser on
+#    Earth that actually requires it.
+*.bat          text eol=crlf
+*.cmd          text eol=crlf
+
+# 7) Markdown is LF everywhere; avoids the "trailing-whitespace renders
+#    as line break under CRLF" headache.
+*.md           text eol=lf
+
+# 8) Binary files — never touch.
+*.png          binary
+*.jpg          binary
+*.jpeg         binary
+*.gif          binary
+*.ico          binary
+*.pdf          binary
+*.zip          binary
+*.tar.gz       binary
+*.dll          binary
+*.exe          binary
+*.pdb          binary
+*.snk          binary

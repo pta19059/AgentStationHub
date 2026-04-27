@@ -1,0 +1,76 @@
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "Microsoft Learn Catalog",
+    "description": "Returns information from the Microsoft Learn Catalog about all publicly available Modules, Units, Learning Paths, Applied Skills, Certifications, Exams, and Instructor-Led Courses. Backed by an Azure Logic App Standard workflow that proxies the Microsoft Learn Catalog API.",
+    "version": "1.0.0"
+  },
+  "servers": [
+    { "url": "https://logicapp-090730.azurewebsites.net" }
+  ],
+  "paths": {
+    "/api/Get_Learning_Content/triggers/Request/invoke": {
+      "post": {
+        "operationId": "getLearningContent",
+        "summary": "Get the full Microsoft Learn catalog.",
+        "description": "Invokes the Get_Learning_Content Logic App workflow. The workflow calls the Microsoft Learn Catalog API and returns the JSON response unchanged. Authentication to the Logic App is performed via the signed SAS query string parameters (sig, sv, sp, api-version) which are required by the trigger.",
+        "parameters": [
+          {
+            "name": "api-version",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "default": "2022-05-01" }
+          },
+          {
+            "name": "sp",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "default": "/triggers/Request/run" }
+          },
+          {
+            "name": "sv",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "default": "1.0" }
+          },
+          {
+            "name": "sig",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "default": "q68BIR-8LRjZsdLLUK3lwZ46icfpchPrzcC3ZT4x1VQ" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false
+              },
+              "example": {}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Microsoft Learn catalog payload (passthrough JSON).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": { "description": "Invalid request." },
+          "401": { "description": "Unauthorized - missing or invalid SAS signature." },
+          "403": { "description": "Forbidden." },
+          "500": { "description": "Workflow execution failed." }
+        }
+      }
+    }
+  },
+  "components": {}
+}

@@ -1,0 +1,113 @@
+@page "/about"
+@using Markdig
+@inject IWebHostEnvironment Env
+
+<PageTitle>About AgenticStationFuelHub</PageTitle>
+
+<div class="about-container">
+    <div class="about-card">
+        @if (_html is null)
+        {
+            <p><em>README.md not found.</em></p>
+        }
+        else
+        {
+            @((MarkupString)_html)
+        }
+    </div>
+</div>
+
+<style>
+    .about-container {
+        max-width: 1100px;
+        margin: 1.5rem auto;
+        padding: 0 1rem;
+    }
+    .about-card {
+        background: rgba(15, 17, 26, 0.85);
+        border: 1px solid rgba(139, 92, 246, 0.25);
+        border-radius: 12px;
+        padding: 2rem 2.5rem;
+        color: #e8e8ee;
+        line-height: 1.6;
+        box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+    }
+    .about-card h1, .about-card h2, .about-card h3 {
+        color: #ffffff;
+        border-bottom: 1px solid rgba(139, 92, 246, 0.25);
+        padding-bottom: 0.3rem;
+        margin-top: 1.6rem;
+    }
+    .about-card h1 { font-size: 1.9rem; }
+    .about-card h2 { font-size: 1.45rem; }
+    .about-card h3 { font-size: 1.15rem; border-bottom: none; }
+    .about-card a { color: #b794f4; }
+    .about-card a:hover { color: #d6bcfa; }
+    .about-card code {
+        background: rgba(139, 92, 246, 0.18);
+        padding: 0.1rem 0.35rem;
+        border-radius: 4px;
+        font-size: 0.88em;
+    }
+    .about-card pre {
+        background: #0b0d14;
+        border: 1px solid rgba(139, 92, 246, 0.2);
+        border-radius: 6px;
+        padding: 0.85rem 1rem;
+        overflow-x: auto;
+    }
+    .about-card pre code { background: transparent; padding: 0; font-size: 0.85em; }
+    .about-card table {
+        border-collapse: collapse;
+        margin: 0.8rem 0;
+        font-size: 0.92em;
+    }
+    .about-card th, .about-card td {
+        border: 1px solid rgba(139, 92, 246, 0.25);
+        padding: 0.4rem 0.7rem;
+        text-align: left;
+    }
+    .about-card th { background: rgba(139, 92, 246, 0.15); }
+    .about-card blockquote {
+        border-left: 3px solid #8b5cf6;
+        padding-left: 0.9rem;
+        margin-left: 0;
+        color: #cfcfd7;
+    }
+    .about-card hr {
+        border: 0;
+        border-top: 1px solid rgba(139, 92, 246, 0.2);
+        margin: 1.6rem 0;
+    }
+</style>
+
+@code {
+    private string? _html;
+
+    protected override void OnInitialized()
+    {
+        // README.md is copied next to the executable via the csproj
+        // <Content Include="..\README.md" /> entry. Look for it in the
+        // app's content root first, then in the parent directory (the
+        // bare-metal `dotnet run` layout where ContentRoot points at
+        // AgentStationHub/ and the README sits one level up).
+        var candidates = new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "README.md"),
+            Path.Combine(Env.ContentRootPath, "README.md"),
+            Path.Combine(Env.ContentRootPath, "..", "README.md"),
+        };
+        foreach (var path in candidates)
+        {
+            if (File.Exists(path))
+            {
+                var md = File.ReadAllText(path);
+                var pipeline = new MarkdownPipelineBuilder()
+                    .UseAdvancedExtensions()
+                    .Build();
+                _html = Markdown.ToHtml(md, pipeline);
+                return;
+            }
+        }
+    }
+}

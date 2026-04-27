@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/microsoft/AgentSchema/refs/heads/main/schemas/v1.0/AgentManifest.yaml
+name: ash-doctor-hosted
+displayName: "AgentStationHub Doctor (Hosted)"
+
+description: >
+  Hosted-Foundry version of the AgentStationHub remediation Doctor.
+  Receives a failing-step JSON payload (plan + error tail + previous
+  attempts + pre-bundled repo file slices) and returns a typed
+  remediation (replace_step / insert_before / give_up). Backs the
+  AgentStationHub orchestrator's Doctor stage when AzureOpenAI:
+  UseFoundryDoctor=true — STRICT MODE: in-sandbox doctor is NOT used as fall-back.
+
+metadata:
+  tags:
+    - AgentStationHub
+    - Remediation
+    - Invocations Protocol
+    - Agent Framework
+
+template:
+  name: ash-doctor-hosted
+  kind: hosted
+  protocols:
+    - protocol: invocations
+      version: 1.0.0
+  resources:
+    cpu: "0.5"
+    memory: 1Gi
+parameters:
+  properties: []
+resources: []

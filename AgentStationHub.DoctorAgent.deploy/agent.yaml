@@ -1,0 +1,16 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/microsoft/AgentSchema/refs/heads/main/schemas/v1.0/ContainerAgent.yaml
+kind: hosted
+name: ash-doctor-hosted
+protocols:
+  - protocol: invocations
+    version: 1.0.0
+resources:
+  cpu: "0.5"
+  memory: 1Gi
+env:
+  # Wired by the Foundry runtime when the agent runs as part of a
+  # Foundry project. The hosted agent's managed identity must have
+  # 'Cognitive Services User' on the parent account (default for agents
+  # in the same project as the deployment).
+  - name: AZURE_OPENAI_DEPLOYMENT
+    value: ash-doctor

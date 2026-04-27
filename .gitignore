@@ -1,0 +1,56 @@
+# ============================================================================
+# AgentStationHub - repository-level ignores.
+# ============================================================================
+
+# ---- Build outputs ---------------------------------------------------------
+**/bin/
+**/obj/
+**/node_modules/
+
+# ---- Secrets (NEVER commit) -------------------------------------------------
+# docker-compose reads '.env' automatically; it often ends up with API keys,
+# subscription IDs, tenant IDs. Lock it down.
+.env
+.env.*
+!.env.example
+
+# appsettings overrides with secrets. Production values should come from
+# KeyVault / env vars, Development files from 'dotnet user-secrets'.
+**/appsettings.Development.json
+**/appsettings.Local.json
+**/appsettings.Secrets.json
+
+# Azure deployment artifacts that sometimes leak connection strings.
+**/.azure/
+**/azure.yaml.local
+**/main.parameters.local.json
+
+# Service principals, certs, private keys
+*.pem
+*.key
+*.pfx
+*.cer
+*.p12
+
+# ---- IDE / editor local state -----------------------------------------------
+.vs/
+.vscode/
+*.user
+*.suo
+.idea/
+
+# ---- OS clutter -------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Runtime / logs ---------------------------------------------------------
+*.log
+logs/
+local-*
+
+# ---- Docker Desktop build cache / local images ------------------------------
+# Not strictly needed (git wouldn't pick these up anyway), but keeps
+# 'git status' clean when the workspace is opened with different IDEs.
+docker-desktop-diagnostics/
+.azure

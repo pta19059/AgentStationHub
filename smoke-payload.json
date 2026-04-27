@@ -1,0 +1,1 @@
+{"command":"remediate","workspace":"/workspace","failedStepId":1,"errorTail":"npm: command not found","previousAttempts":[],"plan":{"prerequisites":[],"env":{},"steps":[{"id":1,"description":"install","cmd":"npm ci","cwd":"."}],"verifyHints":[]}}

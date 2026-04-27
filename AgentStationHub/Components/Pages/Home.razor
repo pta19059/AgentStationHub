@@ -1,0 +1,239 @@
+﻿@page "/"
+
+<PageTitle>AgenticStationFuelHub – Deploy AI Agents in one click</PageTitle>
+
+<section class="hero">
+    <div class="hero-bg"></div>
+
+    <div class="hero-content">
+        <div class="ms-logo" aria-label="Microsoft logo">
+            <svg width="44" height="44" viewBox="0 0 23 23" xmlns="http://www.w3.org/2000/svg" role="img">
+                <title>Microsoft</title>
+                <rect x="1"  y="1"  width="10" height="10" fill="#F25022" />
+                <rect x="12" y="1"  width="10" height="10" fill="#7FBA00" />
+                <rect x="1"  y="12" width="10" height="10" fill="#00A4EF" />
+                <rect x="12" y="12" width="10" height="10" fill="#FFB900" />
+            </svg>
+            <span>Microsoft</span>
+            <span class="dot">·</span>
+            <span class="built-on">Built on Azure AI Foundry &amp; Copilot Studio</span>
+        </div>
+
+        <h1 class="title">
+            Agentic<span class="accent">Station</span>FuelHub
+        </h1>
+
+        <p class="tagline">
+            The <strong>one-click</strong> platform to deploy production-ready AI agents
+            on <strong>Azure AI Foundry</strong> and <strong>Microsoft Copilot Studio</strong>.
+            Pick a use case, click deploy, the infrastructure is ready.
+        </p>
+
+        <div class="cta-row">
+            <a class="cta primary" href="hub">
+                <i class="bi bi-rocket-takeoff"></i> Explore the AgenticHub
+            </a>
+            <a class="cta ghost" href="https://learn.microsoft.com/azure/ai-foundry/" target="_blank" rel="noopener">
+                <i class="bi bi-book"></i> Azure AI Foundry Docs
+            </a>
+            <a class="cta ghost" href="https://learn.microsoft.com/microsoft-copilot-studio/" target="_blank" rel="noopener">
+                <i class="bi bi-robot"></i> Copilot Studio Docs
+            </a>
+            <a class="cta accent-cta" href="#"
+               onclick="window.copilotLauncher && window.copilotLauncher.open(); return false;">
+                <i class="bi bi-terminal-fill"></i> Open GitHub Copilot CLI
+            </a>
+        </div>
+
+        <div class="stats">
+            <div><span class="num">15+</span><span class="lbl">Curated agents</span></div>
+            <div><span class="num">10</span><span class="lbl">Industries covered</span></div>
+            <div><span class="num">2</span><span class="lbl">Deployment platforms</span></div>
+        </div>
+    </div>
+</section>
+
+<section class="features">
+    <div class="feature">
+        <div class="icon i-blue"><i class="bi bi-lightning-charge-fill"></i></div>
+        <h3>One-click deployment</h3>
+        <p>Azure infrastructure provisioned automatically via ARM / <code>azd up</code>.
+           No YAML to write, no manual configuration.</p>
+    </div>
+
+    <div class="feature">
+        <div class="icon i-green"><i class="bi bi-github"></i></div>
+        <h3>Official repos only</h3>
+        <p>Catalog based exclusively on verified public repositories from
+           <strong>Microsoft</strong> and <strong>Azure-Samples</strong>.</p>
+    </div>
+
+    <div class="feature">
+        <div class="icon i-orange"><i class="bi bi-hospital"></i></div>
+        <h3>Vertical use cases</h3>
+        <p>Healthcare, legal, financial, customer service, HR, education, public sector.
+           All ready to be tailored to your domain.</p>
+    </div>
+
+    <div class="feature">
+        <div class="icon i-purple"><i class="bi bi-shield-check"></i></div>
+        <h3>Enterprise-grade</h3>
+        <p>Native integration with Entra ID, Key Vault, Private Endpoints and
+           built-in responsible-AI safety from Azure AI Foundry.</p>
+    </div>
+</section>
+
+<section class="platforms">
+    <h2>We support both Microsoft runtimes</h2>
+    <div class="platform-cards">
+        <div class="platform-card foundry">
+            <div class="plogo"><i class="bi bi-cloud-fill"></i></div>
+            <h3>Azure AI Foundry</h3>
+            <p>Agent Service, Semantic Kernel, AutoGen, Prompty. Full control over models,
+               vector stores and multi-agent orchestration.</p>
+            <span class="tag">Code-first</span>
+        </div>
+
+        <div class="platform-card studio">
+            <div class="plogo"><i class="bi bi-robot"></i></div>
+            <h3>Microsoft Copilot Studio</h3>
+            <p>Low-code maker experience, Microsoft 365, Dataverse and Power Platform
+               connectors. Ideal for business users and citizen developers.</p>
+            <span class="tag">Low-code</span>
+        </div>
+    </div>
+</section>
+
+<style>
+    :root {
+        --ms-blue:  #0078D4;
+        --ms-red:   #F25022;
+        --ms-green: #7FBA00;
+        --ms-cyan:  #00A4EF;
+        --ms-yellow:#FFB900;
+    }
+
+    .hero {
+        position: relative;
+        border-radius: 18px;
+        padding: 3.5rem 2.5rem 3rem;
+        margin: -1rem -.5rem 2rem;
+        overflow: hidden;
+        color: #fff;
+    }
+    .hero-bg {
+        position: absolute; inset: 0;
+        background:
+            radial-gradient(circle at 15% 20%, rgba(242,80,34,.45) 0, transparent 45%),
+            radial-gradient(circle at 85% 15%, rgba(127,186,0,.40) 0, transparent 45%),
+            radial-gradient(circle at 80% 85%, rgba(255,185,0,.35) 0, transparent 45%),
+            radial-gradient(circle at 15% 85%, rgba(0,164,239,.45) 0, transparent 45%),
+            linear-gradient(135deg, #0b1220 0%, #1e2a4a 60%, #0b1220 100%);
+        z-index: 0;
+    }
+    .hero-content { position: relative; z-index: 1; max-width: 980px; }
+
+    .ms-logo {
+        display: inline-flex; align-items: center; gap: .55rem;
+        background: rgba(255,255,255,.08);
+        backdrop-filter: blur(6px);
+        border: 1px solid rgba(255,255,255,.15);
+        padding: .4rem .9rem; border-radius: 999px;
+        font-size: .85rem; font-weight: 500;
+    }
+    .ms-logo .dot { opacity: .5; }
+    .ms-logo .built-on { opacity: .85; }
+
+    .title {
+        font-size: clamp(2.4rem, 5vw, 4rem);
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        margin: 1.2rem 0 .6rem;
+        line-height: 1.05;
+    }
+    .title .accent {
+        background: linear-gradient(90deg, var(--ms-red), var(--ms-yellow), var(--ms-green), var(--ms-cyan));
+        -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+
+    .tagline {
+        font-size: 1.15rem; line-height: 1.55;
+        max-width: 720px; opacity: .92; margin-bottom: 1.8rem;
+    }
+
+    .cta-row { display: flex; flex-wrap: wrap; gap: .75rem; margin-bottom: 2.2rem; }
+    .cta {
+        display: inline-flex; align-items: center; gap: .5rem;
+        padding: .75rem 1.4rem; border-radius: 10px;
+        font-weight: 600; text-decoration: none;
+        transition: transform .15s, box-shadow .15s;
+    }
+    .cta.primary { background: #fff; color: #0b1220; }
+    .cta.primary:hover { transform: translateY(-2px); box-shadow: 0 10px 25px rgba(0,0,0,.25); }
+    .cta.ghost {
+        background: transparent; color: #fff;
+        border: 1px solid rgba(255,255,255,.35);
+    }
+    .cta.ghost:hover { background: rgba(255,255,255,.1); }
+    .cta.accent-cta {
+        color: #0b1220;
+        background: linear-gradient(90deg, #FFB900, #7FBA00);
+        box-shadow: 0 6px 18px rgba(127,186,0,.35);
+    }
+    .cta.accent-cta:hover { transform: translateY(-2px); box-shadow: 0 12px 26px rgba(127,186,0,.45); }
+
+    .stats {
+        display: flex; gap: 2.5rem; flex-wrap: wrap;
+        padding-top: 1.5rem; border-top: 1px solid rgba(255,255,255,.15);
+    }
+    .stats > div { display: flex; flex-direction: column; }
+    .stats .num { font-size: 1.7rem; font-weight: 700; }
+    .stats .lbl { font-size: .8rem; opacity: .75; text-transform: uppercase; letter-spacing: .06em; }
+
+    /* Features */
+    .features {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+        gap: 1rem; margin-bottom: 2.5rem;
+    }
+    .feature {
+        background: #fff; border: 1px solid #e5e7eb; border-radius: 14px;
+        padding: 1.3rem; transition: transform .15s, box-shadow .15s;
+    }
+    .feature:hover { transform: translateY(-3px); box-shadow: 0 10px 24px rgba(0,0,0,.07); }
+    .feature h3 { font-size: 1.05rem; margin: .6rem 0 .35rem; }
+    .feature p  { font-size: .88rem; color: #4b5563; margin: 0; }
+    .feature .icon {
+        width: 42px; height: 42px; border-radius: 10px;
+        display: grid; place-items: center; color: #fff; font-size: 1.2rem;
+    }
+    .i-blue   { background: var(--ms-blue); }
+    .i-green  { background: var(--ms-green); }
+    .i-orange { background: var(--ms-red); }
+    .i-purple { background: #7c3aed; }
+
+    /* Platforms */
+    .platforms h2 {
+        font-size: 1.4rem; font-weight: 700; margin-bottom: 1rem;
+    }
+    .platform-cards {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 1rem; margin-bottom: 2rem;
+    }
+    .platform-card {
+        position: relative; padding: 1.5rem; border-radius: 14px;
+        color: #fff; overflow: hidden; min-height: 180px;
+    }
+    .platform-card.foundry { background: linear-gradient(135deg, #0078D4, #004578); }
+    .platform-card.studio  { background: linear-gradient(135deg, #7FBA00, #3f6b00); }
+    .platform-card .plogo {
+        font-size: 1.8rem; opacity: .9; margin-bottom: .4rem;
+    }
+    .platform-card h3 { font-size: 1.15rem; margin: 0 0 .4rem; }
+    .platform-card p  { font-size: .9rem; opacity: .92; margin: 0 0 .8rem; }
+    .platform-card .tag {
+        display: inline-block; padding: .2rem .65rem; border-radius: 999px;
+        background: rgba(255,255,255,.2); font-size: .72rem; font-weight: 600;
+    }
+</style>
+

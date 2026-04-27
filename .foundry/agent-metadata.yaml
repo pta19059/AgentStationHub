@@ -1,0 +1,23 @@
+# Foundry-CLI deployment metadata. Read by `foundry agent deploy` /
+# `az foundry agent ...` to know WHERE to push the image and WHICH
+# Foundry project to bind the agent to.
+#
+# Provisioned 2026-04-25 alongside the migration. See session memory
+# /memories/session/foundry-doctor-migration.md for full IDs.
+
+agentName: ash-doctor-hosted
+
+azureContainerRegistry:
+  name: crashfoundry32860
+  loginServer: crashfoundry32860.azurecr.io
+  imageRepository: ash-doctor
+
+environments:
+  dev:
+    foundryAccount: AgenticStationFoundry
+    resourceGroup: AgenticStationFuelHub
+    subscription: AgentSeries
+    projectEndpoint: https://agenticstationfoundry.services.ai.azure.com/api/projects/default
+    projectName: default
+    region: swedencentral
+    modelDeployment: ash-doctor   # o4-mini 2025-04-16, Standard cap=50

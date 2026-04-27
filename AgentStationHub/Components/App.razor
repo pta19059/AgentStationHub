@@ -1,0 +1,176 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <base href="/" />
+    <link rel="stylesheet" href="bootstrap/bootstrap.min.css" />
+    <link rel="stylesheet" href="app.css" />
+    <link rel="stylesheet" href="AgentStationHub.styles.css" />
+    <link rel="icon" type="image/png" href="favicon.png" />
+    <HeadOutlet />
+    <style>
+        /*
+         * Custom reconnect modal. Replaces the Blazor default "Could not
+         * reconnect to the server. Reload the page to restore
+         * functionality." banner with something that matches our deploy
+         * narrative: the deploy keeps running on the server, the client
+         * is just trying to re-attach to it.
+         */
+        #components-reconnect-modal {
+            display: none;
+        }
+
+        #components-reconnect-modal.components-reconnect-show,
+        #components-reconnect-modal.components-reconnect-failed,
+        #components-reconnect-modal.components-reconnect-rejected {
+            display: flex;
+            position: fixed;
+            inset: 0;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+            background: rgba(15, 23, 42, 0.45);
+            backdrop-filter: blur(3px);
+            font-family: system-ui, sans-serif;
+        }
+
+        #components-reconnect-modal .reconnect-card {
+            background: #fff;
+            padding: 1.5rem 1.75rem;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
+            max-width: 420px;
+            text-align: center;
+        }
+
+        #components-reconnect-modal .reconnect-card h3 {
+            margin: 0 0 0.75rem 0;
+            font-size: 1.05rem;
+            color: #0f172a;
+        }
+
+        #components-reconnect-modal .reconnect-card p {
+            margin: 0 0 1rem 0;
+            color: #475569;
+            font-size: 0.92rem;
+            line-height: 1.5;
+        }
+
+        #components-reconnect-modal .reconnect-card .spinner {
+            display: inline-block;
+            width: 28px; height: 28px;
+            border: 3px solid #e2e8f0;
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: reconnect-spin 0.8s linear infinite;
+            margin-bottom: 0.75rem;
+        }
+
+        /* Failed / rejected states: switch spinner for a warning glyph. */
+        #components-reconnect-modal.components-reconnect-failed .reconnect-spinner,
+        #components-reconnect-modal.components-reconnect-rejected .reconnect-spinner {
+            display: none;
+        }
+        #components-reconnect-modal.components-reconnect-show .reconnect-failed,
+        #components-reconnect-modal.components-reconnect-show .reconnect-rejected,
+        #components-reconnect-modal.components-reconnect-failed .reconnect-retrying,
+        #components-reconnect-modal.components-reconnect-rejected .reconnect-retrying {
+            display: none;
+        }
+
+        @@keyframes reconnect-spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+
+<body>
+    <Routes />
+
+    <!--
+        Custom reconnect modal. Blazor toggles the classes
+        .components-reconnect-show / .components-reconnect-failed /
+        .components-reconnect-rejected on the element whose id is
+        'components-reconnect-modal' — we override the default styling
+        above and keep the DOM structure the runtime expects.
+    -->
+    <div id="components-reconnect-modal">
+        <div class="reconnect-card">
+            <div class="spinner reconnect-spinner"></div>
+
+            <div class="reconnect-retrying">
+                <h3>Reconnecting to AgentStationHub</h3>
+                <p>
+                    The connection dropped but your deploy is still running on the server.
+                    We're trying to re-attach automatically — no action needed.
+                </p>
+            </div>
+
+            <div class="reconnect-failed">
+                <h3>Still reconnecting...</h3>
+                <p>
+                    Connection is slow or interrupted. The deploy keeps running on
+                    the server and the UI will catch up as soon as the link is back.
+                </p>
+                <button type="button" class="btn btn-primary btn-sm"
+                        onclick="window.Blazor.reconnect()">
+                    Retry now
+                </button>
+            </div>
+
+            <div class="reconnect-rejected">
+                <h3>Session expired</h3>
+                <p>
+                    The server rejected reconnection. Please reload — the deploy
+                    keeps running and you can re-open the session from the Deployments list.
+                </p>
+                <button type="button" class="btn btn-primary btn-sm"
+                        onclick="location.reload()">
+                    Reload
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!--
+        Note: this app used to load xterm.js + a custom glue script
+        (copilot-term.js) here for the embedded Copilot CLI terminal.
+        The terminal is now a self-contained <iframe> backed by ttyd
+        running inside the agentichub-copilot-cli sidecar (see
+        Components/CopilotLauncher.razor and Dockerfiles/copilot-cli.Dockerfile),
+        which ships its own xterm.js bundle. Keeping those CDN includes
+        out of every page saves ~120 KB on first paint.
+    -->
+    <!-- Tiny shim that lets non-Blazor links call window.copilotLauncher.open(). -->
+    <script src="copilot-launcher.js"></script>
+    <!--
+        autostart=false lets us pass custom reconnection options before
+        the circuit is established.
+    -->
+    <script src="_framework/blazor.web.js" autostart="false"></script>
+    <script>
+        // Reconnect strategy for long-running deploys (15-60 min).
+        // Default Blazor: 8 retries with 1-5s backoff -> gives up in <30s.
+        // We extend to ~1 hour of coverage so a coffee break, laptop
+        // sleep, or a flaky VPN doesn't force a reload + loss of UI state.
+        Blazor.start({
+            circuit: {
+                reconnectionOptions: {
+                    // 200 retries * backoff averaging ~18s ≈ 60 min of
+                    // total retry coverage before Blazor marks the
+                    // circuit 'failed' and swaps the modal to the
+                    // manual-retry branch above.
+                    maxRetries: 200,
+                    // Exponential backoff capped at 30 s. The 'previous'
+                    // argument is the attempt index (0-based).
+                    retryIntervalMilliseconds: (previous) =>
+                        Math.min(30000, 1000 * Math.pow(1.4, previous))
+                }
+            }
+        });
+    </script>
+</body>
+
+</html>

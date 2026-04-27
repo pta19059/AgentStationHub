@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Azure.AI.OpenAI" Version="2.2.0-beta.4" />
+    <!--
+      Direct OpenAI reference to resolve the NU1107 conflict between:
+        * Azure.AI.OpenAI 2.2.0-beta.4      -> OpenAI >= 2.2.0-beta.4
+        * Microsoft.SemanticKernel 1.29.0   -> OpenAI  = 2.1.0-beta.2   (strict equality)
+      Without this direct line the restore fails in a clean environment
+      (e.g. inside the Docker build) even though a warmed local NuGet
+      cache happens to satisfy both constraints. A direct PackageReference
+      wins over the transitive SK pin, and 2.2.0-beta.4 is API-compatible
+      with SK at runtime for the surface we use (chat completions).
+    -->
+    <PackageReference Include="OpenAI" Version="2.2.0-beta.4" />
+    <PackageReference Include="LibGit2Sharp" Version="0.31.0" />
+    <PackageReference Include="CliWrap" Version="3.6.6" />
+    <PackageReference Include="Microsoft.SemanticKernel" Version="1.29.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.AzureOpenAI" Version="1.29.0" />
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="8.0.11" />
+    <PackageReference Include="Azure.Identity" Version="1.13.1" />
+    <!--
+      YARP IHttpForwarder powers the /copilot/ reverse proxy that
+      bridges the Hub's port 8080 to the agentichub-copilot-cli sidecar
+      (ttyd). YARP handles WebSocket upgrade, hop-by-hop header stripping
+      and connection lifetime correctly out of the box; the previous
+      hand-rolled implementation dropped the websocket after the first
+      ttyd handshake frame, leaving xterm.js stuck on "Press to Reconnect".
+    -->
+    <PackageReference Include="Yarp.ReverseProxy" Version="2.2.0" />
+    <PackageReference Include="Markdig" Version="0.37.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Ship the repo README with the published app so the /about page
+         can render it at runtime. The link copies it into the
+         publish/run directory next to the executable. -->
+    <Content Include="..\README.md" Link="README.md">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

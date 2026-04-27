@@ -1,0 +1,351 @@
+@using AgentStationHub.Services.Tools
+@inject FoundryAgentChatClient ChatClient
+@implements IDisposable
+
+@* Floating chat panel anchored to a clickable avatar pinned to the
+   bottom of the side nav column. Click toggles open/close. State
+   (thread id + message list) lives in the component for the lifetime
+   of the circuit, so the conversation has memory across sends but
+   resets on a hard reload. Render mode is forced to InteractiveServer
+   from MainLayout so the click handlers wire up; the rest of the
+   layout stays static. *@
+
+<div class="agent-chat-launcher">
+    <button class="agent-chat-avatar @( _open ? "open" : "" )"
+            type="button"
+            title="@(_open ? "Close Agent Learn" : "Open Agent Learn")"
+            @onclick="Toggle">
+        @* Microsoft 4-square logo (inline SVG so we don't need an asset).
+           Colours match the official brand palette. *@
+        <svg width="26" height="26" viewBox="0 0 24 24" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" style="display:block">
+            <rect x="1"  y="1"  width="10" height="10" fill="#F25022"/>
+            <rect x="13" y="1"  width="10" height="10" fill="#7FBA00"/>
+            <rect x="1"  y="13" width="10" height="10" fill="#00A4EF"/>
+            <rect x="13" y="13" width="10" height="10" fill="#FFB900"/>
+        </svg>
+    </button>
+
+    @if (_open)
+    {
+        <div class="agent-chat-panel">
+            <div class="agent-chat-header">
+                <div class="agent-chat-title">
+                    <strong>Agent Learn</strong>
+                    @if (ChatClient.IsConfigured)
+                    {
+                        <span class="agent-chat-id">@ChatClient.AssistantId</span>
+                    }
+                </div>
+                <button class="agent-chat-close" type="button" @onclick="Toggle" title="Close">×</button>
+            </div>
+
+            <div class="agent-chat-body" @ref="_bodyRef">
+                @if (!ChatClient.IsConfigured)
+                {
+                    <div class="agent-chat-empty">
+                        <p><strong>Agent not configured.</strong></p>
+                        <p>
+                            Set <code>Foundry:ChatAgent:ProjectEndpoint</code> and
+                            <code>Foundry:ChatAgent:AssistantId</code> in
+                            <code>appsettings.json</code> to point at your
+                            Foundry agent (e.g. <code>AgentMicrosoftLearn</code>),
+                            then restart the Hub.
+                        </p>
+                    </div>
+                }
+                else if (_messages.Count == 0)
+                {
+                    <div class="agent-chat-empty">
+                        <p>Start your conversation with your Agent Professor.</p>
+                    </div>
+                }
+                else
+                {
+                    @foreach (var m in _messages)
+                    {
+                        <div class="agent-chat-msg @m.Role">
+                            <div class="agent-chat-bubble">@m.Text</div>
+                        </div>
+                    }
+                    @if (_busy)
+                    {
+                        <div class="agent-chat-msg assistant">
+                            <div class="agent-chat-bubble typing">…</div>
+                        </div>
+                    }
+                }
+            </div>
+
+            <form class="agent-chat-input" @onsubmit="SendAsync" @onsubmit:preventDefault>
+                <input type="text"
+                       placeholder="@(ChatClient.IsConfigured ? "Ask the agent..." : "Configure the agent first")"
+                       @bind="_draft"
+                       @bind:event="oninput"
+                       disabled="@(_busy || !ChatClient.IsConfigured)" />
+                <button type="submit" disabled="@(_busy || !ChatClient.IsConfigured || string.IsNullOrWhiteSpace(_draft))">
+                    Send
+                </button>
+            </form>
+        </div>
+    }
+</div>
+
+@code {
+    private bool _open;
+    private bool _busy;
+    private string _draft = string.Empty;
+    private string? _threadId;
+    private readonly List<ChatMessage> _messages = new();
+    private CancellationTokenSource? _cts;
+    private ElementReference _bodyRef;
+
+    private void Toggle()
+    {
+        _open = !_open;
+    }
+
+    private async Task SendAsync()
+    {
+        if (_busy || string.IsNullOrWhiteSpace(_draft) || !ChatClient.IsConfigured)
+            return;
+
+        var text = _draft.Trim();
+        _draft = string.Empty;
+        _messages.Add(new ChatMessage("user", text));
+        _busy = true;
+        StateHasChanged();
+
+        _cts?.Cancel();
+        _cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        try
+        {
+            var (newThread, reply) = await ChatClient.SendAsync(_threadId, text, _cts.Token);
+            _threadId = newThread;
+            _messages.Add(new ChatMessage("assistant",
+                string.IsNullOrWhiteSpace(reply) ? "(empty reply)" : reply));
+        }
+        catch (Exception ex)
+        {
+            _messages.Add(new ChatMessage("error", ex.Message));
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _cts?.Dispose();
+    }
+
+    private sealed record ChatMessage(string Role, string Text);
+}
+
+<style>
+    .agent-chat-launcher {
+        position: fixed;
+        left: 0.75rem;
+        bottom: 0.75rem;
+        z-index: 1100;
+    }
+
+    .agent-chat-avatar {
+        width: 2.75rem;
+        height: 2.75rem;
+        border-radius: 50%;
+        border: 2px solid rgba(255, 255, 255, 0.5);
+        background: white;
+        color: white;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+        padding: 0;
+    }
+
+    .agent-chat-avatar .ms-logo {
+        width: 1.6rem;
+        height: 1.6rem;
+        display: block;
+    }
+
+    .agent-chat-avatar:hover {
+        transform: scale(1.06);
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+    }
+
+    .agent-chat-avatar.open {
+        border-color: #8b5cf6;
+        box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.4), 0 4px 12px rgba(0, 0, 0, 0.35);
+    }
+
+    .agent-chat-panel {
+        position: absolute;
+        bottom: 3.5rem;
+        left: 0;
+        width: 360px;
+        height: 520px;
+        background: #1e1b2e;
+        color: #e5e7eb;
+        border: 1px solid rgba(139, 92, 246, 0.4);
+        border-radius: 12px;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        font-size: 0.85rem;
+    }
+
+    .agent-chat-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.6rem 0.85rem;
+        background: rgba(139, 92, 246, 0.15);
+        border-bottom: 1px solid rgba(139, 92, 246, 0.3);
+    }
+
+    .agent-chat-title strong {
+        display: block;
+        font-size: 0.9rem;
+    }
+
+    .agent-chat-id {
+        display: block;
+        font-size: 0.7rem;
+        opacity: 0.7;
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+
+    .agent-chat-help {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 1.1rem;
+        height: 1.1rem;
+        margin-left: 0.4rem;
+        border-radius: 50%;
+        background: rgba(139, 92, 246, 0.35);
+        color: #fff;
+        font-size: 0.75rem;
+        font-weight: 600;
+        cursor: help;
+        vertical-align: middle;
+    }
+    .agent-chat-help:hover { background: rgba(139, 92, 246, 0.6); }
+
+    .agent-chat-close {
+        background: transparent;
+        border: none;
+        color: #d1d5db;
+        font-size: 1.4rem;
+        line-height: 1;
+        cursor: pointer;
+        padding: 0 0.25rem;
+    }
+
+    .agent-chat-close:hover {
+        color: white;
+    }
+
+    .agent-chat-body {
+        flex: 1;
+        overflow-y: auto;
+        padding: 0.75rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+
+    .agent-chat-empty {
+        opacity: 0.7;
+        font-size: 0.8rem;
+        padding: 0.5rem;
+    }
+
+    .agent-chat-empty code {
+        background: rgba(255, 255, 255, 0.08);
+        padding: 1px 4px;
+        border-radius: 3px;
+        font-size: 0.75rem;
+    }
+
+    .agent-chat-msg {
+        display: flex;
+    }
+
+    .agent-chat-msg.user {
+        justify-content: flex-end;
+    }
+
+    .agent-chat-bubble {
+        max-width: 80%;
+        padding: 0.5rem 0.7rem;
+        border-radius: 10px;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        line-height: 1.35;
+    }
+
+    .agent-chat-msg.user .agent-chat-bubble {
+        background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
+        color: white;
+    }
+
+    .agent-chat-msg.assistant .agent-chat-bubble {
+        background: rgba(255, 255, 255, 0.08);
+    }
+
+    .agent-chat-msg.error .agent-chat-bubble {
+        background: rgba(239, 68, 68, 0.2);
+        border: 1px solid rgba(239, 68, 68, 0.5);
+        color: #fecaca;
+    }
+
+    .agent-chat-bubble.typing {
+        opacity: 0.7;
+        font-style: italic;
+    }
+
+    .agent-chat-input {
+        display: flex;
+        gap: 0.4rem;
+        padding: 0.5rem;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .agent-chat-input input {
+        flex: 1;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 6px;
+        padding: 0.4rem 0.6rem;
+        color: #e5e7eb;
+        font-size: 0.85rem;
+    }
+
+    .agent-chat-input input:focus {
+        outline: none;
+        border-color: #8b5cf6;
+    }
+
+    .agent-chat-input button {
+        background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
+        color: white;
+        border: none;
+        border-radius: 6px;
+        padding: 0 0.9rem;
+        font-weight: 600;
+        cursor: pointer;
+    }
+
+    .agent-chat-input button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+    }
+</style>

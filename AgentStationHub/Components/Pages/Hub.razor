@@ -1,0 +1,364 @@
+@page "/hub"
+@rendermode InteractiveServer
+@using AgentStationHub.Models
+@using AgentStationHub.Services
+@using Microsoft.Extensions.Options
+@inject AgentCatalogService Catalog
+@inject IJSRuntime JS
+@inject IOptions<DeploymentOptions> DeployOpt
+
+<PageTitle>AgenticHub</PageTitle>
+
+<div class="hub-header">
+    <div class="hub-header-row">
+        <div>
+            <h1><i class="bi bi-rocket-takeoff-fill text-primary"></i> AgenticHub</h1>
+            <p class="lead">
+                A curated catalog of the most relevant projects from public GitHub repositories.
+                Pick a use case and deploy the full infrastructure with one click.
+            </p>
+        </div>
+        <button class="btn btn-dark scan-btn" @onclick="ScanWebAsync" disabled="@_scanning">
+            @if (_scanning)
+            {
+                <span class="spinner-border spinner-border-sm me-2" role="status"></span>
+                <span>Scanning...</span>
+            }
+            else
+            {
+                <i class="bi bi-search me-2"></i>
+                <span>Scan the web</span>
+            }
+        </button>
+    </div>
+</div>
+
+<div class="filters">
+    <input class="form-control search" placeholder="Search by name, description or tag..."
+           @bind="_search" @bind:event="oninput" />
+
+    <select class="form-select" @bind="_category">
+        <option value="">All categories</option>
+        @foreach (var c in Enum.GetValues<AgentCategory>())
+        {
+            <option value="@c">@FormatCategory(c)</option>
+        }
+    </select>
+
+    <select class="form-select" @bind="_target">
+        <option value="">All platforms</option>
+        <option value="@DeploymentTarget.CopilotStudio">Copilot Studio</option>
+        <option value="@DeploymentTarget.AzureAIFoundry">Azure AI Foundry</option>
+    </select>
+
+    <select class="form-select" @bind="_region" title="Azure region used by Agentic Deploy">
+        @foreach (var r in DeployOpt.Value.AvailableAzureLocations)
+        {
+            <option value="@r">@r</option>
+        }
+    </select>
+</div>
+
+<div class="cards-grid">
+    @foreach (var agent in Filtered)
+    {
+        <div class="agent-card">
+            <div class="card-top">
+                <span class="category-badge cat-@agent.Category.ToString().ToLower()">
+                    @FormatCategory(agent.Category)
+                </span>
+                <span class="stars"><i class="bi bi-star-fill"></i> @agent.Stars</span>
+            </div>
+
+            <h3>@agent.Name</h3>
+            <div class="author">by @agent.Author</div>
+            <p class="desc">@agent.Description</p>
+
+            <div class="tags">
+                @foreach (var t in agent.Tags)
+                {
+                    <span class="tag">#@t</span>
+                }
+            </div>
+
+            <div class="actions">
+                <a class="btn btn-outline-secondary btn-sm" href="@agent.GitHubUrl" target="_blank" rel="noopener">
+                    <i class="bi bi-github"></i> GitHub
+                </a>
+
+                @if (agent.Target is DeploymentTarget.AzureAIFoundry or DeploymentTarget.Both)
+                {
+                    <button class="btn btn-primary btn-sm"
+                            title="Runs the agentic deployment pipeline: clone, inspect, plan (LLM), approve, execute in a Docker sandbox."
+                            @onclick="() => AgenticDeployAsync(agent)">
+                        <i class="bi bi-magic"></i> Agentic deploy
+                    </button>
+
+                    @* Only show a direct "Open ARM template" shortcut when the *@
+                    @* catalog entry actually has a one-click Deploy-to-Azure URL. *@
+                    @* The fallback "Manual (azd / README)" button was removed: it  *@
+                    @* duplicated what the GitHub button already offers.            *@
+                    @if (!string.IsNullOrEmpty(agent.DeployToAzureUrl))
+                    {
+                        <button class="btn btn-outline-primary btn-sm"
+                                title="Opens the ARM template on Azure Portal"
+                                @onclick="() => DeployAsync(agent, DeploymentTarget.AzureAIFoundry)">
+                            <i class="bi bi-cloud-upload"></i> Open ARM template
+                        </button>
+                    }
+                }
+
+                @if (agent.Target is DeploymentTarget.CopilotStudio or DeploymentTarget.Both)
+                {
+                    <button class="btn btn-success btn-sm"
+                            title="Opens Copilot Studio (import the solution manually from the repo)"
+                            @onclick="() => DeployAsync(agent, DeploymentTarget.CopilotStudio)">
+                        <i class="bi bi-robot"></i> Open in Copilot Studio
+                    </button>
+                }
+            </div>
+        </div>
+    }
+</div>
+
+@if (!Filtered.Any())
+{
+    <div class="empty">No agents match the current filters.</div>
+}
+
+@if (_deployStatus is not null)
+{
+    <div class="deploy-toast">
+        <strong>@_deployStatus.Title</strong>
+        <div>@_deployStatus.Message</div>
+    </div>
+}
+
+<DeploymentModal @ref="_deploymentModal" />
+
+<style>
+    .hub-header { margin-bottom: 1.5rem; }
+    .hub-header h1 { font-weight: 700; }
+    .hub-header-row {
+        display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem;
+    }
+    .scan-btn {
+        white-space: nowrap;
+        padding: .6rem 1.2rem;
+        border-radius: 10px;
+        font-weight: 600;
+        background: linear-gradient(135deg, #0078D4, #004578);
+        border: none;
+        box-shadow: 0 4px 12px rgba(0,120,212,.25);
+        transition: transform .15s, box-shadow .15s;
+    }
+    .scan-btn:hover:not(:disabled) {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 18px rgba(0,120,212,.4);
+    }
+    .scan-btn:disabled { opacity: .7; cursor: not-allowed; }
+    .filters {
+        display: grid;
+        grid-template-columns: 2fr 1fr 1fr;
+        gap: 0.75rem;
+        margin-bottom: 1.5rem;
+    }
+    .cards-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+        gap: 1rem;
+    }
+    .agent-card {
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 1.1rem;
+        background: #fff;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        display: flex;
+        flex-direction: column;
+        transition: transform .15s, box-shadow .15s;
+    }
+    .agent-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 16px rgba(0,0,0,0.08);
+    }
+    .card-top { display: flex; justify-content: space-between; align-items: center; }
+    .category-badge {
+        font-size: 0.72rem;
+        font-weight: 600;
+        padding: 0.2rem 0.55rem;
+        border-radius: 999px;
+        color: #fff;
+        background: #6366f1;
+    }
+    .cat-medical        { background: #dc2626; }
+    .cat-legal          { background: #7c3aed; }
+    .cat-financial      { background: #059669; }
+    .cat-customerservice{ background: #2563eb; }
+    .cat-humanresources { background: #db2777; }
+    .cat-education      { background: #f59e0b; }
+    .cat-retail         { background: #0891b2; }
+    .cat-manufacturing  { background: #6b7280; }
+    .cat-government     { background: #1e40af; }
+    .cat-productivity   { background: #10b981; }
+
+    .stars { font-size: .85rem; color: #f59e0b; }
+    .agent-card h3 { font-size: 1.1rem; margin: .6rem 0 .15rem; }
+    .author { font-size: .78rem; color: #6b7280; margin-bottom: .55rem; }
+    .desc { font-size: .9rem; color: #374151; flex: 1; }
+    .tags { margin: .55rem 0; }
+    .tag {
+        display: inline-block; font-size: .72rem; color: #4f46e5;
+        background: #eef2ff; padding: .12rem .5rem; border-radius: 6px; margin: 0 .25rem .25rem 0;
+    }
+    .actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .5rem; }
+    .empty { text-align: center; padding: 3rem; color: #6b7280; }
+    .deploy-toast {
+        position: fixed; bottom: 1.5rem; right: 1.5rem;
+        background: #111827; color: #fff; padding: 1rem 1.25rem;
+        border-radius: 10px; max-width: 360px; z-index: 1000;
+        box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+    }
+</style>
+
+@code {
+    private string? _search;
+    private string _category = "";
+    private string _target = "";
+    private string _region = "";
+    private ToastMessage? _deployStatus;
+    private bool _scanning;
+    private DeploymentModal? _deploymentModal;
+
+    protected override void OnInitialized()
+    {
+        // Default the region selector to the configured default so the
+        // dropdown reflects what will actually be used until the user picks.
+        if (string.IsNullOrEmpty(_region))
+            _region = DeployOpt.Value.DefaultAzureLocation;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        // After a laptop standby / page reload, try to rehydrate the
+        // last active deployment modal so the user lands back on the
+        // same live log that is still running on the server. The session
+        // itself lives in the singleton DeploymentOrchestrator, so the
+        // server-side state survives browser reconnects (and even a full
+        // browser relaunch, as long as the app container stays up).
+        try
+        {
+            var raw = await JS.InvokeAsync<string?>(
+                "localStorage.getItem", "agentichub.activeDeployment");
+            if (string.IsNullOrWhiteSpace(raw) || _deploymentModal is null) return;
+
+            using var doc = System.Text.Json.JsonDocument.Parse(raw);
+            var sid = doc.RootElement.TryGetProperty("sessionId", out var s)
+                ? s.GetString() : null;
+            if (string.IsNullOrWhiteSpace(sid)) return;
+
+            await _deploymentModal.ResumeAsync(sid);
+        }
+        catch
+        {
+            // Persisted handle corrupt: drop it so we don't loop.
+            try
+            {
+                await JS.InvokeVoidAsync(
+                    "localStorage.removeItem", "agentichub.activeDeployment");
+            }
+            catch { /* non-fatal */ }
+        }
+    }
+
+    private async Task AgenticDeployAsync(AgentSample agent)
+    {
+        if (_deploymentModal is null) return;
+        await _deploymentModal.OpenAsync(agent.GitHubUrl, _region);
+    }
+
+    private IEnumerable<AgentSample> Filtered =>
+        Catalog.Query(
+            search: _search,
+            category: string.IsNullOrEmpty(_category) ? null : Enum.Parse<AgentCategory>(_category),
+            target: string.IsNullOrEmpty(_target) ? null : Enum.Parse<DeploymentTarget>(_target));
+
+    private async Task ScanWebAsync()
+    {
+        _scanning = true;
+        _deployStatus = new ToastMessage(
+            Title: "Scanning the web...",
+            Message: "Looking for new repositories to add to the catalog.");
+
+        try
+        {
+            var result = await Catalog.ScanAsync();
+            _deployStatus = result.Error is not null
+                ? new ToastMessage(
+                    Title: "Scan completed with errors",
+                    Message: result.Error)
+                : new ToastMessage(
+                    Title: $"Scan complete: {result.Added} new agents",
+                    Message: $"Inspected {result.Inspected} repositories, added {result.Added} new to the catalog.");
+        }
+        finally
+        {
+            _scanning = false;
+            _ = Task.Delay(6000).ContinueWith(_ =>
+            {
+                _deployStatus = null;
+                InvokeAsync(StateHasChanged);
+            });
+        }
+    }
+
+    private async Task DeployAsync(AgentSample agent, DeploymentTarget target)
+    {
+        string url;
+        string message;
+
+        if (target == DeploymentTarget.AzureAIFoundry)
+        {
+            if (!string.IsNullOrEmpty(agent.DeployToAzureUrl))
+            {
+                url = agent.DeployToAzureUrl;
+                message = "Opening the ARM template on Azure Portal. The infrastructure will be provisioned automatically.";
+            }
+            else
+            {
+                url = agent.GitHubUrl;
+                message = "The repo does not expose a direct ARM template: follow the README instructions (typically 'azd up') to deploy to Azure AI Foundry.";
+            }
+        }
+        else
+        {
+            url = !string.IsNullOrEmpty(agent.CopilotStudioImportUrl)
+                ? agent.CopilotStudioImportUrl
+                : agent.GitHubUrl;
+            message = "Opening Copilot Studio. Manually import the solution downloaded from the repo (File > Import solution).";
+        }
+
+        _deployStatus = new ToastMessage(
+            Title: $"Deployment started: {agent.Name}",
+            Message: message);
+
+        await JS.InvokeVoidAsync("open", url, "_blank");
+
+        _ = Task.Delay(6000).ContinueWith(_ =>
+        {
+            _deployStatus = null;
+            InvokeAsync(StateHasChanged);
+        });
+    }
+
+    private static string FormatCategory(AgentCategory c) => c switch
+    {
+        AgentCategory.CustomerService => "Customer Service",
+        AgentCategory.HumanResources => "Human Resources",
+        _ => c.ToString()
+    };
+
+    private sealed record ToastMessage(string Title, string Message);
+}

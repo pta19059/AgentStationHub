@@ -1,0 +1,120 @@
+namespace AgentStationHub.Models;
+
+public enum DeploymentStatus
+{
+    Pending,
+    Cloning,
+    Inspecting,
+    Planning,
+    AwaitingApproval,
+    Rejected,
+    Executing,
+    Verifying,
+    Succeeded,
+    Failed,
+    Cancelled,
+    /// <summary>
+    /// Terminal state: the repository is not a deployment target (course,
+    /// tutorial, pure library, docs site). Different from Failed � the
+    /// pipeline did its job, the repo simply doesn't have anything to run.
+    /// </summary>
+    NotDeployable
+}
+
+public sealed record DeploymentStep(
+    int Id,
+    string Description,
+    string Command,
+    string WorkingDirectory = ".",
+    TimeSpan? Timeout = null)
+{
+    /// <summary>
+    /// Optional typed-action JSON. When non-null the orchestrator
+    /// routes through <c>ActionRegistry.TryParse</c> + the typed
+    /// <c>IDeployAction.ExecuteAsync</c> path instead of executing
+    /// <see cref="Command"/> as a shell string. Backward compatible:
+    /// existing plans without this field execute exactly as before.
+    /// See <c>Services/Actions/IDeployAction.cs</c> for the rationale
+    /// (eliminates the "LLM writes brittle bash pipelines" failure mode).
+    /// </summary>
+    public string? ActionJson { get; init; }
+}
+
+public sealed record DeploymentPlan(
+    string Repo,
+    IReadOnlyList<string> Prerequisites,
+    IReadOnlyDictionary<string, string> Environment,
+    IReadOnlyList<DeploymentStep> Steps,
+    IReadOnlyList<string> VerifyHints)
+{
+    /// <summary>
+    /// Classification signal from the Scout + TechClassifier: 'app',
+    /// 'course', 'library', 'samples', 'docs', 'cli', 'monorepo', 'unknown'.
+    /// Null means the classifier did not produce a kind (legacy path).
+    /// </summary>
+    public string? RepoKind { get; init; }
+
+    /// <summary>
+    /// When false the orchestrator skips execution entirely and surfaces
+    /// <see cref="NotDeployableReason"/> to the user. Default is true so
+    /// existing behaviour is preserved when the classifier is silent.
+    /// </summary>
+    public bool IsDeployable { get; init; } = true;
+
+    /// <summary>
+    /// User-facing explanation of why the repo is not a deploy target
+    /// (e.g. "This repository is a 10-lesson course with 47 Jupyter
+    /// notebooks. It has no deployable infrastructure.").
+    /// </summary>
+    public string? NotDeployableReason { get; init; }
+}
+
+/// <summary>
+/// Fix proposed by the DeploymentDoctor agent after a step failure.
+/// Kind: "replace_step" | "insert_before" | "give_up".
+/// </summary>
+public sealed record Remediation(
+    string Kind,
+    int StepId,
+    IReadOnlyList<DeploymentStep> NewSteps,
+    string? Reasoning);
+
+public sealed record LogEntry(
+    DateTime AtUtc,
+    string Level,          // info | err | status
+    string Message,
+    int? StepId = null);
+
+public sealed class DeploymentSession
+{
+    public string Id { get; } = Guid.NewGuid().ToString("N")[..12];
+    public required string RepoUrl { get; init; }
+    public required string WorkDir { get; init; }
+    /// <summary>
+    /// Azure region chosen by the user for this deploy. Passed through to
+    /// the agent team so the Strategist emits the correct 'azd env set
+    /// AZURE_LOCATION &lt;x&gt;' (and sibling location env vars) in the plan.
+    /// </summary>
+    public required string AzureLocation { get; init; }
+    public DeploymentStatus Status { get; set; } = DeploymentStatus.Pending;
+    public DeploymentPlan? Plan { get; set; }
+    public List<LogEntry> Logs { get; } = new();
+    public string? FinalEndpoint { get; set; }
+    public string? ErrorMessage { get; set; }
+    public DateTime CreatedAtUtc { get; } = DateTime.UtcNow;
+
+    /// <summary>
+    /// Gates the orchestrator's transition from AwaitingApproval to
+    /// Executing. 'RunContinuationsAsynchronously' is CRITICAL: without it
+    /// TrySetResult() runs the deploy's continuation (SetStatus + long
+    /// Docker operations) inline on the SignalR dispatch thread that
+    /// handled the 'Approve &amp; run' click, blocking the Blazor circuit
+    /// until the whole Executing phase finishes � the UI looks frozen.
+    /// With the flag set, the continuation posts onto the thread pool and
+    /// the click returns immediately.
+    /// </summary>
+    public TaskCompletionSource ApprovalTcs { get; }
+        = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public CancellationTokenSource Cts { get; } = new();
+}
