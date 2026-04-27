@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/microsoft/AgentSchema/refs/heads/main/schemas/v1.0/ContainerAgent.yaml
+
+kind: hosted
+name: ash-doctor-hosted
+description: |
+    Hosted-Foundry version of the AgentStationHub remediation Doctor. Receives a failing-step JSON payload (plan + error tail + previous attempts + pre-bundled repo file slices) and returns a typed remediation (replace_step / insert_before / give_up). Backs the AgentStationHub orchestrator's Doctor stage when AzureOpenAI: UseFoundryDoctor=true — STRICT MODE: in-sandbox doctor is NOT used as fall-back, any HTTP/auth/agent failure fails the step.
+metadata:
+    tags:
+        - AgentStationHub
+        - Remediation
+        - Invocations Protocol
+        - Agent Framework
+protocols:
+    - protocol: invocations
+      version: 1.0.0
+resources:
+    cpu: "0.5"
+    memory: 1Gi
+environmentVariables:
+    - name: AZURE_OPENAI_ENDPOINT
+      value: https://agenticstationfoundry.openai.azure.com/
+    - name: AZURE_OPENAI_DEPLOYMENT
+      value: ash-doctor

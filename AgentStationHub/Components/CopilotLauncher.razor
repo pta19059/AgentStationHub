@@ -1,0 +1,278 @@
+@* ============================================================================
+   Floating Copilot CLI launcher.
+
+   Two visual states share the same component:
+     - Collapsed: a circular pill anchored bottom-right of the viewport,
+       visible on every page because this component lives in MainLayout.
+     - Expanded:  a fixed-size panel pinned bottom-right that embeds an
+       <iframe> pointing at the ttyd service running inside the
+       'agentichub-copilot-cli' sidecar container.
+
+   Why iframe + ttyd: the previous implementation pumped Copilot CLI
+   bytes through a SignalR hub into a hand-rolled xterm.js wrapper.
+   Copilot's Ink-based TUI emits enough DEC alt-screen / box-drawing
+   traffic that our bespoke client produced visible rendering glitches
+   (stray "ccccc" runs, broken borders) we never fully tamed. ttyd is a
+   purpose-built binary that ships an upstream-tested xterm.js bundle and
+   runs Copilot under a true forkpty(); embedding it as an iframe drops
+   ~400 lines of glue and gets us a TUI that just works.
+
+   The iframe origin is http://localhost:7681 (the host loopback that
+   CopilotCliService publishes ttyd on); minimising hides the panel
+   without reloading the iframe so the Copilot session keeps running.
+   Closing with the X removes the iframe from the DOM entirely, which
+   ttyd treats as a websocket disconnect and tears the PTY down.
+   ============================================================================ *@
+
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+@* ----------------------------------------------------------------------
+   Pixel-art robot mark (purple body, cyan visor, green mouth). Inline
+   SVG built from a 12x12 grid of <rect> cells so the mark stays crisp
+   at every zoom and avoids webfont / glyph-fallback artefacts.
+   ---------------------------------------------------------------------- *@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"
+     class="copilot-mark" aria-hidden="true" focusable="false"
+     style="display:none" shape-rendering="crispEdges">
+    <symbol id="copilotMark" viewBox="0 0 12 12">
+        <rect x="0" y="0" width="12" height="12" fill="none" />
+        <g fill="#C77DFF">
+            <rect x="2" y="1" width="8" height="1" />
+            <rect x="1" y="2" width="10" height="2" />
+            <rect x="0" y="4" width="12" height="6" />
+            <rect x="1" y="10" width="10" height="1" />
+            <rect x="2" y="11" width="2" height="1" />
+            <rect x="8" y="11" width="2" height="1" />
+        </g>
+        <g fill="#4FD1E0">
+            <rect x="2" y="3" width="8" height="3" />
+            <rect x="1" y="4" width="10" height="1" />
+        </g>
+        <g fill="#000">
+            <rect x="3" y="4" width="2" height="1" />
+            <rect x="7" y="4" width="2" height="1" />
+        </g>
+        <g fill="#7FBA00">
+            <rect x="5" y="8" width="1" height="2" />
+            <rect x="6" y="8" width="1" height="2" />
+        </g>
+    </symbol>
+</svg>
+
+<div class="copilot-launcher @(_open ? "open" : "collapsed")"
+     aria-hidden="@((!_open).ToString().ToLowerInvariant())">
+
+    @* ---------- Collapsed pill ---------- *@
+    <button type="button" class="copilot-fab" title="Open GitHub Copilot CLI"
+            @onclick="OpenAsync"
+            style="@(_open ? "display:none;" : "")">
+        <svg class="copilot-mark" viewBox="0 0 12 12" aria-hidden="true" shape-rendering="crispEdges">
+            <use href="#copilotMark" />
+        </svg>
+        <span class="fab-label">Copilot CLI</span>
+    </button>
+
+    @* ---------- Expanded panel ---------- *@
+    <div class="copilot-panel" style="@(_open ? "" : "display:none;")">
+        <header class="copilot-panel-head">
+            <div class="head-title">
+                <svg class="copilot-mark head-mark" viewBox="0 0 12 12"
+                     aria-hidden="true" shape-rendering="crispEdges">
+                    <use href="#copilotMark" />
+                </svg>
+                <span>GitHub Copilot CLI</span>
+            </div>
+            <div class="head-actions">
+                @* Reload nukes the iframe so ttyd sees a fresh
+                   websocket; useful if the operator's network blipped
+                   or the sidecar was restarted out-of-band. *@
+                <button type="button" class="icon-btn reconnect" title="Reload terminal"
+                        @onclick="Reload">
+                    <i class="bi bi-arrow-clockwise"></i>
+                </button>
+                <button type="button" class="icon-btn minimise" title="Minimise"
+                        @onclick="Minimise">
+                    <i class="bi bi-dash-lg"></i>
+                </button>
+                <button type="button" class="icon-btn danger" title="Close (ends session)"
+                        @onclick="CloseAsync">
+                    <i class="bi bi-x-lg"></i>
+                </button>
+            </div>
+        </header>
+
+        @* The iframe is only mounted while _mounted=true; closing the
+           panel sets it false so ttyd tears the PTY down on websocket
+           disconnect instead of leaving an orphaned Copilot process.
+           ?v=@_iframeNonce forces a hard reload after the user clicks
+           the reconnect icon (otherwise the browser would keep the
+           old websocket-broken page in cache).
+
+           The src is a same-origin path: /copilot/ is reverse-proxied
+           by the Hub on its own port (8080) to the ttyd sidecar, both
+           in bare-metal mode (proxy -> 127.0.0.1:7681) and in VM /
+           in-container mode (proxy -> agentichub-copilot-cli:7681 over
+           the compose docker network). This keeps the panel working
+           when the user opens the Hub from a remote browser without
+           any extra port-forward or NSG rule. *@
+        @if (_mounted)
+        {
+            <iframe class="copilot-frame"
+                    src="@($"/copilot/?v={_iframeNonce}")"
+                    title="GitHub Copilot CLI terminal"
+                    referrerpolicy="no-referrer"></iframe>
+        }
+    </div>
+</div>
+
+<style>
+    .copilot-launcher { position: fixed; right: 20px; bottom: 20px; z-index: 10000; }
+
+    /* ------- Collapsed FAB ------- */
+    .copilot-fab {
+        display: inline-flex; align-items: center; gap: .55rem;
+        padding: .6rem 1rem; border-radius: 999px; border: 0;
+        color: #0b1220;
+        background: linear-gradient(90deg, #FFB900, #7FBA00);
+        box-shadow: 0 10px 24px rgba(0,0,0,.25);
+        font-weight: 600; font-size: .9rem; cursor: pointer;
+        transition: transform .15s ease, box-shadow .15s ease;
+    }
+    .copilot-fab:hover { transform: translateY(-2px); box-shadow: 0 14px 28px rgba(0,0,0,.3); }
+    .copilot-fab .copilot-mark { width: 22px; height: 22px; }
+    .copilot-fab .fab-label { white-space: nowrap; }
+
+    /* ------- Expanded panel ------- */
+    .copilot-panel {
+        width: 920px; height: 560px;
+        max-width: calc(100vw - 40px);
+        max-height: calc(100vh - 40px);
+        background: #0b1220;
+        border: 1px solid #1f2937;
+        border-radius: 12px;
+        box-shadow: 0 20px 50px rgba(0,0,0,.5);
+        display: flex; flex-direction: column;
+        overflow: hidden;
+        color: #e5e7eb;
+    }
+    .copilot-panel-head {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: .55rem .75rem;
+        background: #111827;
+        border-bottom: 1px solid #1f2937;
+    }
+    .head-title { display: inline-flex; align-items: center; gap: .55rem; font-weight: 600; font-size: .9rem; }
+    .head-title .head-mark { width: 20px; height: 20px; }
+
+    .head-actions { display: inline-flex; gap: .35rem; }
+    .icon-btn {
+        background: transparent; color: #e5e7eb;
+        border: 1px solid transparent;
+        width: 32px; height: 32px; border-radius: 8px;
+        display: grid; place-items: center; cursor: pointer;
+        transition: transform .12s ease, box-shadow .12s ease;
+    }
+    .icon-btn i { font-size: 1rem; }
+    .icon-btn.reconnect {
+        color: #fff;
+        background: linear-gradient(135deg, #00A4EF, #0078D4);
+        box-shadow: 0 3px 10px rgba(0,164,239,.35);
+    }
+    .icon-btn.reconnect:hover { transform: translateY(-1px); box-shadow: 0 6px 14px rgba(0,164,239,.5); }
+    .icon-btn.minimise {
+        color: #0b1220;
+        background: linear-gradient(135deg, #FFB900, #7FBA00);
+        box-shadow: 0 3px 10px rgba(255,185,0,.35);
+    }
+    .icon-btn.minimise:hover { transform: translateY(-1px); box-shadow: 0 6px 14px rgba(127,186,0,.45); }
+    .icon-btn.danger {
+        color: #fff;
+        background: linear-gradient(135deg, #F25022, #c1351a);
+        box-shadow: 0 3px 10px rgba(242,80,34,.4);
+    }
+    .icon-btn.danger:hover { transform: translateY(-1px); box-shadow: 0 6px 14px rgba(242,80,34,.55); }
+
+    .copilot-frame {
+        flex: 1 1 auto;
+        width: 100%; border: 0; background: #0b1220;
+    }
+</style>
+
+@code {
+    /// <summary>
+    /// Host port that <c>CopilotCliService</c> publishes ttyd on. Kept
+    /// in sync with <c>CopilotCliService.HostPort</c>.
+    /// </summary>
+    private const int TtydPort = 7681;
+
+    private bool _open;
+    private bool _mounted;
+    private long _iframeNonce = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+    private DotNetObjectReference<CopilotLauncher>? _selfRef;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            // Register a global entry point so plain anchors / nav links
+            // anywhere on the site can open this panel via
+            // `window.copilotLauncher.open()`.
+            _selfRef = DotNetObjectReference.Create(this);
+            await JS.InvokeVoidAsync("copilotLauncher.register", _selfRef);
+        }
+    }
+
+    /// <summary>Invoked from JS (anchor, nav link, home-page CTA).</summary>
+    [JSInvokable]
+    public Task OpenFromJs() => OpenAsync();
+
+    private Task OpenAsync()
+    {
+        _open    = true;
+        _mounted = true;
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Hide the panel but keep the iframe (and PTY) alive.</summary>
+    private void Minimise()
+    {
+        _open = false;
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Force-reload the embedded terminal. Bumps the URL nonce and
+    /// briefly unmounts the iframe so the browser issues a fresh
+    /// websocket handshake instead of reusing a stale connection.
+    /// </summary>
+    private async Task Reload()
+    {
+        _mounted = false;
+        StateHasChanged();
+        await Task.Yield();
+        _iframeNonce = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        _mounted = true;
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Explicit close: unmounts the iframe so ttyd sees the websocket
+    /// drop and reaps the Copilot process. Re-opening starts a brand
+    /// new session with a fresh PTY.
+    /// </summary>
+    private Task CloseAsync()
+    {
+        _open    = false;
+        _mounted = false;
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _selfRef?.Dispose();
+        return ValueTask.CompletedTask;
+    }
+}

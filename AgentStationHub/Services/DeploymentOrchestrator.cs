@@ -1,0 +1,2896 @@
+﻿using System.Collections.Concurrent;
+using AgentStationHub.Hubs;
+using AgentStationHub.Models;
+using AgentStationHub.Services.Agents;
+using AgentStationHub.Services.Security;
+using AgentStationHub.Services.Tools;
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Options;
+
+namespace AgentStationHub.Services;
+
+public sealed class DeploymentOrchestrator
+{
+    private readonly IHubContext<DeploymentHub> _hub;
+    private readonly IServiceProvider _sp;
+    private readonly DeploymentOptions _opt;
+    private readonly ILogger<DeploymentOrchestrator> _log;
+    private readonly AgentMemoryStore _memory;
+    private readonly DeploymentSessionStore _store;
+    private readonly ConcurrentDictionary<string, DeploymentSession> _sessions = new();
+
+    public DeploymentOrchestrator(
+        IHubContext<DeploymentHub> hub,
+        IServiceProvider sp,
+        IOptions<DeploymentOptions> opt,
+        ILogger<DeploymentOrchestrator> log,
+        AgentMemoryStore memory,
+        DeploymentSessionStore store)
+    {
+        _hub = hub;
+        _sp = sp;
+        _opt = opt.Value;
+        _log = log;
+        _memory = memory;
+        _store = store;
+
+        // Rehydrate sessions left on disk by a previous app lifetime.
+        // The in-process pipeline task cannot be resurrected — the
+        // Docker sandbox child died with the app — but the session's
+        // status/plan/logs are kept so the user's localStorage-driven
+        // resume still lands on a meaningful view (last known state +
+        // an explicit "Interrupted" marker) instead of an empty page.
+        RehydrateSessionsFromDisk();
+
+        // Plant durable, codebase-authored lessons as GLOBAL insights
+        // (RepoUrl == null). These are consulted on every deploy by
+        // GetRelevantInsights() and forwarded to the Strategist and
+        // Doctor agents, so repeat mistakes the project already knows
+        // about do NOT need to be rediscovered by the LLM each time.
+        // SeedGlobalInsightIfChanged is a no-op when the value is
+        // already stored unchanged, so this is safe to call at every
+        // boot.
+        SeedBuiltInGlobalInsights();
+
+        // Cleanup of ORPHAN sandbox containers from previous app lifetimes.
+        // Classic failure mode: a deploy got stuck on a buildx hang (or
+        // the app container crashed / was restarted) and the sandbox
+        // sibling kept running on the host daemon. Without this sweep the
+        // zombie sandbox holds docker resources, and — more dangerously —
+        // still appears "busy" from the user's perspective (Docker Desktop
+        // shows "sandbox Up 9 hours" when the deploy was abandoned the day
+        // before). On startup we now forcibly kill any container whose
+        // image starts with 'agentichub/sandbox:'. This is safe because:
+        //   • The _sessions dictionary is always empty at construction
+        //     time (singleton service, boots with the process).
+        //   • Every live session owns a CancellationToken that would
+        //     have cleaned its sandbox; if a sandbox exists at boot
+        //     it's guaranteed to be an orphan.
+        // Failures of this sweep are non-fatal: the app still starts.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await CleanOrphanSandboxesAsync("startup orphan sweep");
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex,
+                    "Orphan sandbox cleanup failed at startup (non-fatal). " +
+                    "If you see a stuck 'agentichub/sandbox:*' container, 'docker kill' it manually.");
+            }
+        });
+    }
+
+    /// <summary>
+    /// Enumerate and force-kill every container running an
+    /// <c>agentichub/sandbox:*</c> image. Used at startup (to reap
+    /// orphans from previous app lifetimes) and on explicit session
+    /// cancel (to make sure the sandbox sibling dies with the session
+    /// and isn't left holding a buildx lock against the host daemon).
+    /// </summary>
+    private async Task CleanOrphanSandboxesAsync(string reason)
+    {
+        // List first so we can report what we're killing.
+        var listOut = new System.Text.StringBuilder();
+        var listResult = await CliWrap.Cli.Wrap("docker")
+            .WithArguments(new[]
+            {
+                "ps", "--filter", "ancestor=agentichub/sandbox:v10",
+                "--filter", "ancestor=agentichub/sandbox:v9",
+                "--filter", "ancestor=agentichub/sandbox:v8",
+                "--format", "{{.ID}} {{.Image}} {{.Status}}"
+            })
+            .WithValidation(CliWrap.CommandResultValidation.None)
+            .WithStandardOutputPipe(CliWrap.PipeTarget.ToStringBuilder(listOut))
+            .ExecuteAsync();
+
+        var lines = listOut.ToString()
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToList();
+        if (lines.Count == 0)
+        {
+            _log.LogInformation("Sandbox orphan sweep ({Reason}): none found.", reason);
+            return;
+        }
+
+        _log.LogWarning(
+            "Sandbox orphan sweep ({Reason}): killing {Count} zombie sandbox container(s):\n{Details}",
+            reason, lines.Count, string.Join("\n", lines));
+
+        foreach (var line in lines)
+        {
+            var id = line.Split(' ', 2)[0];
+            if (string.IsNullOrWhiteSpace(id)) continue;
+            try
+            {
+                await CliWrap.Cli.Wrap("docker")
+                    .WithArguments(new[] { "kill", id })
+                    .WithValidation(CliWrap.CommandResultValidation.None)
+                    .WithStandardOutputPipe(CliWrap.PipeTarget.Null)
+                    .WithStandardErrorPipe(CliWrap.PipeTarget.Null)
+                    .ExecuteAsync();
+            }
+            catch (Exception killEx)
+            {
+                _log.LogWarning(killEx, "Failed to kill orphan sandbox {Id}", id);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Hard-coded lessons about failure modes this project has already
+    /// debugged at least once. Stored as GLOBAL insights (RepoUrl=null)
+    /// so they are surfaced to the planning and Doctor agents on every
+    /// future deploy regardless of repo. Keep each value SHORT and
+    /// ACTIONABLE — they are injected into the agent prompts verbatim.
+    /// Update the <c>key</c> suffix (…v2, …v3) when changing the text
+    /// to force a re-seed, otherwise SeedGlobalInsightIfChanged will
+    /// silently skip the write.
+    /// </summary>
+    private void SeedBuiltInGlobalInsights()
+    {
+        // Lesson from Azure-Samples/azure-ai-travel-agents and every
+        // other azd + Container Apps monorepo: `azd up` runs provision
+        // THEN deploy. The provision phase creates Container Apps with
+        // a placeholder image (mcr.microsoft.com/azuredocs/
+        // containerapps-helloworld); only the deploy phase does docker
+        // build, push to ACR, and revision update. If `azd up` completes
+        // but any Container App still shows the hello-world image, the
+        // deploy half silently failed or was skipped — the fix is NOT
+        // to rerun provision but to run `azd deploy --no-prompt` on its
+        // own, optionally scoped to the failing service
+        // (`azd deploy <serviceName> --no-prompt`).
+        _memory.SeedGlobalInsightIfChanged(
+            "azd.containerapps.hello-world-placeholder",
+            "When deploying a repo whose azure.yaml targets Azure Container " +
+            "Apps: `azd up` provisions first (Container Apps are created with " +
+            "the mcr.microsoft.com/azuredocs/containerapps-helloworld placeholder " +
+            "image) and only then runs deploy (docker build + ACR push + " +
+            "revision update). If the final container apps still serve the " +
+            "hello-world image, the deploy half failed — the correct remediation " +
+            "is `azd deploy --no-prompt` (NOT another `azd up`). Per-service " +
+            "retry: `azd deploy <serviceName> --no-prompt`. Always add an " +
+            "explicit `azd deploy --no-prompt` verification step AFTER `azd up " +
+            "--no-prompt` when the plan targets Container Apps.",
+            confidence: 1.0);
+
+        // Companion lesson for the Doctor: how to detect the condition
+        // so it can trigger the fix without relying on the verifier.
+        _memory.SeedGlobalInsightIfChanged(
+            "azd.containerapps.hello-world-detect",
+            "Detect the hello-world trap with: `az containerapp list -g " +
+            "<resourceGroup> --query \"[].{name:name,image:properties.template." +
+            "containers[0].image}\" -o tsv` — any row whose image contains " +
+            "'containerapps-helloworld' means that service's `azd deploy` " +
+            "never completed. Fix: `azd deploy --no-prompt` from the repo root " +
+            "(the env already has AZURE_SUBSCRIPTION_ID, AZURE_TENANT_ID, " +
+            "AZURE_LOCATION set).",
+            confidence: 1.0);
+    }
+
+    public DeploymentSession? Get(string id) => _sessions.TryGetValue(id, out var s) ? s : null;
+
+    /// <summary>
+    /// Reads every persisted session from disk and registers it in the
+    /// in-memory dictionary. Any session whose status was NOT terminal
+    /// at the time of the previous shutdown is transitioned to Failed
+    /// with an explicit "Interrupted" marker, because the background
+    /// pipeline task that was driving it is long gone.
+    /// </summary>
+    private void RehydrateSessionsFromDisk()
+    {
+        try
+        {
+            foreach (var s in _store.LoadAll())
+            {
+                var wasTerminal = s.Status
+                    is DeploymentStatus.Succeeded
+                    or DeploymentStatus.Failed
+                    or DeploymentStatus.Cancelled
+                    or DeploymentStatus.Rejected
+                    or DeploymentStatus.NotDeployable;
+
+                if (!wasTerminal)
+                {
+                    // The previous process died mid-deploy (app restart,
+                    // container recreate, crash). The sandbox sibling is
+                    // also gone, so there is nothing to continue. Mark
+                    // the session as Failed so the UI stops showing a
+                    // spinner and the user knows to restart the run.
+                    s.Status = DeploymentStatus.Failed;
+                    var hint = "The deploy was interrupted by an app restart " +
+                               "before reaching a terminal state. Server-side logs " +
+                               "up to the last checkpoint are preserved; please " +
+                               "start a new deploy to continue.";
+                    s.ErrorMessage = string.IsNullOrWhiteSpace(s.ErrorMessage)
+                        ? hint
+                        : s.ErrorMessage + " | " + hint;
+                    s.Logs.Add(new LogEntry(
+                        DateTime.UtcNow, "err",
+                        "[orchestrator] " + hint));
+                    _store.SaveLater(s);
+                }
+
+                _sessions[s.Id] = s;
+            }
+            _log.LogInformation(
+                "Rehydrated {Count} persisted deployment session(s) from {Path}.",
+                _sessions.Count, _store.Directory_);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Session rehydration failed (non-fatal). Previous deploys will " +
+                "appear as fresh runs instead of resumable handles.");
+        }
+    }
+
+
+    public string Start(string repoUrl, string? azureLocation = null)
+    {
+        var root = string.IsNullOrWhiteSpace(_opt.WorkRootDir)
+            ? Path.Combine(Path.GetTempPath(), "agentichub")
+            : _opt.WorkRootDir!;
+        Directory.CreateDirectory(root);
+
+        // Resolve the Azure region: explicit user choice wins, then config
+        // default, finally a hardcoded safe default. The string is
+        // lower-cased and trimmed because azd is case-sensitive about
+        // AZURE_LOCATION values.
+        var location = (azureLocation ?? _opt.DefaultAzureLocation ?? "eastus")
+            .Trim().ToLowerInvariant();
+
+        var s = new DeploymentSession
+        {
+            RepoUrl = repoUrl,
+            WorkDir = Path.Combine(root, Guid.NewGuid().ToString("N")[..8]),
+            AzureLocation = location
+        };
+        _sessions[s.Id] = s;
+        _store.SaveLater(s);
+        _ = Task.Run(() => RunAsync(s));
+        return s.Id;
+    }
+
+    public void Approve(string id)
+    {
+        if (_sessions.TryGetValue(id, out var s)) s.ApprovalTcs.TrySetResult();
+    }
+
+    public void Cancel(string id)
+    {
+        if (_sessions.TryGetValue(id, out var s))
+        {
+            s.Cts.Cancel();
+            s.ApprovalTcs.TrySetCanceled();
+
+            // Also reap the sandbox sibling. Cancelling the CTS unblocks
+            // every 'await' in RunAsync but it does NOT kill the child
+            // container cleanly — 'docker run --rm' only removes the
+            // container AFTER the process inside exits, and a stuck
+            // 'docker buildx build' child of a hung 'azd deploy' can keep
+            // the sandbox alive indefinitely. Without this reap every
+            // user-cancel leaks a zombie 'agentichub/sandbox:*' that
+            // keeps holding buildx locks and misleading the user that
+            // the deploy is still running. We do it fire-and-forget so
+            // the UI cancel button stays responsive.
+            _ = Task.Run(async () =>
+            {
+                try { await CleanOrphanSandboxesAsync($"cancel session {id}"); }
+                catch (Exception ex) { _log.LogWarning(ex, "Post-cancel sandbox reap failed"); }
+            });
+        }
+    }
+
+    private async Task RunAsync(DeploymentSession s)
+    {
+        // No wall-clock limit on a session. A full 'azd up' for a rich
+        // template can legitimately run well over an hour; enforcing a
+        // timeout here would kill deploys mid-provisioning and leave Azure
+        // resources in a dangling state. The three natural terminators
+        // remain in place:
+        //   • user click on Cancel -> s.Cts.Cancel()
+        //   • DeploymentDoctor returning kind="give_up"
+        //   • a plan step's own per-step timeout firing
+        var ct = s.Cts.Token;
+
+        // Hoisted ABOVE the try so the outer OperationCanceledException
+        // handler can read which step was running when a timeout fired.
+        // Without this the user only saw a generic "a step timed out"
+        // with no indication of WHICH step.
+        DeploymentStep? currentStep = null;
+        DateTime? currentStepStartedAt = null;
+        TimeSpan currentStepBudget = TimeSpan.Zero;
+
+        // Long-lived sandbox container for this deploy. Created right after
+        // workspace staging, torn down in the outer finally. Owning it at
+        // this scope (instead of inline-using) keeps it alive across the
+        // step loop, the hollow-deploy autonomous recovery, and any future
+        // post-loop diagnostics, while still guaranteeing cleanup on every
+        // exit path (success, failure, cancel, exception).
+        SandboxSession? session = null;
+
+        try
+        {
+            using var scope = _sp.CreateScope();
+            var planner = scope.ServiceProvider.GetRequiredService<PlanExtractorAgent>();
+            var verifier = scope.ServiceProvider.GetRequiredService<VerifierAgent>();
+
+            // ---- Preflight: verify Docker daemon is reachable ----
+            // The entire pipeline (agent sandbox, plan execution, Doctor
+            // remediation) runs through 'docker run' against the host
+            // daemon. Without it every phase fails in a confusing cascade:
+            // runner exits 1 with no stdout, the fallback planner emits a
+            // nonsense plan, the first step fails with the SAME docker
+            // error, the Doctor is invoked, the Doctor ALSO needs docker,
+            // crashes, and the user is left with three error messages and
+            // no idea that the root cause is just "Docker Desktop not
+            // running". Catch it ONCE, up front, with an actionable
+            // message.
+            var dockerError = await PreflightDockerAsync(ct);
+            if (dockerError is not null)
+            {
+                s.ErrorMessage =
+                    "Docker Desktop is not running or not reachable from this process.\n\n" +
+                    "AgentStationHub spawns its deployment sandboxes as sibling containers " +
+                    "on the host Docker daemon, so Docker Desktop must be started BEFORE a " +
+                    "deploy is launched. Please:\n" +
+                    "  1. Start Docker Desktop and wait for the whale icon to stop animating.\n" +
+                    "  2. Retry the deploy.\n\n" +
+                    $"Underlying error: {dockerError}";
+                await Log(s, "err", s.ErrorMessage);
+                await SetStatus(s, DeploymentStatus.Failed);
+                return;
+            }
+
+            await SetStatus(s, DeploymentStatus.Cloning);
+            await GitTool.CloneAsync(s.RepoUrl, s.WorkDir, msg => _ = Log(s, "info", msg), ct);
+
+            await SetStatus(s, DeploymentStatus.Inspecting);
+            var files = new FileTool(s.WorkDir);
+            // README is the primary source of deployment instructions. Read up
+            // to 60 KB so we do not truncate large docs before the 'Deployment'
+            // / 'Getting Started' section.
+            var readme = files.ReadText("README.md", maxBytes: 60_000)
+                          ?? files.ReadText("readme.md", maxBytes: 60_000)
+                          ?? "";
+
+            // Gather the content of key orchestration files so the planner can
+            // decide whether 'azd' is viable or if we need different tooling
+            // (docker compose, npm, python, make, terraform, ...).
+            var keyFiles = new Dictionary<string, string?>
+            {
+                ["azure.yaml"]         = files.ReadText("azure.yaml")         ?? files.ReadText("azure.yml"),
+                ["Dockerfile"]         = files.ReadText("Dockerfile"),
+                ["docker-compose.yml"] = files.ReadText("docker-compose.yml") ?? files.ReadText("docker-compose.yaml") ?? files.ReadText("compose.yaml"),
+                ["package.json"]       = files.ReadText("package.json", maxBytes: 4_000),
+                ["pyproject.toml"]     = files.ReadText("pyproject.toml", maxBytes: 4_000),
+                ["requirements.txt"]   = files.ReadText("requirements.txt", maxBytes: 4_000),
+                ["Makefile"]           = files.ReadText("Makefile", maxBytes: 4_000),
+                ["setup.sh"]           = files.ReadText("setup.sh", maxBytes: 4_000),
+                ["main.bicep"]         = files.ReadText("infra/main.bicep", maxBytes: 4_000),
+                ["main.tf"]            = files.ReadText("infra/main.tf", maxBytes: 4_000)
+            };
+            var presentFiles = keyFiles.Where(kv => !string.IsNullOrWhiteSpace(kv.Value))
+                                       .ToDictionary(kv => kv.Key, kv => kv.Value!);
+
+            var infra = files.ListFiles("infra", "*.*")
+                             .Concat(files.ListFiles(".", "azure.yaml"))
+                             .Concat(files.ListFiles(".", "azure.yml"))
+                             .Distinct()
+                             .ToList();
+            await Log(s, "info",
+                $"README: {readme.Length} chars, infra files: {infra.Count}, " +
+                $"key files present: [{string.Join(", ", presentFiles.Keys)}]");
+
+            var toolchain = RepoInspector.Inspect(s.WorkDir);
+            var detected = string.Join(", ", toolchain.Summary());
+            await Log(s, "status",
+                $"Detected toolchains: {(string.IsNullOrEmpty(detected) ? "none" : detected)}");
+            foreach (var r in toolchain.Rationale)
+                await Log(s, "info", $"  • {r}");
+
+            await SetStatus(s, DeploymentStatus.Planning);
+
+            // Resolve the sandbox image up-front so the SAME image is used by
+            // both the planning-phase Agent Framework runner and the execute-
+            // phase step containers. On arm64 hosts this swaps the amd64-only
+            // default image for our locally-built 'agentichub/sandbox:vN'.
+            var imageToUse = await SandboxImageBuilder.ResolveAsync(
+                _opt.SandboxImage,
+                line => _ = Log(s, "info", line),
+                ct);
+
+            // Preferred path: invoke the Microsoft Agent Framework multi-agent
+            // team running inside the Docker sandbox (Scout → TechClassifier →
+            // DeploymentStrategist → SecurityReviewer). If that fails (runner
+            // publish error, container issue, LLM error), fall back to the
+            // legacy in-process PlanExtractorAgent so a deploy attempt is
+            // never dead-in-the-water.
+            DeploymentPlan plan;
+            var runnerHost = _sp.GetService<SandboxRunnerHost>();
+            if (runnerHost is not null)
+            {
+                try
+                {
+                    // Pull cross-session insights for this repo so the
+                    // Strategist starts with prior learnings instead of
+                    // re-discovering the same constraints from scratch.
+                    var priorInsights = _memory.GetRelevantInsights(s.RepoUrl);
+                    if (priorInsights.Count > 0)
+                        await Log(s, "info",
+                            $"Memory: passing {priorInsights.Count} prior insight(s) to the planning team.");
+
+                    await Log(s, "status",
+                        $"Invoking Agent Framework team in sandbox (region: {s.AzureLocation})...");
+                    plan = await runnerHost.ExtractPlanAsync(
+                        imageToUse, s.RepoUrl, s.WorkDir, s.AzureLocation,
+                        (lvl, line) => _ = Log(s, lvl, line),
+                        ct,
+                        priorInsights);
+                }
+                catch (Exception ex)
+                {
+                    await Log(s, "err",
+                        $"Sandbox Agent Framework run failed: {ex.Message}. " +
+                        "Falling back to in-process planner.");
+                    plan = await planner.ExtractAsync(
+                        s.RepoUrl, readme, infra, presentFiles, toolchain, ct);
+                }
+            }
+            else
+            {
+                plan = await planner.ExtractAsync(
+                    s.RepoUrl, readme, infra, presentFiles, toolchain, ct);
+            }
+            var (ok, reason) = PlanValidator.Validate(plan);
+            if (!ok)
+            {
+                s.ErrorMessage = reason;
+                await SetStatus(s, DeploymentStatus.Rejected);
+                return;
+            }
+
+            // Guarantee a FRESH resource group on every deploy.
+            // azd derives the Azure Resource Group name as 'rg-<envName>',
+            // so reusing the same envName across deploys makes the second
+            // `azd up` fight with:
+            //   � the previous RG still in "Deleting" state (cannot
+            //     create until it's gone � can take 5-10 min),
+            //   � stale soft-deleted Key Vault / Cognitive Services
+            //     accounts with identical names,
+            //   � leftover Container Apps whose revisions block
+            //     provisioning.
+            // We append a short timestamp suffix to whatever name the
+            // Strategist picked so every deploy lands in a brand-new RG.
+            // The original prefix is preserved so users can still tell
+            // at a glance which repo the RG belongs to.
+            plan = EnforceUniqueAzdEnvName(plan,
+                line => _ = Log(s, "info", line));
+
+            s.Plan = plan;
+            _store.SaveLater(s);
+            await _hub.Clients.Group(s.Id).SendAsync("PlanReady", plan, ct);
+
+            // Classification gate: the repo may be a course / library /
+            // docs site / cli tool with no deploy target. The TechClassifier
+            // inside the sandbox team flags these by returning a plan with
+            // IsDeployable=false and a user-facing reason. Short-circuit
+            // the pipeline here with a dedicated NotDeployable status.
+            if (!plan.IsDeployable)
+            {
+                s.ErrorMessage = plan.NotDeployableReason
+                    ?? "This repository does not appear to contain a deployable application.";
+                await Log(s, "info",
+                    $"Classifier verdict: not deployable ({plan.RepoKind ?? "unknown"}). {s.ErrorMessage}");
+                await SetStatus(s, DeploymentStatus.NotDeployable);
+                return;
+            }
+
+            // Surface which strategy the planner used (README vs inferred).
+            var planSource = plan.VerifyHints.FirstOrDefault(h => h.StartsWith("source:", StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrEmpty(planSource))
+                await Log(s, "info", $"Plan {planSource}");
+
+            if (!_opt.AutoApprove)
+            {
+                await SetStatus(s, DeploymentStatus.AwaitingApproval);
+                await s.ApprovalTcs.Task.WaitAsync(ct);
+            }
+
+            await SetStatus(s, DeploymentStatus.Executing);
+
+            // Ensure the sandbox has its own (Linux-native) Azure login cached
+            // in a persistent Docker volume. First deploy triggers a device
+            // code flow; subsequent deploys reuse the cached tokens.
+            var hostTenantId = ReadHostTenantId();
+            await SandboxAzureAuth.EnsureAsync(
+                imageToUse,
+                hostTenantId,
+                (lvl, line) => _ = Log(s, lvl, line),
+                ct);
+
+            // Stage the cloned repo into a per-session DOCKER NAMED VOLUME
+            // and use it as /workspace for every plan step. This is the
+            // definitive fix for the EACCES / exit 126 class of failures
+            // we used to see on samples like azure-ai-travel-agents:
+            // postinstall scripts (esbuild / tree-sitter / node-gyp-build)
+            // produce binaries inside node_modules/.bin that the kernel
+            // refuses to execute when /workspace is a virtio-fs / 9p
+            // bind from a Windows host (lost +x bit, sometimes noexec).
+            // A named volume lives on the Docker VM's native ext4 and
+            // honours full Linux semantics. See SandboxWorkspaceVolume.
+            string? workspaceVolume = null;
+            try
+            {
+                workspaceVolume = await SandboxWorkspaceVolume.EnsureAsync(
+                    s.Id, s.WorkDir,
+                    (lvl, line) => _ = Log(s, lvl, line),
+                    ct);
+            }
+            catch (Exception ex)
+            {
+                await Log(s, "warn",
+                    $"Could not create per-session workspace volume " +
+                    $"({ex.GetType().Name}: {ex.Message}). Falling back to host bind " +
+                    "mount � deploys that postinstall native binaries (esbuild, " +
+                    "tree-sitter, node-gyp) may fail with EACCES on Windows hosts.");
+            }
+
+            // Generic preflight: walk every docker-compose*.y?ml under
+            // /workspace and `touch` any env_file references that don't
+            // exist yet. Many Azure samples (notably azure-ai-travel-
+            // agents) ship hooks that build images via `docker compose
+            // build`; compose v2 fails fast with exit 14 if a service
+            // declares an env_file that is not on disk, even when the
+            // file would have been irrelevant at build time. Hook scripts
+            // try to seed these from .env.sample but routinely skip
+            // services that don't have one, leaving the deploy to wedge
+            // the Doctor in an 8-attempt loop chasing the same
+            // ENOENT-after-ENOENT pattern. Pre-touching the placeholders
+            // makes compose accept them; real runtime configuration is
+            // still injected via `environment:` and Azure-set env vars.
+            // Best-effort, idempotent, never fails the deploy on its own.
+            if (workspaceVolume is not null)
+            {
+                await WorkspaceEnvFilePrimer.PrimeAsync(
+                    workspaceVolume,
+                    (lvl, line) => _ = Log(s, lvl, line),
+                    ct);
+            }
+
+            // Boot the long-lived sandbox container. Every step from here on
+            // is a `docker exec` into THIS container, so filesystem state,
+            // env vars, MSAL tokens, ACR credentials, npm/pip caches and
+            // any +x bit set by postinstall scripts persist across steps
+            // for free. See SandboxSession class doc for the full rationale.
+            session = await SandboxSession.StartAsync(
+                s.Id, imageToUse, workspaceVolume, s.WorkDir,
+                (lvl, line) => _ = Log(s, lvl, line),
+                ct);
+
+            var docker = new DockerShellTool(session,
+                (lvl, line) => _ = Log(s, lvl, line));
+            var env = plan.Environment.ToDictionary(kv => kv.Key, kv => kv.Value);
+
+            // Typed-action context: typed actions read deploy targets
+            // (resource group, ACR name, per-service last-built image)
+            // through this object instead of asking the LLM to extract
+            // them via shell pipelines. We pass `env` BY REFERENCE so
+            // every existing AzdEnvLoader.LoadAndMergeAsync(env, ...)
+            // call automatically updates DeployContext.Env, and the
+            // explicit MergeFromAzdEnv() calls below promote well-known
+            // keys into typed properties (AcrName, ResourceGroup, etc).
+            var deployCtx = new Services.Actions.DeployContext(
+                sessionId: s.Id,
+                repoUrl: s.RepoUrl,
+                workDir: s.WorkDir,
+                azureLocation: s.AzureLocation,
+                initialEnv: env);
+            deployCtx.MergeFromAzdEnv(env);
+
+            // NOTE: we deliberately DO NOT forward AZURE_SUBSCRIPTION_ID /
+            // AZURE_TENANT_ID from the host's azureProfile.json here. The
+            // sandbox has its own 'az login' (persistent Docker volume, see
+            // SandboxAzureAuth) that may be tied to a DIFFERENT identity
+            // than the one cached on the host. Forcing the host's sub id
+            // into the container caused 'failed to resolve user access to
+            // subscription' errors whenever the two accounts differed.
+            // Instead we let azd discover the subscription via the sandbox
+            // user's default ('az account show' inside the container).
+
+            // Extract the azd environment name from the plan so we can tag
+            // deployment-progress polling against it. Priority:
+            //   1. env["AZURE_ENV_NAME"] if the planner set it explicitly;
+            //   2. the first argument of 'azd env new <name>' in any step;
+            //   3. a fallback derived from the session id.
+            var azdEnvName = ResolveAzdEnvName(env, plan);
+
+            // Mutable list so the Doctor can insert/replace steps at runtime.
+            var steps = plan.Steps.ToList();
+            var previousAttempts = new List<string>();
+            // Dedicated counter for real LLM Doctor invocations (excludes
+            // orchestrator-level cheap retries like ContainerAppValidation
+            // Timeout). Enforced against DeploymentOptions.MaxDoctorInvocations
+            // PerSession so a hallucinating model cannot loop on micro-
+            // variations the near-duplicate guard fails to catch.
+            int doctorInvocations = 0;
+
+            // Empty-output dead-sandbox detector: when consecutive steps
+            // exit 0 with zero captured output, the sandbox container has
+            // almost certainly died and RunAsync is silently no-op'ing.
+            // We bail out with an explicit error rather than letting the
+            // deploy "succeed" with no real work done.
+            int consecutiveEmptySuccesses = 0;
+
+            for (int i = 0; i < steps.Count; i++)
+            {
+                var step = steps[i];
+                currentStep = step;
+                currentStepStartedAt = DateTime.UtcNow;
+
+                // Pre-execution normalisation: rewrite pwsh invocations
+                // that slip past the Strategist / Doctor. The sandbox
+                // image has no PowerShell, so 'pwsh -c "..."' exits 127
+                // with 'command not found'. Rather than bouncing through
+                // a Doctor attempt, convert on the fly to 'bash -lc' —
+                // the two shells share enough syntax for the patterns we
+                // see in azd setup (command substitution, env assignment)
+                // that a direct swap is correct in practice.
+                if (ContainsPwsh(step.Command))
+                {
+                    var rewritten = RewritePwshToBash(step.Command);
+                    await Log(s, "warn",
+                        "Step references 'pwsh' which is not available in the sandbox. " +
+                        "Auto-rewriting to 'bash -lc' to avoid a Doctor round-trip.",
+                        step.Id);
+                    step = step with { Command = rewritten };
+                    steps[i] = step;
+                }
+
+                // Pre-execution normalisation #2: rewrite raw `azd up` to
+                // the baked `agentic-azd-up` helper. On ARM hosts the
+                // upstream `azd up` deploy phase invokes docker buildx
+                // which delegates the per-service Dockerfile build to
+                // qemu — for repos with a heavy Angular/webpack image
+                // (e.g. azure-ai-travel-agents ui-angular) qemu hangs
+                // indefinitely, tripping our 60-min SILENCE_TIMEOUT.
+                // The baked helper splits provision (azd) + per-svc
+                // build (`az acr build`, native amd64 in Azure) which
+                // bypasses the qemu path entirely. The helper is a
+                // strict drop-in replacement: same env, same cwd,
+                // same idempotency guarantees.
+                if (ContainsRawAzdUp(step.Command))
+                {
+                    var rewritten = RewriteAzdUpToBakedHelper(step.Command);
+                    if (!string.Equals(rewritten, step.Command, StringComparison.Ordinal))
+                    {
+                        await Log(s, "warn",
+                            "Step uses raw `azd up` — auto-rewriting to baked " +
+                            "`agentic-azd-up` (split provision + per-svc " +
+                            "`az acr build`) to bypass qemu hangs on ARM hosts. " +
+                            $"original=`{Truncate(step.Command, 200)}` " +
+                            $"rewritten=`{Truncate(rewritten, 200)}`",
+                            step.Id);
+                        step = step with { Command = rewritten };
+                        steps[i] = step;
+                    }
+                }
+
+                await Log(s, "status", $"▶ Step {step.Id}: {step.Description}", step.Id);
+
+                // Long-running azd commands can go silent for several minutes
+                // while provisioning subscription-level deployments. Start a
+                // background watcher that polls 'az deployment sub list' and
+                // emits concise progress snapshots to the Live log.
+                using var watcherCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                Task? watcherTask = null;
+                Task? heartbeatTask = null;
+                if (IsLongRunningAzdCommand(step.Command) &&
+                    !string.IsNullOrWhiteSpace(azdEnvName))
+                {
+                    var watcher = new DeploymentProgressWatcher(
+                        imageToUse, azdEnvName!,
+                        (lvl, line) => _ = Log(s, lvl, line, step.Id));
+                    watcherTask = Task.Run(() => watcher.RunAsync(watcherCts.Token));
+                }
+
+                // Unconditional heartbeat for every long-running step (azd
+                // AND 'az group delete' / 'purge'): every 60 seconds emit a
+                // single status line with elapsed time. This reassures the
+                // user that the sandbox is alive when the underlying
+                // command produces no stdout for minutes at a time — the
+                // classic case being 'az group delete' which is silent
+                // from start to finish of a 20-minute teardown.
+                if (IsLongRunningAzdCommand(step.Command))
+                {
+                    var stepStartedAt = DateTime.UtcNow;
+                    var capturedStep = step;
+                    heartbeatTask = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            while (!watcherCts.Token.IsCancellationRequested)
+                            {
+                                await Task.Delay(TimeSpan.FromSeconds(60), watcherCts.Token);
+                                var elapsed = DateTime.UtcNow - stepStartedAt;
+                                await Log(s, "info",
+                                    $"⏳ Step {capturedStep.Id} still running ({elapsed.TotalMinutes:0} min elapsed). " +
+                                    "Sandbox is alive, waiting on the underlying command to return.",
+                                    capturedStep.Id);
+                            }
+                        }
+                        catch (OperationCanceledException) { /* normal on step completion */ }
+                    });
+                }
+
+                DockerShellResult result;
+                try
+                {
+                    // Pick a timeout that fits the kind of work: long-running
+                    // azd commands (provision/deploy/up) legitimately run 30+
+                    // minutes on rich templates, so applying the 10-minute
+                    // generic default would kill the deploy mid-way.
+                    var stepTimeout = step.Timeout
+                        ?? (IsLongRunningAzdCommand(step.Command)
+                            ? _opt.LongRunningStepTimeout
+                            : _opt.DefaultStepTimeout);
+                    currentStepBudget = stepTimeout;
+
+                    // ── TYPED ACTION ROUTING ─────────────────────────
+                    // If the step carries a typed action (LLM emitted
+                    // {"action":{"type":"AcrBuild",...}} instead of a
+                    // bash "cmd"), parse it and dispatch through the
+                    // typed pipeline. This bypasses AzdEnvSubstitutor
+                    // and the bash interpreter entirely � the action
+                    // composes its argv from typed DeployContext fields
+                    // (AcrName, ResourceGroup, LastBuiltImageRef) so
+                    // there is no place for $(...) extraction or quote
+                    // nesting to go wrong. See Services/Actions/.
+                    var typedAction = !string.IsNullOrWhiteSpace(step.ActionJson)
+                        ? Services.Actions.ActionRegistry.TryParse(step.ActionJson)
+                        : null;
+                    if (typedAction is not null)
+                    {
+                        // Pre-load azd env so DeployContext typed fields
+                        // (AcrName, ResourceGroup, ...) reflect post-
+                        // provision state. Same predicate as the bash
+                        // path: only fire if anything looks azd-derived.
+                        if (StepNeedsAzdEnv("$AZURE_", env))
+                        {
+                            await AzdEnvLoader.LoadAndMergeAsync(
+                                docker, env,
+                                (lvl, msg) => _ = Log(s, lvl, msg, step.Id),
+                                ct);
+                            deployCtx.MergeFromAzdEnv(env);
+                        }
+
+                        await Log(s, "info",
+                            $"[typed-action] {typedAction.Type}: {typedAction.Describe(deployCtx)}",
+                            step.Id);
+
+                        var actionResult = await typedAction.ExecuteAsync(
+                            deployCtx, docker, stepTimeout, ct);
+
+                        result = new DockerShellResult(
+                            actionResult.ExitCode, actionResult.TailLog ?? "")
+                        {
+                            TimedOutBySilence =
+                                actionResult.Category == Services.Actions.ActionErrorCategory.BuildHang
+                        };
+                    }
+                    else
+                    {
+                        // PRE-LOAD: if the step's command refers to any
+                    // azd-derived variable (either via `azd env get-values`
+                    // pipeline OR a direct $AZURE_*/$SERVICE_* reference)
+                    // and that variable is NOT yet in `env`, run
+                    // AzdEnvLoader once now. Without this pre-load,
+                    // steps planned BEFORE the first azd-touching step
+                    // (e.g. an out-of-order ACR remote build emitted by
+                    // the Strategist as an early "optimization") would
+                    // see an empty $REGISTRY and fail with the cryptic
+                    // `argument --registry/-r: expected one argument`.
+                    // The post-step loader (further down) still keeps
+                    // env in sync after every azd state change. This
+                    // pre-load is a best-effort no-op when there is
+                    // nothing to load yet.
+                    if (StepNeedsAzdEnv(step.Command, env))
+                    {
+                        await AzdEnvLoader.LoadAndMergeAsync(
+                            docker, env,
+                            (lvl, msg) => _ = Log(s, lvl, msg, step.Id),
+                            ct);
+                        deployCtx.MergeFromAzdEnv(env);
+                    }
+
+                    // Deterministic preprocessing: rewrite any
+                    // `$(azd env get-values | ... | grep AZURE_X | ...)` and
+                    // backtick equivalents into "$AZURE_X" using values
+                    // already merged into `env` by AzdEnvLoader. The
+                    // Doctor and Strategist routinely emit this pattern
+                    // from a service subdir cwd where azd returns nothing,
+                    // burning their entire 8-attempt remediation budget
+                    // on shape-of-pipeline variations (`sed` → `grep|cut`
+                    // → `awk`) of an extraction we already did once at
+                    // /workspace. With the substitution applied the LLM's
+                    // intent is preserved while the cwd-fragile lookup is
+                    // gone. See AzdEnvSubstitutor for the regex contract.
+                    var commandToRun = AzdEnvSubstitutor.Rewrite(
+                        step.Command, env,
+                        line => _ = Log(s, "info", line, step.Id));
+
+                    // Heavy step heuristic: azd up / azd deploy / docker
+                    // push / agentic-azd-up etc serialise dozens of
+                    // multi-arch image builds + ACR pushes, where a
+                    // single push of a 1+ GB Python or Angular image can
+                    // sit genuinely silent for 30+ min under qemu
+                    // emulation. Match anywhere in the command string —
+                    // commands often arrive as `bash -lc "agentic-azd-up"`
+                    // or with leading `cd <dir> && ...` boilerplate.
+                    var sbCmdLower = (commandToRun ?? string.Empty).ToLowerInvariant();
+                    bool sbIsHeavy =
+                        sbCmdLower.Contains("azd up") ||
+                        sbCmdLower.Contains("azd deploy") ||
+                        sbCmdLower.Contains("azd provision") ||
+                        sbCmdLower.Contains("agentic-azd-up") ||
+                        sbCmdLower.Contains("agentic-azd-deploy") ||
+                        sbCmdLower.Contains("agentic-acr-build") ||
+                        sbCmdLower.Contains("agentic-build") ||
+                        sbCmdLower.Contains("docker push") ||
+                        sbCmdLower.Contains("docker buildx") ||
+                        sbCmdLower.Contains("docker build");
+                    var stepSilence = sbIsHeavy
+                        ? TimeSpan.FromMinutes(Math.Max(60, _opt.StepSilenceBudget.TotalMinutes))
+                        : _opt.StepSilenceBudget;
+
+                    result = await docker.RunAsync(
+                        commandToRun, step.WorkingDirectory,
+                        env, stepTimeout, ct,
+                        silenceBudget: stepSilence);
+                    }
+                }
+                finally
+                {
+                    watcherCts.Cancel();
+                    if (watcherTask is not null)
+                    {
+                        try { await watcherTask; } catch { /* expected on cancel */ }
+                    }
+                    if (heartbeatTask is not null)
+                    {
+                        try { await heartbeatTask; } catch { /* expected on cancel */ }
+                    }
+                }
+
+                // Always log the step's exit envelope BEFORE branching on
+                // success/failure. Without this we had blind sessions where
+                // 5 consecutive 'azd up' / 'azd deploy' steps reported
+                // success silently in <1s — the sandbox had been killed
+                // and RunAsync was returning empty results. A single line
+                // per step exit (with byte count, silence-timeout flag and
+                // duration) is enough to spot that pattern instantly.
+                {
+                    var tailBytes = result.TailLog?.Length ?? 0;
+                    var silenceFlag = result.TimedOutBySilence ? " SILENCE_TIMEOUT" : string.Empty;
+                    var levelExit = result.ExitCode == 0 ? "info" : "warn";
+                    await Log(s, levelExit,
+                        $"⏹ Step {step.Id} exit={result.ExitCode} " +
+                        $"tail={tailBytes}B{silenceFlag}",
+                        step.Id);
+                    if (result.ExitCode == 0
+                        && tailBytes < 4
+                        && !result.TimedOutBySilence)
+                    {
+                        consecutiveEmptySuccesses++;
+                        await Log(s, "info",
+                            $"Step {step.Id} returned exit=0 with empty output " +
+                            $"(consecutive empties: {consecutiveEmptySuccesses}). " +
+                            "Many idempotent commands (azd env set, az config) " +
+                            "legitimately produce no stdout — only treated as " +
+                            "dead-sandbox after a probe.",
+                            step.Id);
+                        if (consecutiveEmptySuccesses >= 3)
+                        {
+                            // Probe: is the sandbox container actually alive?
+                            // 'docker inspect -f {{.State.Running}} asb-<sid>'
+                            // returns "true\n" (~5B) when alive. If the
+                            // container was reaped we abort; otherwise we
+                            // reset the counter — the empties were just a
+                            // streak of legitimately silent commands.
+                            string probeOut = string.Empty;
+                            try
+                            {
+                                var psi = new System.Diagnostics.ProcessStartInfo("docker",
+                                    $"inspect -f {{{{.State.Running}}}} {session!.ContainerName}")
+                                {
+                                    RedirectStandardOutput = true,
+                                    RedirectStandardError = true,
+                                    UseShellExecute = false
+                                };
+                                using var p = System.Diagnostics.Process.Start(psi)!;
+                                probeOut = (await p.StandardOutput.ReadToEndAsync()).Trim();
+                                await p.WaitForExitAsync();
+                            }
+                            catch (Exception ex)
+                            {
+                                probeOut = "probe-error:" + ex.GetType().Name;
+                            }
+
+                            if (!string.Equals(probeOut, "true", StringComparison.OrdinalIgnoreCase))
+                            {
+                                await Log(s, "err",
+                                    $"DEAD SANDBOX CONFIRMED via docker inspect " +
+                                    $"(probe='{probeOut}', expected 'true'). " +
+                                    "Aborting deploy.",
+                                    step.Id);
+                                s.ErrorMessage =
+                                    $"Dead-sandbox guard tripped at step #{step.Id} " +
+                                    $"'{step.Description}' — container '{session!.ContainerName}' " +
+                                    $"is no longer running (probe='{probeOut}').";
+                                await SetStatus(s, DeploymentStatus.Failed);
+                                return;
+                            }
+                            await Log(s, "info",
+                                $"Sandbox alive-probe OK after {consecutiveEmptySuccesses} " +
+                                "empties — these are legitimate silent successes. " +
+                                "Resetting counter.",
+                                step.Id);
+                            consecutiveEmptySuccesses = 0;
+                        }
+                    }
+                    else
+                    {
+                        consecutiveEmptySuccesses = 0;
+                    }
+
+                    // Heavy-step output guard. Commands like `azd up`,
+                    // `azd deploy`, `azd provision`, `agentic-azd-up`,
+                    // `agentic-azd-deploy`, `agentic-acr-build` cannot
+                    // legitimately exit 0 with <400B of output — azd
+                    // streams hundreds of lines for every provisioning
+                    // run. If we see one of these claim success silently
+                    // it almost certainly means the helper script is
+                    // broken (e.g. 0-byte file from a heredoc bake
+                    // failure) or that exec mis-routed stdout. Treat as
+                    // hard failure so the Doctor / Verifier can react.
+                    if (result.ExitCode == 0)
+                    {
+                        var cmdLower = (step.Command ?? string.Empty).ToLowerInvariant();
+                        bool isHeavy =
+                            cmdLower.Contains("azd up") ||
+                            cmdLower.Contains("azd deploy") ||
+                            cmdLower.Contains("azd provision") ||
+                            cmdLower.Contains("agentic-azd-up") ||
+                            cmdLower.Contains("agentic-azd-deploy") ||
+                            cmdLower.Contains("agentic-acr-build") ||
+                            cmdLower.Contains("agentic-build");
+                        if (isHeavy && tailBytes < 400)
+                        {
+                            // Whitelist: the agentic-* helpers legitimately
+                            // short-circuit when the work is already done
+                            // (e.g. all container apps already have real
+                            // images, ACR build cache hit, etc). In those
+                            // cases the helper prints a 1-line ✓ marker
+                            // and exits 0 — that is NOT a broken pipe.
+                            var tailLower = (result.TailLog ?? string.Empty).ToLowerInvariant();
+                            bool fastPathOk =
+                                tailLower.Contains("skipping redundant") ||
+                                tailLower.Contains("already have real images") ||
+                                tailLower.Contains("nothing to do") ||
+                                tailLower.Contains("✓ all ") ||
+                                tailLower.Contains("✓ skipped") ||
+                                tailLower.Contains("[agentic-") && tailLower.Contains("skip");
+                            if (fastPathOk)
+                            {
+                                await Log(s, "info",
+                                    $"Heavy-step output guard: short output ({tailBytes}B) " +
+                                    "but recognized fast-path / idempotent skip marker. Accepting exit 0.",
+                                    step.Id);
+                            }
+                            else
+                            {
+                                await Log(s, "err",
+                                $"Heavy step '{step.Description}' (cmd starts with " +
+                                $"'{cmdLower.Split(' ', 2)[0]}') exited 0 but produced " +
+                                $"only {tailBytes}B of output. This is impossible for a " +
+                                "real azd/acr-build run — the helper script is likely " +
+                                "broken or its stdout was lost. Aborting.",
+                                step.Id);
+                            s.ErrorMessage =
+                                $"Heavy-step output guard tripped at step #{step.Id} " +
+                                $"'{step.Description}': {tailBytes}B output is too short " +
+                                "for a real provisioning run.";
+                            await SetStatus(s, DeploymentStatus.Failed);
+                            return;
+                            }
+                        }
+                    }
+                }
+
+                if (result.ExitCode == 0)
+                {
+                    // Post-step hook: when a step that just provisioned
+                    // Azure infrastructure succeeds, eagerly log the
+                    // sandbox's Docker CLI into the deployment's Azure
+                    // Container Registry so any subsequent step that
+                    // pushes images (`azd deploy`, `docker push`,
+                    // `docker buildx … --push`) authenticates without
+                    // hitting `denied: authentication required`.
+                    //
+                    // Why this is necessary: each plan step runs in a
+                    // FRESH ephemeral sandbox container. We mount a
+                    // persistent named volume at /root/.docker (see
+                    // SandboxAzureAuth.DockerConfigVolumeName) so the
+                    // result of `az acr login` survives across steps,
+                    // but SOMETHING has to actually run that login. The
+                    // first step that creates the ACR is `azd up` /
+                    // `azd provision`; everything downstream assumes the
+                    // login is already in place. So immediately after
+                    // either of those two commands succeeds we resolve
+                    // the ACR endpoint from `azd env get-values` and
+                    // run `az acr login --name <acrname>` once. The
+                    // login is idempotent and cheap (~2 s) so re-running
+                    // it after a follow-up `azd provision` is harmless.
+                    //
+                    // This is the definitive fix for the multi-service
+                    // sample case (e.g. azure-ai-travel-agents) where
+                    // `azd up` provisioned the ACR + Container Apps but
+                    // the deploy phase silently failed at `docker push`,
+                    // leaving the apps wired to the
+                    // `containerapps-helloworld` placeholder image.
+                    if (TouchesAzdProvision(step.Command)
+                        && !string.IsNullOrWhiteSpace(azdEnvName))
+                    {
+                        await TryEnsureAcrLoginAsync(
+                            s, docker, step, env, azdEnvName!, ct);
+                    }
+
+                    // After ANY azd-touching step refresh the azd
+                    // environment values into our `env` dictionary so
+                    // subsequent steps inherit them as ordinary env vars.
+                    // This eliminates the brittle `$(azd env get-values
+                    // | grep ... | cut ... | tr ...)` shell pattern that
+                    // both the planner and the Doctor sometimes emit:
+                    // those substitutions silently produce empty strings
+                    // when the step's cwd is a service subdirectory
+                    // (azd env get-values requires the project root),
+                    // leading to errors like
+                    // `argument --registry/-r: expected one argument`.
+                    // With the values pre-injected as env vars the
+                    // recovery step just references $AZURE_CONTAINER_
+                    // REGISTRY_NAME and works. See AzdEnvLoader for the
+                    // full rationale.
+                    if (TouchesAnyAzd(step.Command))
+                    {
+                        await AzdEnvLoader.LoadAndMergeAsync(
+                            docker, env,
+                            (lvl, line) => _ = Log(s, lvl, line, step.Id),
+                            ct);
+                        deployCtx.MergeFromAzdEnv(env);
+                    }
+                    continue; // step succeeded, next.
+                }
+
+                // ---------------- Step failed ----------------
+                var stepTail = string.IsNullOrWhiteSpace(result.TailLog)
+                    ? "(no output captured)"
+                    : result.TailLog;
+
+                // [Probe] short-circuit — read-only diagnostic steps
+                // tagged in their description with the literal "[Probe] "
+                // prefix do NOT consume the Doctor budget and do NOT
+                // fail the deploy when they exit non-zero. Their output
+                // is logged as a warning and the orchestrator proceeds
+                // to the next step. This keeps the diagnose-vs-fix
+                // distinction sharp: the Strategist + Doctor can ask
+                // for inspection (ls, cat, docker ps, az resource list)
+                // without spending an attempt.
+                var isProbe = (step.Description ?? string.Empty)
+                    .TrimStart()
+                    .StartsWith("[Probe]", StringComparison.OrdinalIgnoreCase);
+                if (isProbe)
+                {
+                    await Log(s, "warn",
+                        $"[Probe] Step {step.Id} exited {result.ExitCode}; this is a read-only " +
+                        "diagnostic step and does not consume the Doctor budget. Continuing.",
+                        step.Id);
+                    continue;
+                }
+
+                // When the silence watchdog fired we want the Doctor to
+                // see the signature 'StepSilent' even if the underlying
+                // cancel-triggered tail log doesn't mention it (cancel
+                // comes from outside the child process). Prepend a
+                // synthetic marker so SummariseErrorSignature picks it
+                // up and the Doctor can apply the ACR-remote-build fix.
+                if (result.TimedOutBySilence)
+                {
+                    stepTail = "⚠  Step produced no output for the silence budget " +
+                               "— treating as a hang.\n" + stepTail;
+                }
+
+                // Cheap orchestrator-level auto-retry for TRANSIENT
+                // failure classes. Invoking the Doctor for these takes
+                // ~30 s of LLM latency and the remediation it returns is
+                // always "re-run the same step" — so we short-circuit it
+                // here and save both time and a model call.
+                //
+                // Current auto-retry class: SignalKilled (host OOM killer
+                // caught 'az'/azd mid-execution — a race condition with
+                // no persistent state to fix, just transient memory
+                // pressure). We attempt up to 2 retries per step; the
+                // Doctor is only invoked if the issue persists (at which
+                // point the Doctor's prompt tells it to escalate with a
+                // buildx-cache-prune prep step before the next retry).
+                var cheapRetrySignature = SummariseErrorSignature(stepTail);
+                var priorCheapRetries = previousAttempts
+                    .Count(a => a.Contains($"step {step.Id} [{cheapRetrySignature}] AUTO_RETRY",
+                                           StringComparison.Ordinal));
+                if (cheapRetrySignature == "SignalKilled" && priorCheapRetries < 2)
+                {
+                    await Log(s, "warn",
+                        $"Step {step.Id} failed with [SignalKilled] — the host OOM killer " +
+                        "interrupted 'az'. This is almost always transient. Auto-retrying the " +
+                        $"step in 10 s (attempt {priorCheapRetries + 1}/2, Doctor not yet invoked).",
+                        step.Id);
+                    previousAttempts.Add(
+                        $"step {step.Id} [SignalKilled] AUTO_RETRY: orchestrator-level no-LLM retry");
+                    try { await Task.Delay(TimeSpan.FromSeconds(10), ct); }
+                    catch (OperationCanceledException) { throw; }
+                    i--; // re-execute the same step on next iteration
+                    continue;
+                }
+
+                // Same auto-retry treatment for Azure Container Apps
+                // "Validation timed out" errors. Bicep is idempotent:
+                // re-running the deployment retries only the Container
+                // Apps that actually failed (the ones that succeeded
+                // are simply re-validated and left alone). The regional
+                // ACA control plane gets saturated when 8 Container
+                // Apps are created simultaneously and some slip past
+                // the validation budget, so waiting 30-60 s before the
+                // retry usually lets it recover. We allow up to 3
+                // auto-retries here (seen real-world cases needing 2
+                // on azure-ai-travel-agents); the Doctor takes over
+                // only if all 3 fail, meaning the issue is not the
+                // transient validation race.
+                if (cheapRetrySignature == "ContainerAppValidationTimeout"
+                    && priorCheapRetries < 3)
+                {
+                    await Log(s, "warn",
+                        $"Step {step.Id} failed with [ContainerAppValidationTimeout] — Azure " +
+                        "Container Apps control plane timed out validating some revisions. " +
+                        "This is almost always transient; Bicep is idempotent and will retry " +
+                        $"only the failed Container Apps. Auto-retrying the step in 45 s " +
+                        $"(attempt {priorCheapRetries + 1}/3, Doctor not yet invoked).",
+                        step.Id);
+                    previousAttempts.Add(
+                        $"step {step.Id} [ContainerAppValidationTimeout] AUTO_RETRY: " +
+                        "orchestrator-level no-LLM retry of idempotent Bicep deployment");
+                    try { await Task.Delay(TimeSpan.FromSeconds(45), ct); }
+                    catch (OperationCanceledException) { throw; }
+                    i--;
+                    continue;
+                }
+
+                // Ask the DeploymentDoctor (agent team in sandbox) to propose
+                // a fix. The loop runs unbounded: natural terminations are
+                //   (a) the Doctor returning kind="give_up",
+                //   (b) the session budget (MaxSessionDuration) elapsing,
+                //   (c) the user clicking Cancel.
+                // The Doctor receives the list of previousAttempts in its
+                // prompt and is explicitly instructed to escalate to
+                // "give_up" rather than repeat a failed remediation.
+                if (runnerHost is not null)
+                {
+                    Remediation? fix = null;
+
+                    // Short-circuit for environmental failures that the
+                    // Doctor cannot fix from inside the sandbox. Invoking
+                    // it in these cases wastes an LLM call and muddies the
+                    // error with a fake 'give_up' reason. Surface the real
+                    // root cause instead.
+                    var envError = DetectEnvironmentalFailure(stepTail);
+                    if (envError is not null)
+                    {
+                        await Log(s, "err",
+                            $"Step {step.Id} failed due to an environmental issue that cannot be " +
+                            $"remediated by the Doctor: {envError} " +
+                            "Please resolve it on the host and retry the deploy.",
+                            step.Id);
+                        // Skip the Doctor call; fall through to the
+                        // 'no fix available' error path below.
+                    }
+                    else
+                    {
+                        // Hard budget: abort cleanly when the Doctor has
+                        // already been invoked MaxDoctorInvocationsPerSession
+                        // times for this deploy. The Doctor's own give_up
+                        // logic is still the primary terminator; this is a
+                        // safety net for hallucination loops.
+                        if (_opt.MaxDoctorInvocationsPerSession > 0
+                            && doctorInvocations >= _opt.MaxDoctorInvocationsPerSession)
+                        {
+                            // Last-resort canonical fix BEFORE giving up:
+                            // when the failure signature is the noexec
+                            // bind-mount problem (Windows + Docker Desktop),
+                            // apply the relocate-node_modules-to-/tmp fix
+                            // ONCE outside the Doctor budget. The Doctor
+                            // wasted N attempts on micro-variations of
+                            // --ignore-scripts that only delay the failure;
+                            // the canonical fix is fully deterministic and
+                            // safe to apply unconditionally for this class.
+                            var lastSignature = SummariseErrorSignature(stepTail);
+                            if (string.Equals(lastSignature, "NoexecBindMount",
+                                    StringComparison.Ordinal))
+                            {
+                                await Log(s, "warn",
+                                    "Doctor budget exhausted on a [NoexecBindMount] failure. " +
+                                    "Applying the canonical relocate-node_modules-to-/tmp " +
+                                    "recipe once and retrying the failing step before " +
+                                    "marking Failed. This is a deterministic fix the Doctor " +
+                                    "kept skipping in favour of unsuccessful --ignore-scripts " +
+                                    "patches.",
+                                    step.Id);
+
+                                // Use the relocate-node-modules helper baked into the
+                                // sandbox image (see SandboxImageBuilder.cs Dockerfile,
+                                // tag v16+). Single command, no nested quoting, no
+                                // LLM-template fragility — same script the Strategist's
+                                // preventive step calls.
+                                var relocateCmd = "relocate-node-modules /workspace";
+
+                                var relocate = await docker.RunAsync(
+                                    relocateCmd, ".",
+                                    env,
+                                    TimeSpan.FromMinutes(2),
+                                    ct,
+                                    silenceBudget: _opt.StepSilenceBudget);
+
+                                if (relocate.ExitCode == 0)
+                                {
+                                    await Log(s, "info",
+                                        "Last-resort node_modules relocation completed. " +
+                                        "Retrying the failing step ONCE before giving up.",
+                                        step.Id);
+                                    previousAttempts.Add(
+                                        $"step {step.Id} [LastResortRelocate] orchestrator " +
+                                        "applied canonical fix outside Doctor budget");
+                                    i--; // re-execute the same step
+                                    // Do NOT return; fall through to the
+                                    // outer loop. Mark a flag so a second
+                                    // budget-exhausted hit really does
+                                    // give up.
+                                    if (!previousAttempts.Any(a =>
+                                            a.Contains("[LastResortRelocateRetried]")))
+                                    {
+                                        previousAttempts.Add(
+                                            "[LastResortRelocateRetried] one-shot retry token");
+                                        continue;
+                                    }
+                                }
+                                else
+                                {
+                                    await Log(s, "err",
+                                        $"Last-resort relocate failed with exit " +
+                                        $"{relocate.ExitCode}. Falling through to Failed.",
+                                        step.Id);
+                                }
+                            }
+
+                            await Log(s, "err",
+                                $"Doctor invocation budget exhausted " +
+                                $"({doctorInvocations}/{_opt.MaxDoctorInvocationsPerSession}). " +
+                                "The orchestrator is aborting to stop burning LLM calls and " +
+                                "cloud quota on a problem the Doctor cannot resolve from " +
+                                "inside the sandbox. Review the Live log, address the root " +
+                                "cause, and retry the deploy.",
+                                step.Id);
+                            s.ErrorMessage =
+                                $"Doctor budget exhausted after {doctorInvocations} remediation " +
+                                $"attempts. Last step: #{step.Id} '{step.Description}'. " +
+                                "Manual intervention required.";
+                            await SetStatus(s, DeploymentStatus.Failed);
+                            return;
+                        }
+
+                        await Log(s, "status",
+                            $"Step {step.Id} failed (exit {result.ExitCode}). " +
+                            $"Invoking DeploymentDoctor agent for remediation " +
+                            $"(attempt #{previousAttempts.Count + 1})...",
+                            step.Id);
+
+                        try
+                        {
+                            doctorInvocations++;
+
+                            // Doctor backend selection — strict, no
+                            // silent fall-back. When the Foundry hosted
+                            // Doctor is configured (Foundry:UseFoundryDoctor=true
+                            // + DoctorAgentEndpoint set, registers the
+                            // FoundryDoctorClient in DI), we use ONLY it.
+                            // If it returns null we surface the failure so
+                            // the user knows their hosted agent is broken
+                            // instead of masking it with the in-sandbox
+                            // Doctor. When the Foundry client is NOT
+                            // registered, we use the in-sandbox Doctor as
+                            // the sole backend (legacy default).
+                            var foundryDoctor = _sp.GetService<FoundryDoctorClient>();
+                            if (foundryDoctor is not null)
+                            {
+                                fix = await foundryDoctor.RemediateAsync(
+                                    s.WorkDir,
+                                    plan with { Steps = steps.ToList() },
+                                    step.Id, stepTail, previousAttempts,
+                                    (lvl, line) => _ = Log(s, lvl, line, step.Id),
+                                    ct,
+                                    _memory.GetRelevantInsights(s.RepoUrl));
+
+                                if (fix is null)
+                                {
+                                    await Log(s, "err",
+                                        "[Foundry] hosted Doctor returned no " +
+                                        "remediation (auth, HTTP, or agent " +
+                                        "image-pull failure). Fall-back is " +
+                                        "DISABLED — failing the step. Check " +
+                                        "the agent status in the Foundry " +
+                                        "portal or unset Foundry:UseFoundryDoctor " +
+                                        "to use the in-sandbox Doctor.",
+                                        step.Id);
+                                }
+                            }
+                            else
+                            {
+                                fix = await runnerHost.RemediateAsync(
+                                    imageToUse, s.WorkDir,
+                                    // Rebuild plan DTO from the current (possibly
+                                    // already-remediated) step list so the Doctor
+                                    // sees the real state.
+                                    plan with { Steps = steps.ToList() },
+                                    step.Id, stepTail, previousAttempts,
+                                    (lvl, line) => _ = Log(s, lvl, line, step.Id),
+                                    ct,
+                                    // Same insights as the planner: the Doctor
+                                    // benefits even more from learnings like
+                                    // "doctor.lastGiveUp" or "lastSuccess.endpoint"
+                                    // when iterating against the same repo.
+                                    _memory.GetRelevantInsights(s.RepoUrl));
+                            }
+                        }
+                        catch (Exception rex)
+                        {
+                            await Log(s, "err",
+                                $"Doctor invocation threw: {rex.Message}. " +
+                                "Falling through to failure.", step.Id);
+                        }
+                    }
+
+                    if (fix is not null && fix.Kind != "give_up" && fix.NewSteps.Count > 0)
+                    {
+                        // Defensive guard: reject remediations that silently
+                        // degrade the deploy to a hollow state. We've hit the
+                        // "Succeeded but Container Apps stuck on hello-world
+                        // placeholder" failure mode when the Doctor replaced
+                        // 'azd up' with 'azd provision' alone, or set
+                        // AZURE_SERVICE_*_RESOURCE_EXISTS=true to skip
+                        // build+push+deploy. Both are explicitly forbidden
+                        // by the Doctor prompt; this is the orchestrator's
+                        // belt-and-braces enforcement. When detected we
+                        // DROP the remediation and let the step fail again,
+                        // eventually forcing the Doctor into a real fix or
+                        // give_up.
+                        bool DegradesDeploy(IEnumerable<DeploymentStep> newSteps)
+                        {
+                            // Remediation batches that include a REAL
+                            // 'az acr build' + 'az containerapp update'
+                            // are LEGITIMATE ACR-remote-build recoveries
+                            // (Doctor's [StepSilent] canonical fix). These
+                            // genuinely produce + activate the image, so
+                            // the accompanying 'azd env set *_RESOURCE_
+                            // EXISTS true' flag is an intentional nudge
+                            // to stop the next 'azd deploy' from re-
+                            // triggering the hang — not a skip. Detect
+                            // the combo and skip the blanket reject.
+                            bool hasAcrBuildAndUpdate =
+                                newSteps.Any(s =>
+                                    (s.Command ?? "").Contains("az acr build",
+                                        StringComparison.OrdinalIgnoreCase))
+                                && newSteps.Any(s =>
+                                    (s.Command ?? "").Contains("az containerapp update",
+                                        StringComparison.OrdinalIgnoreCase));
+
+                            foreach (var ns in newSteps)
+                            {
+                                var c = (ns.Command ?? string.Empty);
+                                var lc = c.ToLowerInvariant();
+                                // 1) Replacing 'azd up' with 'azd provision'
+                                //    (standalone, not 'azd provision && azd deploy').
+                                if (System.Text.RegularExpressions.Regex.IsMatch(
+                                        lc, @"\bazd\s+provision\b")
+                                    && !System.Text.RegularExpressions.Regex.IsMatch(
+                                        lc, @"\bazd\s+deploy\b"))
+                                {
+                                    return true;
+                                }
+                                // 2) Setting *_RESOURCE_EXISTS=true to skip services —
+                                //    rejected UNLESS accompanied by a real ACR build +
+                                //    containerapp update in the same batch (legitimate
+                                //    remote-build recovery, see above).
+                                if (System.Text.RegularExpressions.Regex.IsMatch(
+                                        lc, @"azure_service_[a-z0-9_]+_resource_exists\s+true")
+                                    && !hasAcrBuildAndUpdate)
+                                {
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }
+
+                        if (fix.Kind == "replace_step" && DegradesDeploy(fix.NewSteps))
+                        {
+                            await Log(s, "warn",
+                                "Rejected Doctor remediation: would degrade the deploy model " +
+                                "(replacing 'azd up' with 'azd provision' alone, or setting " +
+                                "AZURE_SERVICE_*_RESOURCE_EXISTS=true). Both leave Container " +
+                                "Apps on the 'hello-world' placeholder. Retrying the original " +
+                                "step so the Doctor has another chance to propose a real fix.",
+                                step.Id);
+                            // Skip the 'apply fix' branch entirely. The outer
+                            // retry loop will re-invoke the Doctor with the
+                            // same error next iteration.
+                            fix = null;
+                        }
+
+                        // Near-duplicate detection: if the Doctor proposes a
+                        // command materially identical to one it has already
+                        // tried (same step target, tokens differ only in
+                        // whitespace / quoting / short arg reshuffling) we
+                        // reject it so the NEXT invocation sees it tagged
+                        // as a "redundant attempt" and must pivot. Without
+                        // this the Doctor can burn dozens of retries on
+                        // micro-variations of the same wrong idea (we saw
+                        // this on --mount=type=cache sed patterns: 20+
+                        // slightly-different find/sed invocations that all
+                        // produced the same broken Dockerfile).
+                        if (fix is not null
+                            && IsNearDuplicate(fix, previousAttempts, out var dupHint))
+                        {
+                            await Log(s, "warn",
+                                $"Rejected Doctor remediation: near-duplicate of a prior " +
+                                $"attempt ({dupHint}). The same strategy has already failed; " +
+                                "the Doctor will be re-invoked with this attempt recorded in " +
+                                "PREVIOUS ATTEMPTS so it pivots to a materially different fix.",
+                                step.Id);
+                            // Record the rejected attempt so the Doctor sees
+                            // it on the next round and cannot propose it a
+                            // third time without acknowledgement.
+                            previousAttempts.Add(
+                                $"step {step.Id} [{SummariseErrorSignature(stepTail)}] REJECTED_DUP: " +
+                                Truncate(fix.NewSteps[0].Command, 100));
+                            fix = null;
+                        }
+                    }
+
+                    if (fix is not null && fix.Kind != "give_up" && fix.NewSteps.Count > 0)
+                    {
+                        // Include the error signature alongside the attempted
+                        // remediation so the Doctor can detect "I've tried
+                        // three different things against the same error, the
+                        // strategy class is not working" and escalate to
+                        // give_up instead of spinning.
+                        var errSig = SummariseErrorSignature(stepTail);
+                        previousAttempts.Add(
+                            $"step {step.Id} [{errSig}]: {Truncate(step.Command, 60)} — " +
+                            $"{fix.Kind} -> {Truncate(fix.NewSteps[0].Command, 80)}");
+
+                        // Note: a signature-based circuit breaker used to
+                        // live here ("same signature >= 3x -> hard abort").
+                        // It was removed on purpose: for non-trivial failures
+                        // (e.g. opaque azd preprovision hooks with empty
+                        // stderr) the Doctor legitimately needs several
+                        // speculative attempts to discover the actual cause.
+                        // The budget + the Doctor's own 'give_up' remain the
+                        // terminators. The signature is still tagged onto
+                        // previousAttempts so the Doctor can see repetition
+                        // and choose 'give_up' itself when warranted.
+
+                        if (!string.IsNullOrWhiteSpace(fix.Reasoning))
+                            await Log(s, "info", $"Doctor: {fix.Reasoning}", step.Id);
+
+                        if (fix.Kind == "replace_step")
+                        {
+                            // Guard: the Doctor is supposed to target either
+                            // the currently-failing step or a future one.
+                            // Pointing at an already-executed step is
+                            // meaningless (you cannot un-run history) and
+                            // historically caused a catastrophic bug: the
+                            // Doctor would say 'replace step 4' (an
+                            // already-completed azd env set) and the
+                            // orchestrator would replace step i (the
+                            // failing azd up), destroying the actual
+                            // deploy command and leaving only a corrective
+                            // env var step.
+                            //
+                            // Policy:
+                            //   • fix.StepId == step.Id  -> replace the failing step (original intent)
+                            //   • fix.StepId points to a future step in 'steps' -> replace that one
+                            //   • fix.StepId missing / points to a past step -> convert to insert_before
+                            //     the failing step (safe corrective prepend)
+                            var targetIndex = fix.StepId == step.Id
+                                ? i
+                                : steps.FindIndex(x => x.Id == fix.StepId);
+
+                            if (targetIndex < 0 || targetIndex < i)
+                            {
+                                await Log(s, "warn",
+                                    $"🩺 Doctor targeted step {fix.StepId} which is not replaceable " +
+                                    $"(past or unknown). Converting to 'insert_before' step {step.Id} " +
+                                    "to avoid dropping the failing step.",
+                                    step.Id);
+                                for (int k = 0; k < fix.NewSteps.Count; k++)
+                                    steps.Insert(i + k, fix.NewSteps[k]);
+                                await PublishUpdatedPlanAsync(s, plan, steps, ct);
+                                i--;
+                                continue;
+                            }
+
+                            await Log(s, "status",
+                                $"🩺 Doctor applied 'replace_step': substituting step {steps[targetIndex].Id} " +
+                                $"with `{Truncate(fix.NewSteps[0].Command, 80)}`. Re-running now.",
+                                step.Id);
+                            steps[targetIndex] = fix.NewSteps[0];
+                            for (int k = 1; k < fix.NewSteps.Count; k++)
+                                steps.Insert(targetIndex + k, fix.NewSteps[k]);
+                            await PublishUpdatedPlanAsync(s, plan, steps, ct);
+                            // Re-execute starting from the replaced step,
+                            // not from i, when the Doctor retargeted a
+                            // future step — we want to run that one now.
+                            i = Math.Min(i, targetIndex) - 1;
+                            continue;
+                        }
+                        if (fix.Kind == "insert_before")
+                        {
+                            var preview = string.Join(
+                                ", ",
+                                fix.NewSteps.Take(2).Select(x => Truncate(x.Command, 40)));
+                            await Log(s, "status",
+                                $"🩺 Doctor applied 'insert_before': adding {fix.NewSteps.Count} " +
+                                $"prep step(s) ({preview}) ahead of step {step.Id}. " +
+                                "Running prep steps now, then retrying the failed step.",
+                                step.Id);
+                            for (int k = 0; k < fix.NewSteps.Count; k++)
+                                steps.Insert(i + k, fix.NewSteps[k]);
+                            await PublishUpdatedPlanAsync(s, plan, steps, ct);
+                            i--; // step at position i is now the first prep step
+                            continue;
+                        }
+                        // Unknown kind → treat as give_up.
+                    }
+                    else if (fix is { Kind: "give_up" })
+                    {
+                        await Log(s, "err",
+                            $"Doctor gave up: {fix.Reasoning ?? "(no reason provided)"}",
+                            step.Id);
+
+                        // Persist the give-up rationale so the next deploy
+                        // of the same repo sees it under prior insights
+                        // and can short-circuit equivalent dead ends.
+                        if (!string.IsNullOrWhiteSpace(fix.Reasoning))
+                        {
+                            _memory.UpsertInsight(s.RepoUrl, "doctor.lastGiveUp",
+                                fix.Reasoning, confidence: 0.7);
+                        }
+
+                        // [Escalate] verdict — the Doctor has determined that
+                        // the failure is in the REPO SOURCE itself (missing
+                        // Dockerfile, broken Bicep, corrupt lockfile) and
+                        // continuing to retry inside the sandbox cannot
+                        // succeed. Surface this to the UI as a distinct
+                        // BlockedNeedsHumanOrSourceFix signal so the user
+                        // can either (a) apply a fix on the source repo
+                        // and retry, or (b) skip the offending service.
+                        if (!string.IsNullOrWhiteSpace(fix.Reasoning)
+                            && fix.Reasoning.TrimStart().StartsWith("[Escalate]",
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            await Log(s, "err",
+                                "Doctor emitted an [Escalate] verdict: the failure is in the " +
+                                "repository source and cannot be patched from inside the sandbox. " +
+                                "Apply the proposed fix on the repo (PR / commit) and retry the " +
+                                "deploy.",
+                                step.Id);
+                            s.ErrorMessage =
+                                $"BlockedNeedsHumanOrSourceFix: step #{step.Id} " +
+                                $"'{step.Description}' — {fix.Reasoning}";
+                            await SetStatus(s, DeploymentStatus.Failed);
+                            return;
+                        }
+                    }
+                }
+
+                s.ErrorMessage =
+                    $"Step {step.Id} '{step.Description}' failed (exit code {result.ExitCode}).\n" +
+                    $"Command: {step.Command}\n" +
+                    $"--- last output ---\n{stepTail}";
+                await Log(s, "err", s.ErrorMessage, step.Id);
+                await SetStatus(s, DeploymentStatus.Failed);
+                return;
+            }
+
+            await SetStatus(s, DeploymentStatus.Verifying);
+            var tail = string.Join('\n', s.Logs.TakeLast(40).Select(l => l.Message));
+
+            // Real-world post-deploy probe: even when every step exited 0,
+            // a deploy can be "hollow" — the template provisioned Container
+            // Apps but they're all still pointing at Microsoft's default
+            // 'containerapps-helloworld' placeholder (ACR empty, no real
+            // image build+push happened). We've hit this when the Doctor
+            // navigated around a missing docker runtime by skipping the
+            // package+deploy phases. Surface that fact to the Verifier as
+            // a hint so it doesn't blindly mark the deploy Succeeded.
+            var probeHints = await ProbeDeployedStateAsync(s, ct);
+            var allHints = plan.VerifyHints.Concat(probeHints).ToList();
+
+            var v = await verifier.VerifyAsync(tail, allHints, ct);
+            s.FinalEndpoint = v.Endpoint;
+            if (!string.IsNullOrEmpty(v.Notes)) await Log(s, "info", $"Verifier: {v.Notes}");
+
+            // If our probe spotted placeholder images, overrule the
+            // Verifier if it optimistically said 'success'. This is a
+            // deterministic signal that cannot be argued away by
+            // interpretation of the log tail.
+            var hasHollowSignal = probeHints.Any(h =>
+                h.StartsWith("hollow_deploy:", StringComparison.Ordinal));
+            if (hasHollowSignal && v.Success)
+            {
+                var hollowDetail = string.Join("; ",
+                    probeHints.Where(h => h.StartsWith("hollow_deploy:")));
+
+                // Autonomous recovery: instead of immediately failing the
+                // whole deploy, try an 'azd deploy --no-prompt' pass. The
+                // infrastructure is already intact (the post-deploy probe
+                // proved it), so all we need is to drive azd through the
+                // package + push + update-container-app phases again. This
+                // typically succeeds when the earlier 'azd up' exited
+                // non-zero because of a parallel-provision race (some
+                // Container Apps were still in 'Validation timed out' at
+                // the moment azd gave up) but the follow-up provision
+                // (triggered by our ContainerAppValidationTimeout auto-
+                // retry) stabilised them — just that the FINAL deploy
+                // phase never ran.
+                //
+                // We only attempt this ONCE per session: if it doesn't
+                // fix the hollow state, we mark Failed so the user knows.
+                // This is a terminal recovery pass, not another retry
+                // loop — the loop responsibility lives in step-level
+                // auto-retry + Doctor remediation ABOVE, not here.
+                await Log(s, "warn",
+                    $"Verifier said Succeeded but the real Azure state disagrees: {hollowDetail}. " +
+                    "Triggering an autonomous 'azd deploy' recovery pass before failing the deploy. " +
+                    "Infrastructure is intact; only the image build+push is missing.");
+
+                var recovered = await TryAutoRecoverHollowDeployAsync(
+                    s, docker, plan.Environment, ct);
+
+                if (recovered)
+                {
+                    // Re-probe: did the recovery actually move the needle?
+                    var reprobeHints = await ProbeDeployedStateAsync(s, ct);
+                    var stillHollow = reprobeHints.Any(h =>
+                        h.StartsWith("hollow_deploy:", StringComparison.Ordinal));
+                    if (!stillHollow)
+                    {
+                        await Log(s, "info",
+                            "Post-recovery probe: all Container Apps now serving real images. " +
+                            "Deploy marked Succeeded.");
+                        await SetStatus(s, DeploymentStatus.Succeeded);
+                        _memory.UpsertInsight(s.RepoUrl, "lastSuccess.azureLocation",
+                            s.AzureLocation, confidence: 1.0);
+                        _memory.UpsertInsight(s.RepoUrl, "lastSuccess.at",
+                            DateTimeOffset.UtcNow.ToString("O"), confidence: 1.0);
+                        if (!string.IsNullOrEmpty(v.Endpoint))
+                            _memory.UpsertInsight(s.RepoUrl, "lastSuccess.endpoint",
+                                v.Endpoint, confidence: 1.0);
+                        return;
+                    }
+                    // Still hollow after recovery — fall through to Failed.
+                    hollowDetail = string.Join("; ",
+                        reprobeHints.Where(h => h.StartsWith("hollow_deploy:")));
+                }
+
+                s.ErrorMessage =
+                    "Deploy completed infrastructure provisioning but the application images " +
+                    "were never built or pushed after the autonomous recovery pass. " +
+                    $"Detail: {hollowDetail}. Inspect the Live log for 'azd deploy' errors " +
+                    "from the recovery pass; typical causes are an inaccessible ACR, a " +
+                    "Dockerfile build error, or missing buildx.";
+                await SetStatus(s, DeploymentStatus.Failed);
+                return;
+            }
+
+            await SetStatus(s, v.Success ? DeploymentStatus.Succeeded : DeploymentStatus.Failed);
+
+            // Distil outcome into durable insights the next deploy of the
+            // same (or similar) repo can benefit from.
+            if (v.Success)
+            {
+                _memory.UpsertInsight(s.RepoUrl, "lastSuccess.azureLocation",
+                    s.AzureLocation, confidence: 1.0);
+                _memory.UpsertInsight(s.RepoUrl, "lastSuccess.at",
+                    DateTimeOffset.UtcNow.ToString("O"), confidence: 1.0);
+                if (!string.IsNullOrEmpty(v.Endpoint))
+                    _memory.UpsertInsight(s.RepoUrl, "lastSuccess.endpoint",
+                        v.Endpoint, confidence: 1.0);
+            }
+            else if (!string.IsNullOrEmpty(v.Notes))
+            {
+                _memory.UpsertInsight(s.RepoUrl, "lastFailure.verifier",
+                    v.Notes, confidence: 0.6);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The only sources of OperationCanceledException here are:
+            //   1. user click on the Cancel button (s.Cts.Cancel())
+            //   2. a per-step timeout firing inside DockerShellTool
+            // In both cases the running docker container is already being
+            // torn down by CliWrap, so we just record a concise reason.
+            if (s.Cts.IsCancellationRequested)
+            {
+                s.ErrorMessage = "Cancelled by user.";
+            }
+            else
+            {
+                // Concise timeout message. The earlier verbose "what to do"
+                // block was duplicated between the live log panel and the
+                // red error card in the UI, producing a wall of text the
+                // user had to scroll past every time a step hit its budget.
+                // We keep the essential facts (which step, how long, what
+                // budget) on a single line. Context-specific advice
+                // ('check Azure portal', 'az group delete is long-running')
+                // is already in the README + the step-timeout warning
+                // already logged minutes earlier by the heartbeat task, so
+                // repeating it here adds noise without information.
+                var elapsed = currentStepStartedAt.HasValue
+                    ? DateTime.UtcNow - currentStepStartedAt.Value
+                    : TimeSpan.Zero;
+                var stepSummary = currentStep is not null
+                    ? $"step {currentStep.Id} ('{Truncate(currentStep.Description, 80)}')"
+                    : "a deployment step";
+
+                // With timeouts set to Infinite by default, hitting this
+                // branch means the user clicked Cancel or an upstream
+                // cancellation fired (docker daemon gone, session GC'd).
+                // Phrase the message accordingly; only mention a numeric
+                // budget when one was actually configured.
+                var hasFiniteBudget = currentStepBudget > TimeSpan.Zero
+                    && currentStepBudget != System.Threading.Timeout.InfiniteTimeSpan;
+                if (hasFiniteBudget)
+                {
+                    s.ErrorMessage =
+                        $"Timeout: {stepSummary} did not finish within " +
+                        $"{currentStepBudget.TotalMinutes:0} min (elapsed " +
+                        $"{elapsed.TotalMinutes:0} min). The work may still be running on Azure; " +
+                        "check the portal before retrying.";
+                }
+                else
+                {
+                    s.ErrorMessage =
+                        $"Cancelled: {stepSummary} was stopped after " +
+                        $"{elapsed.TotalMinutes:0} min. The work may still be running on Azure; " +
+                        "check the portal before retrying.";
+                }
+            }
+            await Log(s, "err", s.ErrorMessage);
+            await SetStatus(s, DeploymentStatus.Cancelled);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Deployment {Id} failed", s.Id);
+            s.ErrorMessage = ex.Message;
+            await SetStatus(s, DeploymentStatus.Failed);
+        }
+        finally
+        {
+            // Tear down the long-lived sandbox container FIRST, before the
+            // workspace volume: docker refuses to delete a volume that is
+            // still referenced by an existing container, even a stopped
+            // one. Both teardowns run with CancellationToken.None so a
+            // user-cancel doesn't skip cleanup of resources we created.
+            if (session is not null)
+            {
+                try
+                {
+                    await session.DisposeAsync();
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex,
+                        "Failed to dispose sandbox session container for {Id} (non-fatal).", s.Id);
+                }
+            }
+
+            try
+            {
+                await SandboxWorkspaceVolume.RemoveAsync(s.Id, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex,
+                    "Failed to remove workspace volume for session {Id} (non-fatal).", s.Id);
+            }
+        }
+    }
+
+    private async Task SetStatus(DeploymentSession s, DeploymentStatus st)
+    {
+        s.Status = st;
+        _store.SaveLater(s);
+        await _hub.Clients.Group(s.Id).SendAsync("StatusChanged", st.ToString(), s.ErrorMessage, s.FinalEndpoint);
+    }
+
+    private async Task Log(DeploymentSession s, string level, string message, int? stepId = null)
+    {
+        var e = new LogEntry(DateTime.UtcNow, level, message, stepId);
+        s.Logs.Add(e);
+        _store.SaveLater(s);
+        await _hub.Clients.Group(s.Id).SendAsync("LogAppended", e);
+
+        // Record agent traces in the memory store so the per-session
+        // history is reconstructable from disk after the fact (useful for
+        // debugging a failed deploy the user already closed the tab on).
+        // We only persist lines coming from the sandbox runner — the
+        // orchestrator's own status messages are already summarised in
+        // s.Logs and would just duplicate noise.
+        if (!string.IsNullOrEmpty(message) && message.StartsWith("[agent-runner]", StringComparison.Ordinal))
+        {
+            var trimmed = message.Substring("[agent-runner]".Length).Trim();
+            // Parse '[agent] <Name>/<role>: <content>' format emitted by PlanningTeam.
+            var m = System.Text.RegularExpressions.Regex.Match(
+                trimmed,
+                @"^\[agent\]\s+(?<name>[A-Za-z0-9_\-]+)/(?<role>[a-z]+):\s*(?<body>.*)$",
+                System.Text.RegularExpressions.RegexOptions.Singleline);
+            if (m.Success)
+                _memory.RecordTurn(s.Id, m.Groups["name"].Value, m.Groups["role"].Value, m.Groups["body"].Value);
+            else
+                _memory.RecordTurn(s.Id, "runner", level, trimmed);
+        }
+    }
+
+    private static string? ReadHostTenantId() => ReadHostDefaultSubscription().TenantId;
+
+    /// <summary>
+    /// Runs 'docker version --format "{{.Server.Version}}"' to verify the
+    /// Docker daemon is reachable BEFORE any other pipeline phase starts.
+    /// Returns null when Docker is healthy, or a short error message when
+    /// the client cannot talk to the daemon (Docker Desktop not started,
+    /// npipe/unix socket missing, bad DOCKER_HOST env var, etc.).
+    ///
+    /// Short timeout (5s): 'docker version' is local-only, if it has not
+    /// answered in 5 seconds the daemon is effectively down.
+    /// </summary>
+    private static async Task<string?> PreflightDockerAsync(CancellationToken ct)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "docker",
+                Arguments = "version --format \"{{.Server.Version}}\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc is null) return "failed to start 'docker' CLI (is it on PATH?)";
+
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(5));
+            try { await proc.WaitForExitAsync(cts.Token); }
+            catch (OperationCanceledException)
+            {
+                try { proc.Kill(true); } catch { }
+                return "'docker version' timed out after 5s (daemon unresponsive).";
+            }
+
+            if (proc.ExitCode != 0)
+            {
+                var stderr = (await proc.StandardError.ReadToEndAsync(ct)).Trim();
+                // Keep only the first non-empty line: 'docker version'
+                // emits a long 'Client: ...' block before the failure
+                // message, and the user only needs the actionable tail.
+                var firstLine = stderr.Split('\n')
+                    .Select(l => l.Trim())
+                    .FirstOrDefault(l => !string.IsNullOrEmpty(l)
+                                      && !l.StartsWith("Client", StringComparison.OrdinalIgnoreCase))
+                    ?? stderr.Split('\n').Select(l => l.Trim()).FirstOrDefault(l => !string.IsNullOrEmpty(l))
+                    ?? "";
+                return string.IsNullOrEmpty(firstLine)
+                    ? $"'docker version' exited with code {proc.ExitCode}."
+                    : firstLine;
+            }
+            return null; // Healthy.
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return "'docker' executable not found on PATH.";
+        }
+        catch (Exception ex)
+        {
+            return ex.Message;
+        }
+    }
+
+    /// <summary>
+    /// Classifies a step's tail output and returns a short, user-facing
+    /// message when the failure is environmental (Docker daemon down, az
+    /// CLI unusable, sandbox image missing, DNS broken, …) — i.e. not
+    /// something the in-sandbox Doctor can possibly fix. Returns null
+    /// when the failure looks like a genuine deployment issue the Doctor
+    /// should analyse. Keeping this list conservative: misclassifying a
+    /// Doctor-fixable issue as "environmental" would bypass a valid
+    /// remediation.
+    /// </summary>
+    private static string? DetectEnvironmentalFailure(string stepTail)
+    {
+        if (string.IsNullOrWhiteSpace(stepTail)) return null;
+        var t = stepTail.ToLowerInvariant();
+
+        // Docker daemon unreachable: by far the most common "cannot fix
+        // from inside a container" failure. The client tries npipe on
+        // Windows, /var/run/docker.sock on Linux, and any failure maps
+        // to one of these strings.
+        if (t.Contains("cannot connect to the docker daemon")
+         || t.Contains("failed to connect to the docker api")
+         || t.Contains("the system cannot find the file specified"
+                        /* npipe missing */) && t.Contains("docker"))
+        {
+            return "the Docker daemon is not reachable (is Docker Desktop running?).";
+        }
+
+        // Docker image for the sandbox was never pulled / built.
+        if (t.Contains("unable to find image") && t.Contains("locally"))
+            return "the required sandbox image is missing from the Docker host.";
+
+        return null;
+    }
+
+    /// <summary>
+    /// Detects whether a command would invoke PowerShell. The sandbox
+    /// image carries only bash, so any 'pwsh' / 'powershell' invocation
+    /// exits 127. Matches both the bare binary name and the common
+    /// 'pwsh -c' / '-Command' forms while avoiding false positives on
+    /// substrings like 'pwshell' appearing inside longer words.
+    /// </summary>
+    private static bool ContainsPwsh(string cmd)
+    {
+        if (string.IsNullOrEmpty(cmd)) return false;
+        return System.Text.RegularExpressions.Regex.IsMatch(
+            cmd,
+            @"(^|[\s""'|&;])(pwsh|powershell)(\s|$)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    }
+
+    /// <summary>
+    /// True iff <paramref name="cmd"/> contains a raw 'azd up' invocation
+    /// (with or without flags) that is NOT already wrapped by the baked
+    /// 'agentic-azd-up' helper. Conservative: requires 'azd' followed by
+    /// 'up' as separate whitespace-delimited tokens.
+    /// </summary>
+    private static bool ContainsRawAzdUp(string cmd)
+    {
+        if (string.IsNullOrEmpty(cmd)) return false;
+        // Already using the baked helper — leave alone.
+        if (cmd.Contains("agentic-azd-up", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return System.Text.RegularExpressions.Regex.IsMatch(
+            cmd,
+            @"(^|[\s""'|&;])azd\s+up(\s|$|"")",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    }
+
+    /// <summary>
+    /// Replace the leftmost 'azd up [args...]' span in <paramref name="cmd"/>
+    /// with 'agentic-azd-up'. The baked helper takes no args and reads the
+    /// same azd env, so any trailing flags (e.g. --no-prompt, -e ENV) are
+    /// dropped — they're already the helper's defaults. Wrapping shells
+    /// ('bash -lc "..."', 'sh -c "..."') and surrounding env assignments
+    /// are preserved verbatim.
+    /// </summary>
+    private static string RewriteAzdUpToBakedHelper(string cmd)
+    {
+        if (string.IsNullOrEmpty(cmd)) return cmd;
+        // Match 'azd up' + optional flag tail up to the first unescaped
+        // closing quote / shell separator. Conservative: stop at " ' &
+        // ; | or end-of-string. Captures and discards the tail.
+        var rx = new System.Text.RegularExpressions.Regex(
+            @"\bazd\s+up(\s+[^""'&;|]*)?",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return rx.Replace(cmd, "agentic-azd-up", 1);
+    }
+
+    /// <summary>
+    /// Best-effort rewrite of a pwsh-based command to its bash equivalent.
+    /// Handles the patterns the Strategist actually emits:
+    ///   pwsh -c "..."             -> bash -lc "..."
+    ///   powershell -Command "..." -> bash -lc "..."
+    /// For the azd-setup commands we see in practice
+    /// ('azd env set VAR $(az account show --query id -o tsv)') bash and
+    /// pwsh share enough syntax that a direct swap produces a working
+    /// command. Genuinely PowerShell-specific bodies will still fail,
+    /// which is fine — they hit the Doctor as a real bug, not as noise.
+    /// </summary>
+    private static string RewritePwshToBash(string cmd)
+    {
+        var rx = new System.Text.RegularExpressions.Regex(
+            @"\b(pwsh|powershell)\s+(-c|-Command)\s+",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (rx.IsMatch(cmd)) return rx.Replace(cmd, "bash -lc ");
+
+        // Bare 'pwsh -something' / 'pwsh script.ps1': wrap in bash -lc so
+        // the outer shell at least exists, producing a clearer error for
+        // the Doctor if the body is actually PowerShell-specific.
+        return $"bash -lc \"{cmd.Replace("\"", "\\\"")}\"";
+    }
+
+    private static string Truncate(string s, int max) =>
+        string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "...");
+
+    /// <summary>
+    /// Heuristic: is the Doctor's proposed remediation a near-duplicate of
+    /// something already on the previousAttempts list? Trivial exact-match
+    /// is not enough (LLMs routinely shuffle whitespace, swap single
+    /// quotes for double, reorder short flags) so we compare a NORMALISED
+    /// token signature instead.
+    ///
+    /// Returns true + a short user-facing reason when a match is found.
+    /// The orchestrator uses this to reject the remediation and force the
+    /// Doctor to pivot on the next iteration.
+    /// </summary>
+    private static bool IsNearDuplicate(
+        AgentStationHub.Models.Remediation fix,
+        IReadOnlyList<string> previousAttempts,
+        out string reason)
+    {
+        reason = "";
+        if (fix.NewSteps.Count == 0) return false;
+
+        static string Normalise(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            // Collapse whitespace + strip the three flavours of quote
+            // + lowercase + drop the common 'bash -lc' / 'sh -c' wrapper
+            // so the comparison focuses on the actual intent.
+            var core = System.Text.RegularExpressions.Regex.Replace(
+                s.Trim(), @"^(bash|sh)\s+-l?c\s+", "",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            core = core.Replace("\"", "").Replace("'", "").Replace("`", "");
+            core = System.Text.RegularExpressions.Regex.Replace(core, @"\s+", " ");
+            return core.ToLowerInvariant();
+        }
+
+        // Extract the proposed commands (all steps in this remediation)
+        // as a single joined signature.
+        var proposed = string.Join(" && ",
+            fix.NewSteps.Select(ns => Normalise(ns.Command ?? "")));
+        if (proposed.Length < 8) return false;
+
+        // Tokenise so we can compute a Jaccard similarity — robust against
+        // small arg reorderings that plain string equality misses.
+        static HashSet<string> Tokens(string s) =>
+            new HashSet<string>(s.Split(' ',
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+
+        var proposedTokens = Tokens(proposed);
+        if (proposedTokens.Count < 3) return false;
+
+        foreach (var prior in previousAttempts)
+        {
+            // previousAttempts lines look like:
+            //   "step 10 [ErrSig]: <original cmd> — replace_step -> <new cmd>"
+            // We're interested in the PART AFTER the last '->' (the fix
+            // the Doctor previously proposed) since a duplicate of the
+            // original failing command isn't meaningful — it's the FIX
+            // that's repeating.
+            var arrow = prior.LastIndexOf("->", StringComparison.Ordinal);
+            if (arrow < 0) continue;
+            var priorCmd = Normalise(prior[(arrow + 2)..]);
+            if (priorCmd.Length < 8) continue;
+
+            // Exact normalised equality — the most common LLM re-proposal.
+            if (priorCmd.Equals(proposed, StringComparison.Ordinal))
+            {
+                reason = "exact command match (ignoring whitespace/quotes)";
+                return true;
+            }
+
+            // Jaccard similarity >= 0.85 flags "same intent, minor reshuffle"
+            // without false-positiving on commands that happen to share a
+            // 'find /workspace' or 'sed -i' prefix.
+            var priorTokens = Tokens(priorCmd);
+            if (priorTokens.Count < 3) continue;
+            var inter = proposedTokens.Intersect(priorTokens).Count();
+            var union = proposedTokens.Union(priorTokens).Count();
+            if (union == 0) continue;
+            var similarity = (double)inter / union;
+            if (similarity >= 0.85)
+            {
+                reason = $"{similarity:P0} token overlap with a prior attempt";
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Post-deploy reality check. Queries the Azure Resource Group the
+    /// deploy landed in and flags the session when Container Apps are
+    /// still pointing at the 'containerapps-helloworld' placeholder image
+    /// — which is what happens when the 'azd up' flow skips the
+    /// package+deploy phases (typically because the Doctor navigated
+    /// around a missing docker runtime by setting *_RESOURCE_EXISTS=true
+    /// or demoting to 'azd provision' alone).
+    ///
+    /// Returns 0..N string hints to append to the Verifier's input. When
+    /// a hollow deploy is detected we emit a "hollow_deploy:..." hint
+    /// that the orchestrator turns into a hard Failed status — even if
+    /// the Verifier LLM would otherwise interpret the clean exit codes
+    /// as success.
+    ///
+    /// The probe is best-effort: if we can't extract a RG name from the
+    /// logs, or 'az' isn't reachable, we return an empty hint list and
+    /// let the Verifier decide on its own. We never throw.
+    /// </summary>
+    private async Task<bool> TryAutoRecoverHollowDeployAsync(
+        DeploymentSession s,
+        Tools.DockerShellTool docker,
+        IReadOnlyDictionary<string, string> planEnv,
+        CancellationToken ct)
+    {
+        try
+        {
+            await Log(s, "status",
+                "Autonomous recovery: running 'azd deploy --no-prompt' inside the live " +
+                "sandbox session to build + push application images. This is a one-shot " +
+                "pass — if it doesn't clear the hollow state, the deploy will be marked Failed.");
+
+            var env = planEnv.ToDictionary(kv => kv.Key, kv => kv.Value);
+
+            var recoveryCmd =
+                "set -e; " +
+                "cd /workspace; " +
+                "echo '[recovery] azd env list:'; azd env list --output table 2>&1 || true; " +
+                "echo '[recovery] launching azd deploy --no-prompt'; " +
+                "azd deploy --no-prompt";
+
+            var result = await docker.RunAsync(
+                recoveryCmd, ".",
+                env,
+                System.Threading.Timeout.InfiniteTimeSpan,
+                ct,
+                silenceBudget: _opt.StepSilenceBudget);
+
+            if (result.TimedOutBySilence)
+            {
+                await Log(s, "warn",
+                    "Autonomous recovery: 'azd deploy' went silent for >= the silence " +
+                    "budget during build. Re-probing to see what landed before the hang.");
+                return true;
+            }
+            if (result.ExitCode != 0)
+            {
+                await Log(s, "warn",
+                    $"Autonomous recovery: 'azd deploy' exited {result.ExitCode}. " +
+                    "Re-probing Azure to see whether any Container Apps were updated.");
+                return true;
+            }
+
+            await Log(s, "info",
+                "Autonomous recovery: 'azd deploy' completed successfully. Re-probing Azure...");
+            return true;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Autonomous recovery threw unexpectedly; skipping the re-probe and marking Failed.");
+            await Log(s, "warn",
+                $"Autonomous recovery aborted ({ex.GetType().Name}: {ex.Message}). " +
+                "Falling back to Failed.");
+            return false;
+        }
+    }
+
+    private async Task<IList<string>> ProbeDeployedStateAsync(
+        DeploymentSession s, CancellationToken ct)
+    {
+        var hints = new List<string>();
+        try        {
+            var rg = ExtractResourceGroupFromLogs(s.Logs);
+            if (string.IsNullOrWhiteSpace(rg)) return hints;
+
+            var stdout = new System.Text.StringBuilder();
+            var result = await CliWrap.Cli.Wrap("az")
+                .WithArguments(new[]
+                {
+                    "containerapp", "list",
+                    "-g", rg,
+                    "--query",
+                    "[].{name:name, image:properties.template.containers[0].image}",
+                    "-o", "json"
+                })
+                .WithValidation(CliWrap.CommandResultValidation.None)
+                .WithStandardOutputPipe(CliWrap.PipeTarget.ToStringBuilder(stdout))
+                .WithStandardErrorPipe(CliWrap.PipeTarget.Null)
+                .ExecuteAsync(ct);
+
+            if (result.ExitCode != 0 || stdout.Length < 2) return hints;
+
+            using var doc = System.Text.Json.JsonDocument.Parse(stdout.ToString());
+            if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return hints;
+
+            int total = 0, placeholder = 0;
+            var placeholderNames = new List<string>();
+            foreach (var e in doc.RootElement.EnumerateArray())
+            {
+                total++;
+                var img = e.TryGetProperty("image", out var iEl) &&
+                          iEl.ValueKind == System.Text.Json.JsonValueKind.String
+                    ? iEl.GetString() ?? ""
+                    : "";
+                if (img.Contains("containerapps-helloworld", StringComparison.OrdinalIgnoreCase))
+                {
+                    placeholder++;
+                    if (e.TryGetProperty("name", out var nEl))
+                        placeholderNames.Add(nEl.GetString() ?? "");
+                }
+            }
+
+            if (total > 0 && placeholder > 0)
+            {
+                var names = string.Join(",", placeholderNames.Take(6));
+                hints.Add(
+                    $"hollow_deploy:{placeholder}/{total} Container Apps in '{rg}' still running " +
+                    $"placeholder image (containerapps-helloworld). Apps: {names}. " +
+                    "ACR build+push did not complete — 'azd package' and 'azd deploy' were " +
+                    "skipped or failed.");
+                await Log(s, "info",
+                    $"Post-deploy probe: {placeholder}/{total} Container Apps in '{rg}' are on " +
+                    "the Microsoft placeholder image (real app images never built/pushed).",
+                    null);
+            }
+            else if (total > 0)
+            {
+                await Log(s, "info",
+                    $"Post-deploy probe: {total} Container Apps in '{rg}' are serving real " +
+                    "images (not the placeholder).", null);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Probe failures are non-fatal — never block the deploy over
+            // diagnostics infrastructure. Log and move on.
+            await Log(s, "info",
+                $"Post-deploy probe skipped (non-fatal): {ex.GetType().Name} {ex.Message}",
+                null);
+        }
+        return hints;
+    }
+
+    /// <summary>
+    /// Sift through the session's log tail for the name of the Azure
+    /// Resource Group the deploy targeted. azd prints this in multiple
+    /// places — the 'azd env get-values' output, the provision summary,
+    /// error messages referencing "resource group: rg-xyz". We prefer
+    /// the most recent mention so cross-attempt noise from an earlier
+    /// 'azd down' doesn't confuse us.
+    /// </summary>
+    private static string? ExtractResourceGroupFromLogs(
+        IReadOnlyList<AgentStationHub.Models.LogEntry> logs)
+    {
+        // Pattern 1: 'AZURE_RESOURCE_GROUP=rg-xyz' (from azd env dump)
+        // Pattern 2: '"resourceGroup": "rg-xyz"' (from az json output)
+        // Pattern 3: 'resource group: rg-xyz' (from azd error messages)
+        // Pattern 4: 'az group delete -n rg-xyz' (from Doctor remediations)
+        // Require at least 3 characters after the prefix to avoid matching
+        // placeholder-like 'rg-' alone.
+        var patterns = new[]
+        {
+            new System.Text.RegularExpressions.Regex(
+                @"AZURE_RESOURCE_GROUP[=:]\s*""?([A-Za-z0-9_-]{3,64})""?",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase),
+            new System.Text.RegularExpressions.Regex(
+                @"""resourceGroup""\s*:\s*""([A-Za-z0-9_-]{3,64})""",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase),
+            new System.Text.RegularExpressions.Regex(
+                @"resource group[:\s]+([A-Za-z0-9_-]{3,64})",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase),
+            new System.Text.RegularExpressions.Regex(
+                @"az\s+group\s+\w+\s+(?:-n|--name)\s+([A-Za-z0-9_-]{3,64})",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+        };
+
+        for (int i = logs.Count - 1; i >= 0 && i >= logs.Count - 500; i--)
+        {
+            var line = logs[i].Message ?? "";
+            foreach (var rx in patterns)
+            {
+                var m = rx.Match(line);
+                if (m.Success)
+                {
+                    var name = m.Groups[1].Value.Trim();
+                    // Filter obvious false positives.
+                    if (name.Length < 3) continue;
+                    if (name.Equals("name", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (name.Equals("true", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (name.Equals("false", StringComparison.OrdinalIgnoreCase)) continue;
+                    return name;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Extracts a short, stable error signature from a step's tail log so
+    /// the DeploymentDoctor can detect when it keeps fighting the same
+    /// class of failure across attempts and should escalate to 'give_up'.
+    /// Recognises a handful of well-known Azure / azd error codes; falls
+    /// back to a sanitized first-200-char snippet otherwise.
+    /// </summary>
+    private static string SummariseErrorSignature(string tail)
+    {
+        if (string.IsNullOrWhiteSpace(tail)) return "unknown";
+        var knownCodes = new[]
+        {
+            "ServiceModelDeprecated",
+            "DeploymentModelNotSupported",
+            "InvalidTemplate",
+            "InvalidTemplateDeployment",
+            "InvalidResourceLocation",
+            "InsufficientResourcesAvailable",
+            "QuotaExceeded",
+            "NameConflict",
+            "SubscriptionQuotaExceeded",
+            "ResourceNotFound",
+            "AuthenticationFailed",
+            "ModuleNotFoundError",
+            "cannot execute: required file not found"
+        };
+        foreach (var code in knownCodes)
+        {
+            if (tail.Contains(code, StringComparison.OrdinalIgnoreCase))
+                return code;
+        }
+
+        // Structured synthetic signatures for classes of failure that
+        // don't have a tidy Azure error code but are still distinct and
+        // recurrent. The circuit breaker needs a STABLE string for each
+        // class, otherwise "same failure, different slice of log tail"
+        // produces a new signature every time and never trips.
+        var lower = tail.ToLowerInvariant();
+        if (lower.Contains("no .net sdks were found")
+         || lower.Contains("a compatible .net sdk was not found")
+         || lower.Contains("the application 'user-secrets' does not exist"))
+            return "DotnetSdkNotFound";
+
+        if (lower.Contains("neither docker nor podman is installed")
+         || lower.Contains("no container runtime (docker/podman) is installed")
+         || lower.Contains("cannot connect to the docker daemon"))
+            return "DockerRuntimeMissing";
+
+        // Silence-detector aborted this step — we synthesise a distinct
+        // signature so the Doctor knows this is a HANG (no exit code,
+        // just no output for N minutes), NOT a crash. The canonical fix
+        // for this class on 'docker buildx build' / 'azd deploy' hangs
+        // is to switch the affected service to 'az acr build' remote
+        // (build on Azure infra, bypassing the fragile local buildkit).
+        if (lower.Contains("step produced no output for")
+         || lower.Contains("treating as a hang"))
+            return "StepSilent";
+
+        // Process killed by the host OOM killer. Classic case: azd's
+        // credential chain shells out to 'az account get-access-token'
+        // and the Python az process peaks at ~1 GB; when combined with
+        // azd, buildx, the Bicep graph and the JSON parsing of a rich
+        // subscription scope template, the sandbox cgroup hits its
+        // memory cap and Docker Desktop kills the heaviest process —
+        // usually az. The error text reported back by azd is
+        // "AzureCLICredential: signal: killed". Distinct signature so
+        // the Doctor re-tries the same step after a short cool-off;
+        // this is a TRANSIENT OOM, not a logic error, and has a >90 %
+        // success rate on retry now that we also bumped the sandbox
+        // memory cap to 6 GB.
+        if (lower.Contains("signal: killed")
+         || lower.Contains("signal:killed")
+         || (lower.Contains("azureclicredential") && lower.Contains("killed")))
+            return "SignalKilled";
+
+        // azd deploy can't find a Container App tagged for a service
+        // declared in azure.yaml, AND azd provision has been skipping
+        // "no changes detected". This means the local .azure state is
+        // out of sync with Azure: azd thinks the infra is already
+        // deployed (so provision skips) but Azure has no tagged
+        // resources (so deploy fails). Distinct signature so the
+        // Doctor goes directly to the 'force Bicep via az deployment
+        // sub create' recovery instead of looping on delete-RG +
+        // provision + deploy (which never works because azd keeps
+        // skipping).
+        if (lower.Contains("unable to find a resource tagged with")
+         || lower.Contains("azd-service-name")
+         || (lower.Contains("didn't find new changes")
+             && lower.Contains("azd-service-name")))
+            return "AzdStateStale";
+
+        // Azure Container Apps 'Validation timed out' error — Azure's
+        // control plane couldn't validate the Container App revision
+        // within its internal budget, usually under contention when
+        // the Bicep creates many Container Apps in parallel (8-service
+        // monorepos hit this regularly). The error is almost always
+        // TRANSIENT: Bicep is idempotent, re-running the exact same
+        // deployment retries only the failed Container Apps, and by
+        // the time the retry fires the regional control plane has
+        // capacity again. Distinct signature so the orchestrator can
+        // auto-retry (see the matching branch below) without burning
+        // a Doctor round-trip on what is effectively a cloud hiccup.
+        if (lower.Contains("validation of container app creation")
+         || lower.Contains("containerappoperationerror")
+         || (lower.Contains("failed: container app:")
+             && lower.Contains("timed out")))
+            return "ContainerAppValidationTimeout";
+
+        if (lower.Contains("--mount")
+         && (lower.Contains("unknown flag") || lower.Contains("dockerfile parse error")
+             || lower.Contains("unexpected token")))
+            return "BuildKitRequired";
+
+        if (lower.Contains("failed to solve")
+         && (lower.Contains("cache") || lower.Contains("mount")))
+            return "BuildKitRequired";
+
+        // Noexec bind-mount: Docker Desktop on Windows (WSL2 hosted
+        // bind-mount of a Windows drive path) strips the executable
+        // bit from files created inside the container. npm extracts
+        // esbuild/rollup/etc. into /workspace/**/node_modules/**/bin
+        // and the subsequent spawnSync fails EACCES. Same pattern hits
+        // bare `./script.sh` calls inside azd hooks. This is distinct
+        // from WorkspacePermissionDenied (which is about writes to a
+        // read-only path) — the file exists and is readable, just not
+        // executable — so the Doctor's canonical fix is different
+        // (relocate node_modules to /tmp, not move the operation).
+        if ((lower.Contains("eacces") || lower.Contains("permission denied"))
+         && lower.Contains("/workspace")
+         && (lower.Contains("node_modules")
+             || lower.Contains(".sh:")
+             || lower.Contains("spawnsync")
+             || lower.Contains("esbuild")
+             || lower.Contains("/bin/")))
+            return "NoexecBindMount";
+
+        // Indirect tells: the Doctor previously rewrote 'npm ci' /
+        // 'npm install' with malformed flags and what reaches us is
+        // npm's own usage block (no EACCES line, just the help text
+        // and "npm error code 1"). Without this branch the failure
+        // looks generic and the next Doctor invocation re-attempts
+        // another sed-on-npm patch. Tagging it [NoexecBindMount]
+        // anyway forces the canonical relocate-to-/tmp recipe.
+        if (lower.Contains("npm error")
+         && (lower.Contains("aliases: clean-install")
+             || lower.Contains("--install-strategy")
+             || lower.Contains("run \"npm help ci\"")))
+            return "NoexecBindMount";
+
+        if (lower.Contains("permission denied")
+         && (lower.Contains("/workspace") || lower.Contains("/.dotnet")))
+            return "WorkspacePermissionDenied";
+
+        if (lower.Contains("exec format error"))
+            return "ExecFormatError";
+
+        if (lower.Contains("command not found"))
+            return "CommandNotFound";
+
+        if (lower.Contains("npm err!") && lower.Contains("enoent"))
+            return "NpmEnoent";
+
+        if (lower.Contains("the deployment template contains errors"))
+            return "BicepTemplateError";
+
+        // Fallback: first non-empty line after "ERROR:" or the first 80 chars
+        var errIdx = tail.IndexOf("ERROR:", StringComparison.OrdinalIgnoreCase);
+        var slice = errIdx >= 0 ? tail[(errIdx + 6)..] : tail;
+        slice = slice.Replace("\r", " ").Replace("\n", " ").Trim();
+        return slice.Length > 80 ? slice[..80] + "..." : slice;
+    }
+
+    /// <summary>
+    /// Re-emits the PlanReady SignalR event with the current (post-
+    /// remediation) step list so the UI checklist always matches what the
+    /// orchestrator is actually running. Step ids are renumbered so the
+    /// checklist shows a clean 1..N sequence after insertions/replacements.
+    /// </summary>
+    private async Task PublishUpdatedPlanAsync(
+        DeploymentSession s, DeploymentPlan plan,
+        IList<DeploymentStep> steps, CancellationToken ct)
+    {
+        var renumbered = steps
+            .Select((st, idx) => new DeploymentStep(
+                idx + 1, st.Description, st.Command, st.WorkingDirectory, st.Timeout))
+            .ToList();
+        // Mutate the shared session plan so late-joining clients and the
+        // Verifier see the accurate state.
+        var updated = plan with { Steps = renumbered };
+        s.Plan = updated;
+        _store.SaveLater(s);
+        await _hub.Clients.Group(s.Id).SendAsync("PlanReady", updated, ct);
+
+        // Also keep the running list coherent with the emitted one so the
+        // orchestrator's loop indices line up with what the user sees.
+        for (int k = 0; k < steps.Count; k++) steps[k] = renumbered[k];
+    }
+
+    /// <summary>
+    /// <summary>
+    /// Heuristic: does this shell command invoke an azd/az operation that
+    /// is likely to run for many minutes with mostly-silent output (Azure
+    /// provisioning, packaging, ACR pushes, resource-group teardown)?
+    /// If yes, we (a) apply <see cref="DeploymentOptions.LongRunningStepTimeout"/>
+    /// instead of the 10-minute default, and (b) attach the progress
+    /// watcher so the user sees periodic updates.
+    ///
+    /// Specifically includes:
+    ///   • 'azd up' / 'azd provision' / 'azd deploy' — template provisioning
+    ///   • 'az group delete' WITHOUT '--no-wait' — can legitimately take
+    ///     30-45 minutes for a group containing OpenAI + Search + Container
+    ///     Apps + VNet resources (each with soft-delete + dependency
+    ///     teardown chains). Historically the 10-minute default timeout
+    ///     killed cleanups mid-way and left half-deleted RGs the next
+    ///     deploy had to fight with.
+    ///   • 'az cognitiveservices account purge' — often waits on a long
+    ///     soft-delete retention period.
+    ///   • 'az keyvault purge' — same reason.
+    /// </summary>
+    private static bool IsLongRunningAzdCommand(string cmd)
+    {
+        if (string.IsNullOrWhiteSpace(cmd)) return false;
+
+        if (cmd.Contains("azd up",        StringComparison.OrdinalIgnoreCase)
+         || cmd.Contains("azd provision", StringComparison.OrdinalIgnoreCase)
+         || cmd.Contains("azd deploy",    StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // 'az group delete' without '--no-wait' blocks until Azure confirms
+        // every resource has been removed. With '--no-wait' the command
+        // returns in <5s, so it doesn't need the extended budget.
+        if (cmd.Contains("az group delete", StringComparison.OrdinalIgnoreCase)
+            && !cmd.Contains("--no-wait", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (cmd.Contains("cognitiveservices account purge", StringComparison.OrdinalIgnoreCase)
+         || cmd.Contains("keyvault purge",                  StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
+    }
+
+    /// <summary>
+    /// Returns true if the command provisioned (or potentially provisioned)
+    /// Azure Container Registry — meaning a follow-up `az acr login` is
+    /// worth attempting so subsequent `docker push` / `azd deploy` steps
+    /// in the SAME session can authenticate. This deliberately matches both
+    /// `azd up` (provision + deploy in one shot) and `azd provision`
+    /// (provision only, deploy will run as a separate step).
+    /// </summary>
+    private static bool TouchesAzdProvision(string cmd)
+    {
+        if (string.IsNullOrWhiteSpace(cmd)) return false;
+        return cmd.Contains("azd up",        StringComparison.OrdinalIgnoreCase)
+            || cmd.Contains("azd provision", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Looser variant of <see cref="TouchesAzdProvision"/>: matches ANY
+    /// invocation of <c>azd</c> (up, provision, deploy, env new, env set,
+    /// hooks). Used to decide when to refresh the cached
+    /// <c>azd env get-values</c> snapshot via
+    /// <see cref="Tools.AzdEnvLoader"/> � essentially every step that
+    /// could have created or mutated the azd environment.
+    /// </summary>
+    private static bool TouchesAnyAzd(string cmd)
+    {
+        if (string.IsNullOrWhiteSpace(cmd)) return false;
+        return cmd.Contains("azd ", StringComparison.OrdinalIgnoreCase)
+            || cmd.TrimStart().StartsWith("azd", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// True when the step's command appears to need azd-derived
+    /// environment values that are NOT yet present in <paramref name="env"/>.
+    /// Triggers a pre-step <see cref="AzdEnvLoader.LoadAndMergeAsync"/>
+    /// run so commands like
+    /// <c>az acr build --registry $AZURE_CONTAINER_REGISTRY_NAME ...</c>
+    /// or inline pipelines like
+    /// <c>$(azd env get-values | grep AZURE_X | cut -d= -f2)</c>
+    /// resolve to the right value even when the step is scheduled
+    /// BEFORE the first explicit azd-touching step (a common mistake
+    /// the Strategist makes when it pre-emptively switches to ACR
+    /// remote build to avoid local docker-build hangs).
+    ///
+    /// Conservative: returns false if the relevant variable is already
+    /// in env (no need to reload), or if the command shows no signs of
+    /// needing azd values at all.
+    /// </summary>
+    private static readonly System.Text.RegularExpressions.Regex AzdRefRegex =
+        new(@"\b(?:AZURE|SERVICE|AZD)_[A-Z0-9_]+\b",
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static bool StepNeedsAzdEnv(
+        string cmd, IReadOnlyDictionary<string, string> env)
+    {
+        if (string.IsNullOrWhiteSpace(cmd)) return false;
+
+        // Inline `azd env get-values` pipelines always benefit from a
+        // pre-load — that way the substitutor can rewrite them.
+        if (cmd.Contains("azd env get-values", StringComparison.Ordinal))
+            return true;
+
+        // Direct $AZURE_X / ${AZURE_X} references where the value is
+        // not yet in env: pre-load to populate it. If env already has
+        // the value (or the variable is something we don't manage),
+        // skip the reload.
+        var refs = AzdRefRegex.Matches(cmd);
+        foreach (System.Text.RegularExpressions.Match m in refs)
+        {
+            // Skip occurrences inside the `KEY=value` left-hand side
+            // (rare, but happens in the Doctor's `REG=$(...)` lines —
+            // the right-hand side will already contain the same name).
+            if (!env.ContainsKey(m.Value)) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Best-effort: query <c>azd env get-values</c> for the registry endpoint
+    /// of the current azd environment, then run <c>az acr login --name …</c>
+    /// inside the sandbox so <c>~/.docker/config.json</c> (persisted in the
+    /// SandboxAzureAuth docker-config volume) gets a valid bearer token for
+    /// the registry. Subsequent steps that push images then succeed.
+    ///
+    /// Failure here is intentionally non-fatal: it's a best-effort warm-up.
+    /// If the env exposes no ACR (templates that use App Service or
+    /// Static Web Apps instead of Container Apps), the helper logs an
+    /// informational line and returns. If the login itself fails (network,
+    /// RBAC, registry doesn't exist yet because provision was skipped) we
+    /// log a warning but still let the main step loop continue — the
+    /// subsequent push will fail with a clearer error and the Doctor will
+    /// remediate (or the user will see the real reason rather than a
+    /// cryptic "denied: authentication required").
+    /// </summary>
+    private async Task TryEnsureAcrLoginAsync(
+        DeploymentSession s,
+        DockerShellTool docker,
+        DeploymentStep parentStep,
+        IReadOnlyDictionary<string, string> env,
+        string azdEnvName,
+        CancellationToken ct)
+    {
+        // Single shell snippet: extract the registry endpoint (preferring
+        // AZURE_CONTAINER_REGISTRY_ENDPOINT, falling back to the *_NAME
+        // variant some templates expose), strip to bare hostname, then
+        // login. `set +e` keeps a missing-variable in the env file from
+        // turning into a fatal step exit.
+        const string acrLoginScript =
+            "set +e; " +
+            "ACR=$(azd env get-value AZURE_CONTAINER_REGISTRY_ENDPOINT 2>/dev/null); " +
+            "if [ -z \"$ACR\" ]; then " +
+            "  ACR=$(azd env get-values 2>/dev/null " +
+            "        | grep -E '^AZURE_CONTAINER_REGISTRY_(ENDPOINT|NAME)=' " +
+            "        | head -1 | cut -d= -f2- | tr -d '\\\"' ); " +
+            "fi; " +
+            "if [ -z \"$ACR\" ]; then " +
+            "  echo '[acr-login-hook] No AZURE_CONTAINER_REGISTRY_* in azd env; nothing to log into.'; " +
+            "  exit 0; " +
+            "fi; " +
+            "ACR_NAME=\"${ACR%%.*}\"; " +
+            "echo \"[acr-login-hook] az acr login --name $ACR_NAME (endpoint: $ACR)\"; " +
+            "az acr login --name \"$ACR_NAME\" --only-show-errors";
+
+        try
+        {
+            await Log(s, "info",
+                "▶ Post-step hook: ensuring sandbox Docker CLI is logged into the deployment ACR " +
+                "so subsequent image pushes authenticate (persisted via the docker-config volume).",
+                parentStep.Id);
+
+            // Reuse the parent step's working directory: that's where the
+            // azd environment metadata lives (.azure/<env>/.env). 30 s is
+            // plenty for the get-values + acr login round trip; if it
+            // hangs longer something is wrong with az itself, no point
+            // blocking the deploy.
+            var hookResult = await docker.RunAsync(
+                acrLoginScript,
+                parentStep.WorkingDirectory,
+                env.ToDictionary(kv => kv.Key, kv => kv.Value),
+                TimeSpan.FromSeconds(60),
+                ct,
+                silenceBudget: TimeSpan.FromSeconds(45));
+
+            if (hookResult.ExitCode != 0)
+            {
+                await Log(s, "warn",
+                    "ACR login hook returned non-zero. Subsequent docker push steps may " +
+                    "fail with 'denied: authentication required' — if so, the Doctor will " +
+                    "see the auth error and remediate. Tail: " +
+                    (string.IsNullOrWhiteSpace(hookResult.TailLog) ? "(empty)" : hookResult.TailLog),
+                    parentStep.Id);
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            await Log(s, "warn",
+                $"ACR login hook threw: {ex.GetType().Name}: {ex.Message}. " +
+                "Continuing — the subsequent deploy step will fail with a clearer error " +
+                "if ACR auth was actually required.",
+                parentStep.Id);
+        }
+    }
+
+    /// <summary>
+    /// Locates the azd environment name for this deployment. Priority order:
+    /// the planner-supplied env dict, then the argument of the first
+    /// 'azd env new &lt;name&gt;' step, then null (watcher simply stays idle).
+    /// </summary>
+    private static string? ResolveAzdEnvName(
+        IReadOnlyDictionary<string, string> env, DeploymentPlan plan)
+    {        if (env.TryGetValue("AZURE_ENV_NAME", out var fromEnv) && !string.IsNullOrWhiteSpace(fromEnv))
+            return fromEnv;
+
+        foreach (var step in plan.Steps)
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(
+                step.Command,
+                @"\bazd\s+env\s+new\s+([A-Za-z0-9][A-Za-z0-9_.-]*)",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (m.Success) return m.Groups[1].Value;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Rewrites the plan so that the <c>azd env new &lt;name&gt;</c> step
+    /// always uses a fresh, time-stamped environment name. azd derives the
+    /// target Azure Resource Group as <c>rg-&lt;envName&gt;</c>, so every
+    /// run of the same repo would otherwise land in the SAME RG. That's
+    /// fine when the previous deploy succeeded, but a failed or cancelled
+    /// deploy leaves:
+    ///   - the RG in "Deleting" state (new provisioning is blocked until
+    ///     the deletion completes, 5-10 min of opaque waiting),
+    ///   - soft-deleted Key Vault / Cognitive Services accounts whose name
+    ///     now collides with the new provision,
+    ///   - Container Apps / revisions in Failed state that the next
+    ///     Bicep deployment cannot cleanly reconcile.
+    /// Appending a short suffix guarantees a brand-new RG with no stale
+    /// siblings. Other steps referencing the old name (e.g. a custom
+    /// 'az group delete -n rg-&lt;old&gt;') are rewritten consistently.
+    /// Azure env names must stay within 64 chars and match
+    /// <c>^[A-Za-z0-9][A-Za-z0-9_.-]*$</c>, so we keep the prefix short.
+    /// </summary>
+    private static DeploymentPlan EnforceUniqueAzdEnvName(
+        DeploymentPlan plan, Action<string> log)
+    {
+        var rx = new System.Text.RegularExpressions.Regex(
+            @"\bazd\s+env\s+new\s+([A-Za-z0-9][A-Za-z0-9_.-]*)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        // Find the first 'azd env new <name>' step; if the planner forgot
+        // one the deploy is already broken for other reasons � no-op.
+        string? original = null;
+        foreach (var step in plan.Steps)
+        {
+            var m = rx.Match(step.Command);
+            if (m.Success) { original = m.Groups[1].Value; break; }
+        }
+        if (original is null) return plan;
+
+        // Short suffix: yyyyMMdd-HHmm gives minute-level uniqueness,
+        // reads like a timestamp in the Azure portal RG list, and keeps
+        // the total well under the 64-char azd limit.
+        var suffix = DateTime.UtcNow.ToString("yyyyMMdd-HHmm");
+
+        // Strip any previous timestamp suffix we might have added so
+        // replays of the same plan don't double-stamp.
+        var stripRx = new System.Text.RegularExpressions.Regex(@"-\d{8}-\d{4}$");
+        var basePrefix = stripRx.Replace(original, "");
+
+        // Cap the prefix so the final string stays <= 40 chars (leaves
+        // headroom for azd's internal prefixing into 'rg-' / 'cae-' and
+        // for the Bicep-generated resource tokens).
+        if (basePrefix.Length > 25) basePrefix = basePrefix[..25].TrimEnd('-', '_', '.');
+        var unique = $"{basePrefix}-{suffix}";
+
+        if (string.Equals(unique, original, StringComparison.Ordinal))
+            return plan;
+
+        var originalEscaped = System.Text.RegularExpressions.Regex.Escape(original);
+        var wholeWordRx = new System.Text.RegularExpressions.Regex(
+            $@"(?<![A-Za-z0-9_.-]){originalEscaped}(?![A-Za-z0-9_.-])");
+
+        var rewritten = plan.Steps
+            .Select(st => st with { Command = wholeWordRx.Replace(st.Command, unique) })
+            .ToList();
+
+        // Also update AZURE_ENV_NAME in the plan env dict (if the planner
+        // set it there) so 'azd env refresh' downstream sees the new name.
+        var envCopy = new Dictionary<string, string>(plan.Environment, StringComparer.Ordinal);
+        if (envCopy.TryGetValue("AZURE_ENV_NAME", out var existingEnvName)
+            && string.Equals(existingEnvName, original, StringComparison.Ordinal))
+        {
+            envCopy["AZURE_ENV_NAME"] = unique;
+        }
+
+        log($"Enforcing unique azd environment name: '{original}' -> '{unique}' " +
+            $"(guarantees a brand-new resource group 'rg-{unique}' per deploy).");
+
+        return plan with
+        {
+            Steps = rewritten,
+            Environment = envCopy
+        };
+    }
+
+    private static (string? SubscriptionId, string? TenantId) ReadHostDefaultSubscription()
+    {
+        try
+        {
+            var profilePath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".azure", "azureProfile.json");
+            if (!File.Exists(profilePath)) return (null, null);
+
+            // azureProfile.json has a BOM; strip it before parsing.
+            var raw = File.ReadAllText(profilePath).TrimStart('\uFEFF');
+            using var doc = System.Text.Json.JsonDocument.Parse(raw);
+            if (!doc.RootElement.TryGetProperty("subscriptions", out var subs))
+                return (null, null);
+
+            foreach (var sub in subs.EnumerateArray())
+            {
+                if (sub.TryGetProperty("isDefault", out var def) && def.GetBoolean())
+                {
+                    var id = sub.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
+                    var tid = sub.TryGetProperty("tenantId", out var tidEl) ? tidEl.GetString() : null;
+                    return (id, tid);
+                }
+            }
+            return (null, null);
+        }
+        catch
+        {
+            return (null, null);
+        }
+    }
+}

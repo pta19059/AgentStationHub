@@ -1,0 +1,613 @@
+@using AgentStationHub.Models
+@using AgentStationHub.Services
+@using Microsoft.AspNetCore.SignalR.Client
+@inject NavigationManager Nav
+@inject DeploymentOrchestrator Orchestrator
+@inject ILogger<DeploymentModal> Log
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+@if (_sessionId is not null)
+{
+    @* Persistent backdrop: clicks on the overlay are intentionally NOT
+       wired to CloseAsync. A deployment can take 10-30 minutes; accidentally
+       dismissing the modal by clicking outside would destroy the only live
+       view of progress for a task the user cannot easily re-open. The
+       header X button is the single way to close, and it is disabled until
+       the run reaches a terminal status. *@
+    <div class="dep-backdrop dep-backdrop-locked"></div>
+    <div class="dep-modal" role="dialog" aria-modal="true">
+        <div class="dep-head">
+            <div class="dep-head-left">
+                <div class="dep-icon-wrap">
+                    <i class="bi bi-rocket-takeoff-fill"></i>
+                </div>
+                <div>
+                    <div class="dep-title">Deploying <code>@_repoShort</code></div>
+                    <div class="dep-sub">
+                        <span class="badge rounded-pill bg-light text-dark border">
+                            <i class="bi bi-hash"></i> @_sessionId
+                        </span>
+                        <span class="status-chip status-@_status.ToLower()">@_status</span>
+                        @if (!IsTerminal)
+                        {
+                            <span class="badge rounded-pill bg-warning-subtle text-warning-emphasis border border-warning-subtle ms-1"
+                                  title="You cannot close this window while the deployment is in progress. Use the Cancel button to abort.">
+                                <i class="bi bi-lock-fill me-1"></i> Locked
+                            </span>
+                        }
+                    </div>
+                </div>
+            </div>
+            <button class="btn btn-sm btn-light border"
+                    @onclick="CloseAsync"
+                    disabled="@(!IsTerminal)"
+                    title="@(IsTerminal ? "Close" : "Deployment is still running. Use 'Cancel' below to abort, or wait for completion.")"
+                    aria-label="Close">
+                <i class="bi bi-x-lg"></i>
+            </button>
+        </div>
+
+        <div class="dep-stages">
+            @for (var i = 0; i < _stages.Length; i++)
+            {
+                var st = _stages[i];
+                var cls = StageClass(st);
+                <div class="stage @cls">
+                    <span class="ico">
+                        @if (cls == "active")
+                        {
+                            <span class="spinner-border spinner-border-sm" role="status"></span>
+                        }
+                        else if (cls == "done")
+                        {
+                            <i class="bi bi-check-circle-fill"></i>
+                        }
+                        else if (cls == "fail")
+                        {
+                            <i class="bi bi-x-circle-fill"></i>
+                        }
+                        else
+                        {
+                            <i class="bi @StageIcon(st)"></i>
+                        }
+                    </span>
+                    <span class="lbl">@FormatStage(st)</span>
+                </div>
+                @if (i < _stages.Length - 1)
+                {
+                    <span class="stage-sep"><i class="bi bi-chevron-right"></i></span>
+                }
+            }
+        </div>
+
+        @if (_plan is not null)
+        {
+            <div class="dep-plan">
+                <div class="dep-plan-head">
+                    <div>
+                        <i class="bi bi-list-check me-1 text-primary"></i>
+                        <strong>Execution plan</strong>
+                        <span class="text-muted ms-2">@_plan.Steps.Count steps</span>
+                    </div>
+                    @if (_status == "AwaitingApproval")
+                    {
+                        <div>
+                            <button class="btn btn-success btn-sm me-2" @onclick="ApproveAsync">
+                                <i class="bi bi-check-lg me-1"></i> Approve &amp; run
+                            </button>
+                            <button class="btn btn-outline-danger btn-sm" @onclick="CancelAsync">
+                                <i class="bi bi-x-lg me-1"></i> Cancel
+                            </button>
+                        </div>
+                    }
+                </div>
+                <ol class="dep-steps">
+                    @foreach (var step in _plan.Steps)
+                    {
+                        <li>
+                            <div class="step-desc">@step.Description</div>
+                            <code>@step.Command</code>
+                        </li>
+                    }
+                </ol>
+            </div>
+        }
+
+        <div class="dep-log">
+            <div class="dep-log-head">
+                <span><i class="bi bi-terminal-fill me-1"></i> Live log</span>
+                @if (_status is "Executing" or "Cloning" or "Planning" or "Verifying" or "Inspecting")
+                {
+                    <button class="btn btn-outline-light btn-sm" @onclick="CancelAsync">
+                        <i class="bi bi-stop-circle me-1"></i> Cancel
+                    </button>
+                }
+            </div>
+            <pre>@foreach (var l in SnapshotLogs())
+{
+@($"[{l.AtUtc:HH:mm:ss}] {l.Message}")
+@("\n")
+}</pre>
+        </div>
+
+        @if (!string.IsNullOrEmpty(_endpoint))
+        {
+            <div class="alert alert-success mt-3 d-flex align-items-center">
+                <i class="bi bi-check2-circle fs-4 me-2"></i>
+                <div>
+                    <strong>Deployment succeeded.</strong>
+                    <div><a href="@_endpoint" target="_blank" rel="noopener">@_endpoint</a></div>
+                </div>
+            </div>
+        }
+        @if (!string.IsNullOrEmpty(_error))
+        {
+            @if (_status == "NotDeployable")
+            {
+                <div class="alert alert-info mt-3 d-flex align-items-start">
+                    <i class="bi bi-info-circle-fill fs-4 me-2"></i>
+                    <div>
+                        <strong>No deployable application detected</strong>
+                        <div class="small mt-1">@_error</div>
+                        <div class="small mt-2 text-muted">
+                            <i class="bi bi-lightbulb me-1"></i>
+                            Recommended next steps: clone the repository locally
+                            (<code>git clone https://github.com/@_repoShort</code>)
+                            and open it in an editor to review its content, run the
+                            provided notebooks or use it as a library dependency.
+                        </div>
+                    </div>
+                </div>
+            }
+            else
+            {
+                <div class="alert alert-danger mt-3 d-flex align-items-start">
+                    <i class="bi bi-exclamation-triangle-fill fs-4 me-2"></i>
+                    <div>
+                        <strong>Deployment error</strong>
+                        <div class="small">@_error</div>
+                    </div>
+                </div>
+            }
+        }
+    </div>
+}
+
+<style>
+    .dep-backdrop {
+        position: fixed; inset: 0;
+        background: rgba(15, 23, 42, .55);
+        backdrop-filter: blur(3px);
+        z-index: 1040;
+    }
+    /* Visual cue that the backdrop is NON-dismissive during a run.
+       Slightly darker tint + 'not-allowed' cursor on hover tells the
+       user "clicking here does nothing". */
+    .dep-backdrop-locked {
+        background: rgba(15, 23, 42, .65);
+        cursor: not-allowed;
+    }
+    .dep-modal {
+        position: fixed; top: 5vh; left: 50%; transform: translateX(-50%);
+        width: min(920px, 94vw); max-height: 90vh; overflow: auto;
+        background: #ffffff;
+        border-radius: 16px;
+        padding: 1.4rem 1.6rem 1.6rem;
+        box-shadow: 0 30px 80px rgba(0,0,0,.35), 0 2px 6px rgba(0,0,0,.08);
+        z-index: 1050;
+        border: 1px solid #e5e7eb;
+    }
+    .dep-head {
+        display: flex; justify-content: space-between; align-items: flex-start;
+        gap: 1rem; margin-bottom: 1.2rem;
+        padding-bottom: 1rem;
+        border-bottom: 1px solid #eef0f3;
+    }
+    .dep-head-left { display: flex; gap: .9rem; align-items: center; }
+    .dep-icon-wrap {
+        width: 42px; height: 42px; border-radius: 10px;
+        background: linear-gradient(135deg, #0078D4, #004578);
+        color: #fff; display: flex; align-items: center; justify-content: center;
+        font-size: 1.25rem;
+        box-shadow: 0 4px 10px rgba(0,120,212,.3);
+    }
+    .dep-title { font-weight: 700; font-size: 1.05rem; color: #0f172a; }
+    .dep-title code {
+        color: #be185d; background: transparent; padding: 0;
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    .dep-sub { color: #6b7280; font-size: .78rem; display: flex; gap: .4rem; align-items: center; margin-top: .2rem; }
+    .dep-sub .badge { font-weight: 500; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+
+    .status-chip {
+        font-size: .72rem; font-weight: 600;
+        padding: .15rem .55rem; border-radius: 999px;
+        background: #eef2ff; color: #4338ca;
+        text-transform: uppercase; letter-spacing: .03em;
+    }
+    .status-chip.status-succeeded { background: #dcfce7; color: #166534; }
+    .status-chip.status-failed,
+    .status-chip.status-rejected,
+    .status-chip.status-cancelled { background: #fee2e2; color: #991b1b; }
+    .status-chip.status-awaitingapproval { background: #fef3c7; color: #92400e; }
+
+    .dep-stages {
+        display: flex; gap: .35rem; flex-wrap: wrap; align-items: center;
+        margin: .2rem 0 1.2rem;
+        padding: .6rem .75rem;
+        background: #f8fafc;
+        border: 1px solid #eef0f3;
+        border-radius: 10px;
+    }
+    .stage {
+        padding: .3rem .7rem; border-radius: 999px;
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        font-size: .78rem; font-weight: 500;
+        display: inline-flex; gap: .4rem; align-items: center;
+        color: #64748b;
+        transition: all .2s ease;
+    }
+    .stage .ico { display: inline-flex; width: 1rem; justify-content: center; }
+    .stage.active {
+        background: #dbeafe; color: #1e40af; font-weight: 600;
+        border-color: #93c5fd;
+        box-shadow: 0 0 0 3px rgba(59,130,246,.15);
+    }
+    .stage.done { background: #dcfce7; color: #166534; border-color: #86efac; }
+    .stage.fail { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
+    .stage-sep { color: #cbd5e1; font-size: .7rem; }
+
+    .dep-plan {
+        border: 1px solid #e5e7eb; border-radius: 12px;
+        padding: .9rem 1.1rem; margin-bottom: 1rem;
+        background: #fbfbfd;
+    }
+    .dep-plan-head {
+        display: flex; justify-content: space-between; align-items: center;
+        margin-bottom: .55rem;
+    }
+    .dep-steps { margin: 0; padding-left: 1.2rem; }
+    .dep-steps li { margin-bottom: .55rem; }
+    .dep-steps .step-desc { font-size: .9rem; color: #1f2937; }
+    .dep-steps code {
+        display: inline-block; margin-top: .2rem;
+        font-size: .78rem; background: #0b1220; color: #e2e8f0;
+        padding: .25rem .55rem; border-radius: 6px;
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+
+    .dep-log {
+        border: 1px solid #0b1220; border-radius: 12px;
+        background: #0b1220; color: #e5e7eb;
+        padding: 0 .9rem .3rem;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+    }
+    .dep-log-head {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: .55rem 0; color: #94a3b8;
+        font-size: .82rem; font-weight: 600; letter-spacing: .02em;
+        border-bottom: 1px solid rgba(255,255,255,.06);
+    }
+    .dep-log pre {
+        color: #cbd5e1; font-size: .78rem;
+        max-height: 280px; overflow: auto; margin: 0;
+        padding: .6rem 0 .5rem 0;
+        white-space: pre-wrap; word-break: break-all;
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+        line-height: 1.45;
+    }
+    .dep-log pre::-webkit-scrollbar { width: 8px; }
+    .dep-log pre::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+</style>
+
+@code {
+    private string? _sessionId;
+    private string? _repoShort;
+    private string _status = "Pending";
+    private DeploymentPlan? _plan;
+    private string? _endpoint;
+    private string? _error;
+    private readonly List<LogEntry> _logs = new();
+    private HubConnection? _conn;
+    private DateTime _lastLogRenderUtc = DateTime.MinValue;
+    private bool _logRenderPending;
+    private readonly object _logsLock = new();
+
+    private readonly string[] _stages =
+        ["Cloning","Inspecting","Planning","AwaitingApproval","Executing","Verifying","Succeeded"];
+
+    public async Task OpenAsync(string repoUrl, string? azureLocation = null)
+    {
+        try
+        {
+            _plan = null; _endpoint = null; _error = null; _logs.Clear();
+            _repoShort = repoUrl.Replace("https://github.com/", "");
+
+            // 1) Start orchestration (synchronous session creation + background pipeline)
+            _sessionId = Orchestrator.Start(repoUrl, azureLocation);
+
+            // Persist the active session in the browser so that if the
+            // PC goes to standby long enough to blow past the Blazor
+            // circuit retention window (or the user manually reloads the
+            // tab), Hub.razor can re-open this modal on the SAME session
+            // after login instead of abandoning a deploy that is still
+            // running on the server. The orchestrator's _sessions dict
+            // is a singleton, so the server-side state is still there.
+            await PersistSessionAsync(_sessionId, repoUrl, azureLocation);
+
+            await AttachHubAsync();
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Log.LogError(ex, "DeploymentModal.OpenAsync failed");
+            _error = $"{ex.GetType().Name}: {ex.Message}";
+            if (_sessionId is null) _sessionId = "error";
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    /// <summary>
+    /// Re-attach to an existing server-side deployment session after a
+    /// page reload / browser reconnect. Pulls the current snapshot from
+    /// the orchestrator (status, plan, logs collected so far) and then
+    /// subscribes to the SignalR group for live updates going forward.
+    /// Returns false if the session is no longer known (e.g. the host
+    /// container was restarted between standby and resume).
+    /// </summary>
+    public async Task<bool> ResumeAsync(string sessionId)
+    {
+        var existing = Orchestrator.Get(sessionId);
+        if (existing is null)
+        {
+            // Stale handle: drop it so we don't keep trying on every
+            // page load. The user will simply see the normal catalog.
+            await ClearPersistedSessionAsync();
+            return false;
+        }
+
+        try
+        {
+            _plan      = existing.Plan;
+            _endpoint  = existing.FinalEndpoint;
+            _error     = existing.ErrorMessage;
+            _status    = existing.Status.ToString();
+            _repoShort = existing.RepoUrl.Replace("https://github.com/", "");
+            _sessionId = existing.Id;
+
+            // Replay backlog (capped like the live buffer).
+            lock (_logsLock)
+            {
+                _logs.Clear();
+                var backlog = existing.Logs;
+                var start = Math.Max(0, backlog.Count - 500);
+                for (var i = start; i < backlog.Count; i++) _logs.Add(backlog[i]);
+            }
+
+            await AttachHubAsync();
+            StateHasChanged();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.LogError(ex, "DeploymentModal.ResumeAsync failed for session {Id}", sessionId);
+            _error = $"{ex.GetType().Name}: {ex.Message}";
+            await InvokeAsync(StateHasChanged);
+            return true; // session exists — surface the error instead of silently dropping
+        }
+    }
+
+    /// <summary>
+    /// Shared wiring used by both OpenAsync (fresh run) and ResumeAsync
+    /// (reattach after reload). Builds the SignalR client, registers the
+    /// push handlers, and joins the per-session group.
+    /// </summary>
+    private async Task AttachHubAsync()
+    {
+        // Accept dev certificates to avoid HTTPS loopback cert validation
+        // errors under IIS Express / Kestrel.
+        _conn = new HubConnectionBuilder()
+            .WithUrl(Nav.ToAbsoluteUri("/hubs/deployment"), opt =>
+            {
+                opt.HttpMessageHandlerFactory = inner =>
+                {
+                    if (inner is HttpClientHandler h)
+                        h.ServerCertificateCustomValidationCallback = (_, _, _, _) => true;
+                    return inner;
+                };
+                opt.WebSocketConfiguration = ws =>
+                {
+                    ws.RemoteCertificateValidationCallback = (_, _, _, _) => true;
+                };
+            })
+            .WithAutomaticReconnect()
+            .Build();
+
+        _conn.On<string, string?, string?>("StatusChanged", async (st, err, ep) =>
+        {
+            _status = st; _error = err; _endpoint = ep;
+            // Terminal state reached: stop persisting the handle so a
+            // future reload doesn't try to rehydrate a finished run.
+            if (IsTerminal) await ClearPersistedSessionAsync();
+            await InvokeAsync(StateHasChanged);
+        });
+        _conn.On<LogEntry>("LogAppended", entry =>
+        {
+            lock (_logsLock)
+            {
+                _logs.Add(entry);
+                if (_logs.Count > 500) _logs.RemoveRange(0, _logs.Count - 500);
+            }
+            return ScheduleLogRenderAsync();
+        });
+        _conn.On<DeploymentPlan>("PlanReady", plan =>
+        {
+            _plan = plan;
+            return InvokeAsync(StateHasChanged);
+        });
+
+        await _conn.StartAsync();
+        if (_sessionId is not null) await _conn.InvokeAsync("Join", _sessionId);
+    }
+
+    private const string PersistenceKey = "agentichub.activeDeployment";
+
+    private async Task PersistSessionAsync(string sessionId, string repoUrl, string? location)
+    {
+        try
+        {
+            var payload = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                sessionId, repoUrl, location
+            });
+            await JS.InvokeVoidAsync("localStorage.setItem", PersistenceKey, payload);
+        }
+        catch (Exception ex)
+        {
+            Log.LogDebug(ex, "Failed to persist active deployment handle (non-fatal).");
+        }
+    }
+
+    private async Task ClearPersistedSessionAsync()
+    {
+        try { await JS.InvokeVoidAsync("localStorage.removeItem", PersistenceKey); }
+        catch { /* non-fatal */ }
+    }
+
+    private Task ApproveAsync()
+    {
+        if (_sessionId is not null) Orchestrator.Approve(_sessionId);
+        return Task.CompletedTask;
+    }
+
+    private Task CancelAsync()
+    {
+        if (_sessionId is not null) Orchestrator.Cancel(_sessionId);
+        return Task.CompletedTask;
+    }
+
+    private async Task CloseAsync()
+    {
+        // Guard against accidental close during an active deployment.
+        // Even if the X button is disabled in markup, programmatic close
+        // paths (disposal, navigation) reach here unconditionally; this
+        // predicate protects the user-initiated click path specifically.
+        if (_sessionId is not null && !IsTerminal)
+        {
+            // Called during a running deploy � treat as no-op from the UI.
+            // DisposeAsync callers still get a clean teardown via the
+            // unconditional path below once they set _sessionId = null.
+            return;
+        }
+
+        if (_conn is not null)
+        {
+            try { if (_sessionId is not null) await _conn.InvokeAsync("Leave", _sessionId); } catch { }
+            await _conn.DisposeAsync();
+            _conn = null;
+        }
+        // Terminal close: drop the persisted handle too so the next
+        // visit to /hub doesn't try to rehydrate a finished session.
+        await ClearPersistedSessionAsync();
+        _sessionId = null;
+    }
+
+    /// <summary>
+    /// True when the deployment has reached a state that cannot change
+    /// further without a new user action. Closing / dismissing the modal
+    /// is only safe in these states; during active phases the user's
+    /// click would sever the only view of the live log.
+    /// </summary>
+    private bool IsTerminal =>
+        _status is "Succeeded"
+                 or "Failed"
+                 or "Cancelled"
+                 or "Rejected"
+                 or "NotDeployable";
+
+    public async ValueTask DisposeAsync()
+    {
+        // Component disposal (navigation away, server restart) must always
+        // tear down the SignalR connection even when the deploy is still
+        // running � the browser side has no way to keep it alive anyway.
+        // So we sidestep the IsTerminal guard by nulling the session first.
+        _sessionId = null;
+        await CloseAsync();
+    }
+
+    private async Task ScheduleLogRenderAsync()
+    {
+        // Coalesce render requests: at most one render every ~200ms to avoid
+        // flooding the Blazor renderer when the orchestrator streams many log lines.
+        if (_logRenderPending) return;
+        var since = (DateTime.UtcNow - _lastLogRenderUtc).TotalMilliseconds;
+        if (since >= 200)
+        {
+            _lastLogRenderUtc = DateTime.UtcNow;
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+        _logRenderPending = true;
+        var delay = (int)Math.Max(1, 200 - since);
+        _ = Task.Delay(delay).ContinueWith(async _ =>
+        {
+            _logRenderPending = false;
+            _lastLogRenderUtc = DateTime.UtcNow;
+            try { await InvokeAsync(StateHasChanged); } catch { /* disposed */ }
+        });
+    }
+
+    private List<LogEntry> SnapshotLogs()
+    {
+        lock (_logsLock) return _logs.ToList();
+    }
+
+    private string StageClass(string stage)
+    {
+        var order = Array.IndexOf(_stages, stage);
+        var current = Array.IndexOf(_stages, _status);
+        if (_status == "Failed" || _status == "Rejected" || _status == "Cancelled")
+            return order <= current ? "fail" : "";
+        // NotDeployable is informational (the repo is a course/library/docs,
+        // nothing went wrong): mark the Planning stage as done, nothing
+        // after it lights up.
+        if (_status == "NotDeployable")
+        {
+            var planningIdx = Array.IndexOf(_stages, "Planning");
+            if (order < planningIdx) return "done";
+            if (order == planningIdx) return "done";
+            return "";
+        }
+        // When the final stage is reached (Succeeded is a terminal state,
+        // not a still-running phase), show it with the 'done' style �
+        // green check instead of the blue spinner. Without this special
+        // case the spinner kept animating on an already-terminated run,
+        // which made completed deploys look as if they were still working.
+        if (_status == "Succeeded")
+            return order <= current ? "done" : "";
+
+        if (order < current) return "done";
+        if (order == current) return "active";
+        return "";
+    }
+
+    private string StageIcon(string stage) => stage switch
+    {
+        "Cloning" => "bi-cloud-download",
+        "Inspecting" => "bi-search",
+        "Planning" => "bi-diagram-3",
+        "AwaitingApproval" => "bi-hand-thumbs-up",
+        "Executing" => "bi-gear-fill",
+        "Verifying" => "bi-shield-check",
+        "Succeeded" => "bi-check2-circle",
+        _ => "bi-circle"
+    };
+
+    private static string FormatStage(string stage) => stage switch
+    {
+        "AwaitingApproval" => "Awaiting approval",
+        _ => stage
+    };
+}

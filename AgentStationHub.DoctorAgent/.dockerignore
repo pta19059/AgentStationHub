@@ -1,0 +1,19 @@
+# Build artefacts and editor noise that should never be inside the
+# container build context (they would invalidate the ACR build cache
+# without contributing to the final image).
+bin/
+obj/
+*.user
+.vs/
+.vscode/
+.idea/
+
+# Foundry metadata is consumed by the Foundry CLI, NOT by the image.
+.foundry/
+
+# Documentation that does not need to ship inside the agent container.
+README.md
+*.md
+
+# Tests / sample data
+**/TestResults/

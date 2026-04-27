@@ -1,0 +1,29 @@
+﻿@inherits LayoutComponentBase
+
+<div class="page">
+    <div class="sidebar">
+        <NavMenu />
+    </div>
+
+    <main>
+        <article class="content px-4">
+            @Body
+        </article>
+    </main>
+</div>
+@* Floating GitHub Copilot CLI launcher. Lives in MainLayout so the pill
+   is visible on every route, scroll-pinned bottom-right. Interactive
+   rendering is forced here (MainLayout itself is static) because the
+   component opens a SignalR connection on demand. *@
+<CopilotLauncher @rendermode="InteractiveServer" />
+
+@* Floating Foundry agent chat avatar. Pinned to the bottom-LEFT
+   (so it does not collide with the Copilot CLI launcher on the right).
+   Click toggles a 360x520 chat panel that talks to the Foundry agent
+   configured in Foundry:ChatAgent. Same rendering reasoning as above. *@
+<AgentChatPanel @rendermode="InteractiveServer" />
+<div id="blazor-error-ui">
+    An unhandled error has occurred.
+    <a href="" class="reload">Reload</a>
+    <a class="dismiss">🗙</a>
+</div>

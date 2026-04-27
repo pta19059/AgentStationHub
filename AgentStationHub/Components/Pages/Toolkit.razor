@@ -1,0 +1,314 @@
+@page "/toolkit"
+@rendermode InteractiveServer
+@using AgentStationHub.Services
+@inject AzureAIToolkitService ToolkitService
+
+<PageTitle>Azure AI Toolkit</PageTitle>
+
+<section class="tk-hero">
+    <div class="tk-hero-bg"></div>
+    <div class="tk-hero-content">
+        <div class="tk-tag">
+            <i class="bi bi-tools"></i> Visual Studio Code extension
+        </div>
+        <h1>Azure AI Toolkit</h1>
+        <p>
+            The official Microsoft extension that brings the full lifecycle of AI agent development
+            into VS Code: browse and download models, test prompts in a playground, fine-tune,
+            evaluate and deploy straight to Azure AI Foundry.
+        </p>
+        <div class="tk-cta">
+            <a class="btn btn-light" href="https://marketplace.visualstudio.com/items?itemName=ms-windows-ai-studio.windows-ai-studio"
+               target="_blank" rel="noopener">
+                <i class="bi bi-download"></i> Install from Marketplace
+            </a>
+            <a class="btn btn-outline-light" href="https://code.visualstudio.com/docs/intelligentapps/overview"
+               target="_blank" rel="noopener">
+                <i class="bi bi-book"></i> Read the docs
+            </a>
+        </div>
+    </div>
+</section>
+
+<section class="tk-section">
+    <h2><i class="bi bi-bookmark-star-fill text-warning"></i> Official resources</h2>
+    <div class="tk-grid">
+        @foreach (var r in AzureAIToolkitLinks.Resources)
+        {
+            <a class="tk-card" href="@r.Url" target="_blank" rel="noopener">
+                <div class="tk-card-icon"><i class="bi @r.Icon"></i></div>
+                <div class="tk-card-body">
+                    <h3>@r.Title</h3>
+                    <p>@r.Description</p>
+                </div>
+                <i class="bi bi-arrow-up-right-circle tk-card-arrow"></i>
+            </a>
+        }
+    </div>
+</section>
+
+<section class="tk-section">
+    <div class="tk-section-head">
+        <div>
+            <h2><i class="bi bi-github"></i> Live examples from GitHub</h2>
+            <p class="muted">
+                Fetched in real time from the GitHub Search API (topic: <code>ai-toolkit</code> and keyword
+                matches). Star counts reflect live values.
+            </p>
+        </div>
+        <button class="btn btn-dark scan-btn" @onclick="RescanAsync" disabled="@(_loading || _scanning)">
+            @if (_loading || _scanning)
+            {
+                <span class="spinner-border spinner-border-sm me-2" role="status"></span>
+                <span>Scanning...</span>
+            }
+            else
+            {
+                <i class="bi bi-arrow-repeat me-2"></i>
+                <span>Scan the web</span>
+            }
+        </button>
+    </div>
+
+    @if (_scanStatus is not null)
+    {
+        <div class="alert alert-info py-2 mb-3">@_scanStatus</div>
+    }
+
+    @if (_loading && _overview is null)
+    {
+        <div class="tk-loading">
+            <div class="spinner-border text-primary" role="status"></div>
+            <span>Fetching live repositories from GitHub...</span>
+        </div>
+    }
+    else if (_error is not null && _overview is null)
+    {
+        <div class="alert alert-warning">
+            <strong>Could not load live data.</strong> @_error
+        </div>
+    }
+    else if (_overview is not null)
+    {
+        @if (_overview.MainRepo is not null)
+        {
+            var main = _overview.MainRepo;
+            <div class="tk-main-repo">
+                <img src="@main.Owner?.AvatarUrl" alt="@main.Owner?.Login" class="avatar" />
+                <div class="mr-body">
+                    <div class="mr-title">
+                        <a href="@main.HtmlUrl" target="_blank" rel="noopener">
+                            @main.FullName
+                        </a>
+                        <span class="stars"><i class="bi bi-star-fill"></i> @main.StargazersCount</span>
+                        <span class="forks"><i class="bi bi-diagram-2"></i> @main.ForksCount</span>
+                    </div>
+                    <p>@main.Description</p>
+                    <div class="topics">
+                        @foreach (var t in main.Topics ?? new())
+                        {
+                            <span class="topic">#@t</span>
+                        }
+                    </div>
+                </div>
+            </div>
+        }
+
+        @if (_overview.Samples.Count > 0)
+        {
+            <div class="tk-grid">
+                @foreach (var repo in _overview.Samples)
+                {
+                    <a class="tk-card repo" href="@repo.HtmlUrl" target="_blank" rel="noopener">
+                        <div class="tk-card-body">
+                            <h3>@repo.FullName</h3>
+                            <p>@(repo.Description ?? "(no description)")</p>
+                            <div class="repo-meta">
+                                <span><i class="bi bi-star-fill"></i> @repo.StargazersCount</span>
+                                <span><i class="bi bi-diagram-2"></i> @repo.ForksCount</span>
+                                @if (repo.Topics is { Count: > 0 })
+                                {
+                                    @foreach (var t in repo.Topics.Take(3))
+                                    {
+                                        <span class="topic">#@t</span>
+                                    }
+                                }
+                            </div>
+                        </div>
+                    </a>
+                }
+            </div>
+        }
+        else
+        {
+            <div class="alert alert-info">
+                No community samples returned by the GitHub search (possibly rate-limited).
+            </div>
+        }
+    }
+</section>
+
+<style>
+    .tk-hero {
+        position: relative; overflow: hidden; color: #fff;
+        border-radius: 18px; padding: 3rem 2.5rem; margin: -1rem -.5rem 2rem;
+    }
+    .tk-hero-bg {
+        position: absolute; inset: 0; z-index: 0;
+        background:
+            radial-gradient(circle at 80% 20%, rgba(0,164,239,.55) 0, transparent 55%),
+            radial-gradient(circle at 15% 80%, rgba(127,186,0,.45) 0, transparent 55%),
+            linear-gradient(135deg, #0b1220 0%, #0078D4 100%);
+    }
+    .tk-hero-content { position: relative; z-index: 1; max-width: 820px; }
+    .tk-hero h1 { font-size: clamp(2rem, 4vw, 3rem); font-weight: 700; margin: .8rem 0 .6rem; }
+    .tk-hero p { font-size: 1.05rem; opacity: .92; }
+    .tk-tag {
+        display: inline-block; padding: .3rem .75rem; border-radius: 999px;
+        background: rgba(255,255,255,.15); font-size: .8rem; font-weight: 500;
+    }
+    .tk-cta { display: flex; gap: .6rem; margin-top: 1.2rem; flex-wrap: wrap; }
+
+    .tk-section { margin: 2rem 0; }
+    .tk-section h2 { font-size: 1.3rem; font-weight: 700; margin-bottom: .4rem; }
+    .tk-section .muted { color: #6b7280; font-size: .88rem; margin-bottom: 1rem; }
+    .tk-section-head {
+        display: flex; justify-content: space-between; align-items: flex-start;
+        gap: 1rem; margin-bottom: .6rem;
+    }
+    .scan-btn {
+        white-space: nowrap;
+        padding: .55rem 1.1rem;
+        border-radius: 10px;
+        font-weight: 600;
+        background: linear-gradient(135deg, #0078D4, #004578);
+        border: none;
+        box-shadow: 0 4px 12px rgba(0,120,212,.25);
+        transition: transform .15s, box-shadow .15s;
+    }
+    .scan-btn:hover:not(:disabled) {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 18px rgba(0,120,212,.4);
+    }
+    .scan-btn:disabled { opacity: .7; cursor: not-allowed; }
+
+    .tk-grid {
+        display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+        gap: 1rem;
+    }
+    .tk-card {
+        display: flex; align-items: flex-start; gap: .75rem;
+        background: #fff; border: 1px solid #e5e7eb; border-radius: 12px;
+        padding: 1rem; text-decoration: none; color: inherit;
+        transition: transform .15s, box-shadow .15s, border-color .15s;
+        position: relative;
+    }
+    .tk-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 10px 24px rgba(0,0,0,.07);
+        border-color: #0078D4;
+    }
+    .tk-card-icon {
+        width: 42px; height: 42px; border-radius: 10px; flex-shrink: 0;
+        display: grid; place-items: center; color: #fff; font-size: 1.2rem;
+        background: linear-gradient(135deg, #0078D4, #004578);
+    }
+    .tk-card-body h3 { font-size: 1rem; margin: 0 0 .25rem; font-weight: 600; }
+    .tk-card-body p  { font-size: .86rem; color: #4b5563; margin: 0; }
+    .tk-card-arrow {
+        position: absolute; top: .75rem; right: .75rem;
+        color: #9ca3af; font-size: 1.1rem; opacity: 0; transition: opacity .15s;
+    }
+    .tk-card:hover .tk-card-arrow { opacity: 1; color: #0078D4; }
+
+    .tk-card.repo .repo-meta {
+        display: flex; gap: .6rem; flex-wrap: wrap; margin-top: .6rem;
+        font-size: .75rem; color: #6b7280;
+    }
+    .tk-card.repo .repo-meta .topic {
+        background: #eef2ff; color: #4f46e5; padding: .08rem .45rem;
+        border-radius: 5px; font-size: .7rem;
+    }
+
+    .tk-loading {
+        display: flex; align-items: center; gap: .8rem; padding: 2rem; color: #6b7280;
+    }
+
+    .tk-main-repo {
+        display: flex; gap: 1rem; padding: 1.2rem;
+        background: linear-gradient(135deg, #f0f9ff, #ffffff);
+        border: 1px solid #bae6fd; border-radius: 12px; margin-bottom: 1rem;
+    }
+    .tk-main-repo .avatar { width: 64px; height: 64px; border-radius: 50%; }
+    .tk-main-repo .mr-title {
+        display: flex; gap: .8rem; align-items: center; flex-wrap: wrap;
+        font-size: 1.05rem; font-weight: 600; margin-bottom: .35rem;
+    }
+    .tk-main-repo .mr-title a { color: #0078D4; text-decoration: none; }
+    .tk-main-repo .stars { color: #f59e0b; font-size: .85rem; font-weight: 500; }
+    .tk-main-repo .forks { color: #6b7280; font-size: .85rem; font-weight: 500; }
+    .tk-main-repo p { color: #374151; font-size: .9rem; margin: 0 0 .5rem; }
+    .tk-main-repo .topic {
+        display: inline-block; font-size: .72rem; color: #4f46e5;
+        background: #eef2ff; padding: .12rem .5rem; border-radius: 6px; margin-right: .25rem;
+    }
+</style>
+
+@code {
+    private AzureAIToolkitService.ToolkitOverview? _overview;
+    private bool _loading = true;     // very first load (no data yet)
+    private bool _scanning;            // manual rescan (data still visible)
+    private string? _error;
+    private string? _scanStatus;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // Defer the GitHub fetch to after the interactive circuit is attached,
+        // so the initial HTTP response (pre-render) is instant. Cached results
+        // make subsequent navigations feel immediate.
+        if (!firstRender) return;
+
+        await LoadAsync(forceRefresh: false);
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private async Task RescanAsync()
+    {
+        if (_scanning) return;
+        _scanning = true;
+        _scanStatus = null;
+        var beforeCount = _overview?.Samples.Count ?? 0;
+
+        await LoadAsync(forceRefresh: true);
+
+        _scanning = false;
+        var afterCount = _overview?.Samples.Count ?? 0;
+
+        if (_error is null)
+        {
+            _scanStatus = afterCount > beforeCount
+                ? $"Scan complete: {afterCount - beforeCount} new repositories discovered (total {afterCount})."
+                : $"Scan complete: catalog refreshed. Currently showing {afterCount}.";
+
+            _ = Task.Delay(6000).ContinueWith(_ =>
+            {
+                _scanStatus = null;
+                InvokeAsync(StateHasChanged);
+            });
+        }
+    }
+
+    private async Task LoadAsync(bool forceRefresh)
+    {
+        _error = null;
+        try
+        {
+            _overview = await ToolkitService.GetOverviewAsync(forceRefresh);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+    }
+}

@@ -1,0 +1,52 @@
+# Build output and local NuGet caches: leaking these into the build
+# context bakes Windows-specific fallback package paths into
+# project.assets.json and breaks 'dotnet publish' inside the Linux
+# image with MSB4018 / "Unable to find fallback package folder
+# 'C:\Program Files (x86)\Microsoft Visual Studio\Shared\NuGetPackages'".
+**/bin/
+**/obj/
+**/.vs/
+
+# Local Docker / git noise
+.git/
+.gitignore
+.gitattributes
+.dockerignore
+.vscode/
+**/.azure/
+
+# IDE & user files
+*.user
+*.suo
+
+# Build artefacts checked into the source tree by mistake
+**/*.staticwebassets.runtime.json
+**/*.staticwebassets.endpoints.json
+
+# Local secrets and dev-only files
+.env
+.env.local
+.env.*.local
+appsettings.Development.json
+
+# Sandbox runner caches and azd state
+.foundry/
+infra/
+azure.yaml
+AgentStationHub.DoctorAgent.deploy/
+
+# Local helper outputs (live recordings, ad-hoc scripts)
+_live*.json
+_session*.json
+_q.py
+body.json
+check_dll.py
+
+# Windows / OS noise
+Thumbs.db
+Desktop.ini
+*.swp
+
+# Documentation we do not need in the image
+INSTALL.md
+azure-readonly/
