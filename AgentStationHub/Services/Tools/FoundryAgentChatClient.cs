@@ -122,7 +122,22 @@ public sealed class FoundryAgentChatClient
         var raw = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         if (!resp.IsSuccessStatusCode)
         {
-            // Surface the API error verbatim — the panel shows it as a chat
+            // Azure content-safety guardrail: when the prompt trips the
+            // "Prompt Shields" / Jailbreak / hate / sexual / violence /
+            // self-harm filters the runtime returns 400 with code
+            // "content_filter" before reaching the model. We mirror what
+            // the playground does and turn it into a polite assistant
+            // reply instead of a red error bubble — the threadId is
+            // preserved so the user can simply rephrase.
+            if ((int)resp.StatusCode == 400 && IsContentFilterError(raw, out var category))
+            {
+                var polite = string.IsNullOrEmpty(category)
+                    ? "I can't help with that request — it was blocked by the content-safety policy. Please rephrase and try again."
+                    : $"I can't help with that request — it was blocked by the content-safety policy ({category}). Please rephrase and try again.";
+                return (threadId, polite);
+            }
+
+            // Surface other API errors verbatim — the panel shows it as a chat
             // bubble, which makes diagnosing portal-side mis-config (missing
             // role assignment, wrong agent name, bloated tool response, …)
             // a one-click affair without trawling container logs.
@@ -228,4 +243,52 @@ public sealed class FoundryAgentChatClient
 
     private static string Truncate(string s, int max) =>
         string.IsNullOrEmpty(s) || s.Length <= max ? s : s[..max] + "…";
+
+    /// <summary>
+    /// Recognise an Azure OpenAI content-safety rejection. The 400 body
+    /// looks like:
+    ///   { "error": { "code":"content_filter", "param":"prompt",
+    ///                "message":"…", "content_filters":[{"category":"sexual",…}] } }
+    /// We extract the first triggered category for a slightly more
+    /// informative user-facing message.
+    /// </summary>
+    private static bool IsContentFilterError(string raw, out string category)
+    {
+        category = string.Empty;
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            if (!doc.RootElement.TryGetProperty("error", out var err) ||
+                err.ValueKind != JsonValueKind.Object) return false;
+
+            var code = err.TryGetProperty("code", out var cEl) ? cEl.GetString() : null;
+            var msg = err.TryGetProperty("message", out var mEl) ? mEl.GetString() : null;
+            var triggered =
+                string.Equals(code, "content_filter", StringComparison.OrdinalIgnoreCase) ||
+                (msg is not null &&
+                 msg.IndexOf("content management policy", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (!triggered) return false;
+
+            if (err.TryGetProperty("content_filters", out var cf) && cf.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var f in cf.EnumerateArray())
+                {
+                    if (f.ValueKind != JsonValueKind.Object) continue;
+                    var filtered = f.TryGetProperty("filtered", out var fEl) && fEl.ValueKind == JsonValueKind.True;
+                    if (!filtered) continue;
+                    if (f.TryGetProperty("category", out var catEl) && catEl.ValueKind == JsonValueKind.String)
+                    {
+                        category = catEl.GetString() ?? string.Empty;
+                        break;
+                    }
+                }
+            }
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
 }
