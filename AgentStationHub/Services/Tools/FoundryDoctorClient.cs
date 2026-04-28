@@ -88,11 +88,18 @@ public sealed class FoundryDoctorClient
         path = path.TrimEnd('/');
 
         // Drop trailing /invocations or /endpoint/protocols/invocations
-        // so we can re-add the canonical form once.
+        // OR a bare /endpoint suffix so we can re-add the canonical form
+        // once. Without the bare-/endpoint case, an env var configured
+        // as '.../agents/<name>/endpoint' (which is the value emitted by
+        // the Foundry portal "agent endpoint URL" copy-button) gets
+        // doubled into '/endpoint/endpoint/protocols/invocations' and
+        // the call returns 404.
         if (path.EndsWith("/endpoint/protocols/invocations", StringComparison.OrdinalIgnoreCase))
             path = path[..^"/endpoint/protocols/invocations".Length];
         else if (path.EndsWith("/invocations", StringComparison.OrdinalIgnoreCase))
             path = path[..^"/invocations".Length];
+        else if (path.EndsWith("/endpoint", StringComparison.OrdinalIgnoreCase))
+            path = path[..^"/endpoint".Length];
 
         // Drop /versions/{n} � the platform routes traffic across versions
         // automatically; pinning a specific version on the data-plane

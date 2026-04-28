@@ -1842,9 +1842,23 @@ public sealed class PlanningTeam
             sb.AppendLine("  'azd init --from-code', hand-written azure.yaml).");
             sb.AppendLine("- USE Strategy 1b (Bicep-direct):");
             sb.AppendLine("    az group create -n rg-<env> -l <region>");
-            sb.AppendLine("    az deployment group create -g rg-<env> -f <main.bicep> --parameters @<params>");
+            sb.AppendLine("    az deployment group create -g rg-<env> -f <main.bicep>");
+            sb.AppendLine("        [--parameters @<params.json>  ONLY IF that file actually exists in the repo]");
+            sb.AppendLine("        [--parameters key=value ...    when bicep params have no defaults]");
             sb.AppendLine("    agentic-acr-build <ctx> <Dockerfile> <imageName>     # one per Dockerfile");
             sb.AppendLine("    az containerapp update --image <acr>.azurecr.io/<img>:latest ...");
+            sb.AppendLine("- PARAMETERS FILE RULE (CRITICAL): NEVER pass '--parameters @<file>' unless");
+            sb.AppendLine("  the FILE LOCATIONS section below explicitly lists that file. If no");
+            sb.AppendLine("  '*.parameters.json' is listed, OMIT the '@' form entirely. The Bicep");
+            sb.AppendLine("  template usually has parameter defaults; pass overrides as '--parameters");
+            sb.AppendLine("  key=value' only for required-without-default params. Hallucinating a");
+            sb.AppendLine("  parameters path that does not exist on disk fails with");
+            sb.AppendLine("  'Unable to parse parameter: @<path>' and burns a Doctor attempt.");
+            sb.AppendLine("- IF THE REPO SHIPS DEPLOY SCRIPTS (e.g. infra/*.sh, deploy.sh, scripts/deploy*.sh,");
+            sb.AppendLine("  Makefile target named 'deploy'), STRONGLY PREFER reproducing them as 'bash <script>'");
+            sb.AppendLine("  in numerical / lexical order � the authors already encoded the right CLI");
+            sb.AppendLine("  invocations, parameter values, and step ordering. Hand-rolling the steps");
+            sb.AppendLine("  from the bicep alone duplicates work and tends to invent parameter files.");
             sb.AppendLine("- If a deploy.sh / Makefile target / npm-script ships in the repo, prefer");
             sb.AppendLine("  reproducing it verbatim.");
             sb.AppendLine("- ONLY if NEITHER infra/*.bicep, *.tf, Dockerfile NOR a documented deploy");
@@ -1858,6 +1872,19 @@ public sealed class PlanningTeam
         {
             sb.AppendLine("FILE LOCATIONS (use these exact paths, do not guess):");
             foreach (var r in m.Rationale) sb.AppendLine("  " + r);
+            sb.AppendLine();
+        }
+
+        // Surface the actual infra/ tree so the Strategist can SEE that
+        // (for example) main.parameters.json does NOT exist before it
+        // hallucinates '--parameters @infra/main.parameters.json'. Also
+        // lets Strategy 1b prefer ready-made deploy scripts when the
+        // repo ships them.
+        if (m.InfraFiles.Count > 0)
+        {
+            sb.AppendLine("INFRA TREE (verbatim - do NOT reference paths NOT in this list):");
+            foreach (var f in m.InfraFiles.Take(40)) sb.AppendLine("  " + f);
+            if (m.InfraFiles.Count > 40) sb.AppendLine($"  ... and {m.InfraFiles.Count - 40} more");
             sb.AppendLine();
         }
 
