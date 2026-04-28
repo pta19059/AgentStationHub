@@ -359,6 +359,22 @@ public sealed class PlanningTeam
           BlockedNeedsHumanOrSourceFix and surface a repo-source-fix proposal
           to the user instead of consuming more attempts.
 
+        REPO LACKS DEPLOYMENT SCAFFOLDING -> ESCALATE, DO NOT INVENT
+          If the failing step is `azd up` / `azd provision` / `azd deploy`
+          / `azd env new` and the inspection shows NO `azure.yaml` at the
+          repo root, OR the failing step is `terraform <x>` with NO `*.tf`
+          present, OR the failing step references a Bicep file that does
+          not exist on disk:
+            -> EMIT `give_up` IMMEDIATELY with reasoning prefixed
+               '[Escalate] ' explaining that the repository does not
+               contain the required deployment artifacts.
+          DO NOT invent commands such as `azd init --template-empty`,
+          `azd init --from-code`, scaffolding a fresh `azure.yaml`,
+          generating a Bicep file from scratch, or any other action that
+          synthesizes deployment files the user did not author. The
+          deploy must fail explicitly so the operator knows the source
+          repo is not deployable as-is.
+
         YOU HAVE INSPECTION TOOLS � USE THEM BEFORE GUESSING:
           � read_workspace_file(relativePath)      � read up to 64 KB of a
                                                      repo file. Use BEFORE
@@ -1962,6 +1978,34 @@ public sealed class PlanningTeam
         1. If 'azure.yaml' exists with services + Bicep/Terraform under
            infra/, use the three-step azd flow above. Ignore README prose
            about manual build steps � azd hooks cover them.
+        1b. NO 'azure.yaml' AT THE REPO ROOT -> NEVER EMIT azd up/provision/
+            deploy/env new. `azd env new` requires a project (azure.yaml)
+            and will fail with "no project exists". DO NOT invent
+            scaffolding commands like `azd init --template-empty`,
+            `azd init --from-code`, or hand-written `azure.yaml`. Pick a
+            different strategy that uses ONLY the deployment artifacts the
+            authors actually shipped:
+              � Bicep present (root or infra/) + Dockerfile(s) ->
+                Bicep-direct flow:
+                  az group create -n rg-<env> -l <region>
+                  az deployment group create -g rg-<env> -f <main.bicep> --parameters @<params> [--parameters key=value]
+                  for each Dockerfile that should ship as an image:
+                    agentic-acr-build <ctx> <Dockerfile> <imageName>
+                  az containerapp update / az webapp config container set as needed
+              � Terraform only -> terraform init / plan / apply
+              � docker-compose only and the README documents `docker
+                compose up` as the deploy path -> reproduce that.
+              � README documents an explicit deploy command (npm run
+                deploy, make deploy, ./deploy.sh) -> reproduce it.
+            If NONE of the above applies (e.g. the README only documents
+            `python main.py` / `npm run dev` for local development and
+            there is no IaC), the repository is NOT deployable as-is.
+            In that case the TechClassifier should have already flagged
+            it; if you are running anyway, emit a 1-step plan whose only
+            step is `agentic-summary` with description prefixed
+            '[Escalate] repository ships no deployment artifacts' so
+            the orchestrator surfaces a clear message instead of running
+            a hallucinated deploy.
         2. Else, if README has a 'Deployment' / 'Getting Started' /
            'Quickstart' section, reproduce those commands (skip clone/init).
         3. Else, infer from the classification and manifest: docker compose
