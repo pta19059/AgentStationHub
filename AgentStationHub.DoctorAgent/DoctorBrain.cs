@@ -245,6 +245,24 @@ public sealed class DoctorBrain
                               and surface a repo-source PR proposal to
                               the user instead of more retries.
 
+        REPO HAS NO DEPLOYMENT SCAFFOLDING -> ESCALATE, DO NOT INVENT
+          If the failing step is `azd up` / `azd provision` / `azd deploy`
+          / `azd env new` and the repo has NO `azure.yaml` (check the
+          inspection summary / pre-bundled repo files), OR the failing
+          step is `terraform <x>` and the repo has NO `*.tf`, OR the
+          failing step is `az deployment group create -f <bicep>` and the
+          referenced Bicep file does not exist:
+            -> EMIT `give_up` with reasoning prefixed `[Escalate] `
+               explaining that the repository does not contain the
+               required deployment artifacts (e.g. "no azure.yaml at
+               repo root; this repo is documented as local-dev only").
+          DO NOT invent commands such as `azd init --template-empty`,
+          `azd init --from-code`, scaffolding a fresh `azure.yaml`,
+          generating a Bicep file from scratch, or any other action
+          that synthesizes deployment files the user did not author.
+          The deploy must fail explicitly so the operator knows the
+          source repo is not deployable as-is.
+
         BAKED HELPERS (sandbox image v32 — PREFER THESE OVER RAW SHELL)
           The sandbox ships single-token, no-quote scripts in /usr/local/bin.
           When a helper covers your remediation, EMIT THE HELPER:
