@@ -64,6 +64,13 @@ services:
       AZURE_TENANT_ID: "${AZURE_TENANT_ID:-}"
       AZURE_CLIENT_ID: "${AZURE_CLIENT_ID:-}"
       AZURE_CLIENT_SECRET: "${AZURE_CLIENT_SECRET:-}"
+      # Single-account login. The app's /login page validates against
+      # these two values. AUTH_PASSWORD is a plain string kept only in
+      # .env on the VM (gitignored). When unset the app fails closed —
+      # nobody can authenticate. To rotate, edit .env and
+      # `docker compose up -d --force-recreate --no-deps agentichub`.
+      Auth__Username: "${AUTH_USERNAME:-demo}"
+      Auth__Password: "${AUTH_PASSWORD:-}"
     volumes:
       # DooD: the app spawns sibling sandbox containers on the host daemon.
       - /var/run/docker.sock:/var/run/docker.sock

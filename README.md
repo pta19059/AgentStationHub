@@ -16,7 +16,7 @@ The Hub runs **only on an Azure VM** that you provision once with [`start.ps1`](
 
 ```
 Operator browser ──HTTPS──► https://agentichub-host.eastus2.cloudapp.azure.com
-                            │   (Let's Encrypt cert, HTTP basic auth)
+                            │   (Let's Encrypt cert, /login form gates the app)
                             ▼
                             Azure VM (agentichub-host, Standard_D2as_v6, Ubuntu)
                             │
@@ -279,30 +279,33 @@ Read by `docker-compose.yml`. Notably:
 - `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_TENANT_ID` — when set, `DefaultAzureCredential` inside the container picks up the SP (`ash-doctor-orchestrator`) instead of the VM's system-assigned MI.
 - `FOUNDRY_USE_FOUNDRY_DOCTOR=true` and `FOUNDRY_DOCTOR_AGENT_ENDPOINT=...` — enable the Foundry Hosted Doctor.
 - `PUBLIC_FQDN` — public hostname Caddy will request a Let's Encrypt cert for. Defaults to `agentichub-host.eastus2.cloudapp.azure.com` (Azure-provided FQDN attached to the VM's public IP).
-- `BASIC_AUTH_USER` / `BASIC_AUTH_HASH` — the single account that gates the public surface. The hash is bcrypt and **must have its `$` signs escaped to `$$`** in `.env` so docker-compose interpolation leaves it intact (compose treats `$` as a variable). Generate it on the VM with `sudo docker run --rm caddy:2-alpine caddy hash-password --plaintext '<password>'`.
+- `AUTH_USERNAME` / `AUTH_PASSWORD` — the single account that gates the public surface, validated by the app's `/login` page (cookie auth, see [`Services/Security/SimpleAuth.cs`](AgentStationHub/Services/Security/SimpleAuth.cs)). Plain string, kept only in `.env` on the VM (gitignored). When unset the app fails closed — nobody can authenticate.
 - `CADDY_ACME_EMAIL` — contact for the ACME account. Must be a syntactically valid email with a public TLD; Let's Encrypt rejects `.local`. Using something like `admin@<PUBLIC_FQDN>` works.
 
 ---
 
 ## Public access & TLS
 
-The VM is reachable from the open internet at **`https://agentichub-host.eastus2.cloudapp.azure.com`** behind a [Caddy v2](https://caddyserver.com/) reverse proxy. The full posture is:
+The VM is reachable from the open internet at **`https://agentichub-host.eastus2.cloudapp.azure.com`** behind a [Caddy v2](https://caddyserver.com/) reverse proxy, and the app itself ships a real **`/login` page** (cookie auth) that gates every route. The full posture is:
 
 ```
 Internet ──► NSG (TCP 443 + 80 from *, TCP 22 from your /24)
         ──► VM eth0
         ──► docker host:443/80
-        ──► agentichub-caddy (TLS termination + HTTP basic auth)
+        ──► agentichub-caddy (TLS termination + security headers)
         ──► docker network ──► agentichub-app:8080  (no host port published)
+                                  └─ ASP.NET Core cookie auth
+                                     └─ unauth → 302 /login
 ```
 
 What this gives us:
 
 - **Auto-TLS via Let's Encrypt HTTP-01.** Caddy provisions and renews the cert with no manual step, persisting account key + chain in the named volumes `agentichub-caddy-data` / `agentichub-caddy-config`. ZeroSSL is the configured fallback.
-- **HTTP basic auth at the edge.** Anything other than `/.well-known/acme-challenge/*` returns `401` until the user provides credentials. Caddy validates a single bcrypt hash kept in `.env` (gitignored). The Blazor app itself stays untouched and continues to assume "trusted operator" semantics.
+- **Branded login page in the app.** [`Services/Security/SimpleAuth.cs`](AgentStationHub/Services/Security/SimpleAuth.cs) wires `AddAuthentication().AddCookie()` with a fallback `RequireAuthenticatedUser` policy, so any unauthenticated request to any path (Blazor route, debug API, `/copilot/*`) is redirected to `/login?ReturnUrl=...`. The page is a single self-contained inline HTML form (no Razor view, no static-file dependency) with constant-time credential comparison via `CryptographicOperations.FixedTimeEquals`. A `Sign out` link in the sidebar hits `/logout`, which clears the cookie and redirects back to `/login`. Sliding 7-day session cookies (`agentichub_auth`, `HttpOnly`, `SameSite=Lax`, `Secure` once Caddy upgrades the request to HTTPS via `X-Forwarded-Proto`).
 - **Hub origin not exposed.** `agentichub-app` declares `expose: ["8080"]` instead of `ports:`, so 8080 is not bound on the host. The only path to the Hub is via Caddy on the same docker network. The `agentichub-copilot-cli` sidecar continues to be attached to the same network — `/copilot/*` is YARP-forwarded inside the Hub, so the same edge auth applies to the terminal too.
-- **Hardening headers.** [`Caddyfile`](Caddyfile) sets HSTS (`max-age=63072000; includeSubDomains; preload`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: SAMEORIGIN`, removes the `Server` header, and enables gzip + zstd encoding.
+- **Hardening headers.** [`Caddyfile`](Caddyfile) sets HSTS (`max-age=31536000; includeSubDomains`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `X-Frame-Options: SAMEORIGIN`, removes the `Server` header, and enables gzip + zstd encoding.
 - **HTTP→HTTPS 308 redirect** is automatic. Plain HTTP only stays open so the ACME HTTP-01 challenge can complete.
+- **Forwarded headers honoured.** The app calls `UseForwardedHeaders` for `X-Forwarded-Proto/Host/For` so cookie auth, redirect URLs and antiforgery tokens reflect the original HTTPS request rather than the internal `http://agentichub:8080` hop.
 
 NSG layout in `rg-agentichub-host` / `agentichub-hostNSG`:
 
@@ -310,17 +313,20 @@ NSG layout in `rg-agentichub-host` / `agentichub-hostNSG`:
 |---|---|---|---|---|
 | `AllowSshFromMyIp` | 1010 | your `/24` | 22 | SSH (refreshed by `start.ps1`) |
 | `AllowHTTP` | 1020 | `*` | 80 | Let's Encrypt HTTP-01 + 308 to HTTPS |
-| `AllowHTTPS` | 1030 | `*` | 443 | Public app traffic (basic-auth gated) |
+| `AllowHTTPS` | 1030 | `*` | 443 | Public app traffic (`/login` gated) |
 
-Credentials are not in the repo. They live only in `~/agentichub/.env` on the VM. To rotate, regenerate the bcrypt hash and `sudo docker compose up -d --force-recreate --no-deps caddy`.
+Credentials are not in the repo. They live only in `~/agentichub/.env` on the VM as `AUTH_USERNAME` / `AUTH_PASSWORD`. To rotate, edit `.env` and `sudo docker compose up -d --force-recreate --no-deps agentichub`.
 
 Smoke test from any machine:
 ```
-curl -I https://agentichub-host.eastus2.cloudapp.azure.com/                # 401
-curl -u <user>:<pass> -I https://agentichub-host.eastus2.cloudapp.azure.com/  # 200/302
+curl -I https://agentichub-host.eastus2.cloudapp.azure.com/                  # 302 -> /login
+curl    https://agentichub-host.eastus2.cloudapp.azure.com/login | head      # the form
+curl -c /tmp/c -X POST -d 'username=<u>&password=<p>' \
+        https://agentichub-host.eastus2.cloudapp.azure.com/login              # 302 + Set-Cookie
+curl -b /tmp/c -I https://agentichub-host.eastus2.cloudapp.azure.com/         # 200
 ```
 
-Files involved: [`Caddyfile`](Caddyfile), [`docker-compose.yml`](docker-compose.yml) (`caddy` service + `caddy-data` / `caddy-config` volumes).
+Files involved: [`AgentStationHub/Services/Security/SimpleAuth.cs`](AgentStationHub/Services/Security/SimpleAuth.cs), [`Caddyfile`](Caddyfile), [`docker-compose.yml`](docker-compose.yml) (`caddy` service + `caddy-data` / `caddy-config` volumes + `Auth__Username` / `Auth__Password` env).
 
 ---
 

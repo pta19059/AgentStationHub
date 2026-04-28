@@ -2,6 +2,7 @@ using AgentStationHub.Components;
 using AgentStationHub.Hubs;
 using AgentStationHub.Services;
 using AgentStationHub.Services.Agents;
+using AgentStationHub.Services.Security;
 using Azure;
 using Azure.AI.OpenAI;
 using Azure.Identity;
@@ -78,6 +79,20 @@ Directory.CreateDirectory(keyRingDir);
 builder.Services.AddDataProtection()
     .PersistKeysToFileSystem(new DirectoryInfo(keyRingDir))
     .SetApplicationName("AgentStationHub");
+
+// ---------- Single-account cookie auth ----------
+//
+// Replaces the previous Caddy `basic_auth` gate with a real /login
+// page (Set-Cookie + sliding session). Caddy keeps doing TLS
+// termination + reverse proxy, but the credential check now lives in
+// the app so we get branded forms, friendly error messages, a
+// /logout link, and a session cookie that the SignalR reconnect
+// channel inherits automatically. Credentials come from
+// `Auth:Username` / `Auth:Password` in configuration (sourced from
+// AUTH_USERNAME / AUTH_PASSWORD env vars in docker-compose). When the
+// password is empty the gate fails closed — no anonymous access.
+// See `Services/Security/SimpleAuth.cs` for the rationale.
+builder.Services.AddSimpleAuth();
 
 builder.Services.AddSingleton<AgentCatalogService>();
 builder.Services.AddSingleton<AgentMemoryStore>();
@@ -265,8 +280,21 @@ if (hasHttpsEndpoint)
 {
     app.UseHttpsRedirection();
 }
+
+// Honour Caddy's X-Forwarded-Proto / -Host / -For so the cookie auth
+// pipeline (and any URL the app generates) sees the original HTTPS
+// request scheme. Must run BEFORE UseAuthentication so cookies get
+// the Secure flag when the upstream was HTTPS.
+app.UseForwardedHeaders();
 app.UseStaticFiles();
+app.UseRouting();
+app.UseAuthentication();
+app.UseAuthorization();
 app.UseAntiforgery();
+
+// /login + /logout endpoints. Mapped early so they always win over
+// the Blazor catch-all router below.
+app.MapSimpleAuthEndpoints();
 
 // ---------- Copilot CLI reverse proxy (YARP IHttpForwarder) ----------
 //
