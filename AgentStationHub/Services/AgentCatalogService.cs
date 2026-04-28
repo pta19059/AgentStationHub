@@ -110,7 +110,8 @@ public class AgentCatalogService
             CopilotStudioImportUrl: CopilotStudioPortal,
             Tags: ["copilot-studio", "templates", "policy", "compliance"],
             Stars: 450,
-            Author: "microsoft"),
+            Author: "microsoft")
+        { Deployability = Deployability.ManualOnly },
 
         // ---------------- FINANCIAL ----------------
         new AgentSample(
@@ -124,7 +125,8 @@ public class AgentCatalogService
             CopilotStudioImportUrl: null,
             Tags: ["autogen", "multi-agent", "python", "research"],
             Stars: 33000,
-            Author: "microsoft"),
+            Author: "microsoft")
+        { Deployability = Deployability.NotApplicable },
 
         new AgentSample(
             Id: "agent-openai-python-prompty",
@@ -165,7 +167,8 @@ public class AgentCatalogService
             CopilotStudioImportUrl: CopilotStudioPortal,
             Tags: ["hr", "onboarding", "sharepoint", "dataverse"],
             Stars: 450,
-            Author: "microsoft"),
+            Author: "microsoft")
+        { Deployability = Deployability.ManualOnly },
 
         // ---------------- EDUCATION ----------------
         new AgentSample(
@@ -179,7 +182,8 @@ public class AgentCatalogService
             CopilotStudioImportUrl: null,
             Tags: ["education", "tutorial", "semantic-kernel", "autogen"],
             Stars: 20000,
-            Author: "microsoft"),
+            Author: "microsoft")
+        { Deployability = Deployability.NotApplicable },
 
         new AgentSample(
             Id: "aisearch-openai-rag-audio",
@@ -220,7 +224,8 @@ public class AgentCatalogService
             CopilotStudioImportUrl: null,
             Tags: ["teams", "graph", "summarization", "bot-framework"],
             Stars: 1400,
-            Author: "microsoft"),
+            Author: "microsoft")
+        { Deployability = Deployability.NotApplicable },
 
         new AgentSample(
             Id: "semantic-kernel",
@@ -233,7 +238,8 @@ public class AgentCatalogService
             CopilotStudioImportUrl: null,
             Tags: ["sdk", "orchestration", "plugins", "dotnet", "python", "azure-ai-foundry"],
             Stars: 22000,
-            Author: "microsoft"),
+            Author: "microsoft")
+        { Deployability = Deployability.NotApplicable },
 
         // =========================================================================
         //  MICROSOFT AGENT FRAMEWORK - the new unified Microsoft framework
@@ -252,7 +258,8 @@ public class AgentCatalogService
             CopilotStudioImportUrl: null,
             Tags: ["microsoft-agent-framework", "azure-ai-foundry", "multi-agent", "dotnet", "python"],
             Stars: 1200,
-            Author: "microsoft"),
+            Author: "microsoft")
+        { Deployability = Deployability.NotApplicable },
 
         new AgentSample(
             Id: "ms-365-agents-sdk",
@@ -265,7 +272,8 @@ public class AgentCatalogService
             CopilotStudioImportUrl: null,
             Tags: ["microsoft-365", "azure-ai-foundry", "teams", "multi-channel"],
             Stars: 400,
-            Author: "microsoft"),
+            Author: "microsoft")
+        { Deployability = Deployability.NotApplicable },
 
         new AgentSample(
             Id: "azureai-samples-foundry",
@@ -278,7 +286,8 @@ public class AgentCatalogService
             CopilotStudioImportUrl: null,
             Tags: ["azure-ai-foundry", "foundry-agent-service", "quickstart", "samples"],
             Stars: 700,
-            Author: "Azure-Samples"),
+            Author: "Azure-Samples")
+        { Deployability = Deployability.NotApplicable },
     ];
 
     public IReadOnlyList<AgentSample> GetAll() => _samples;

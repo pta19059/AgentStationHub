@@ -88,11 +88,28 @@
 
                 @if (agent.Target is DeploymentTarget.AzureAIFoundry or DeploymentTarget.Both)
                 {
-                    <button class="btn btn-primary btn-sm"
-                            title="Runs the agentic deployment pipeline: clone, inspect, plan (LLM), approve, execute in a Docker sandbox."
-                            @onclick="() => AgenticDeployAsync(agent)">
-                        <i class="bi bi-magic"></i> Agentic deploy
-                    </button>
+                    @* SDKs / libraries / courses are flagged in the catalog as
+                       Deployability.NotApplicable. The "Agentic deploy" button
+                       would just clone the repo and have the TechClassifier
+                       reject it after several minutes. Hide it up-front and
+                       show a clear, non-clickable badge instead so the user
+                       knows the canonical action is to read the code on
+                       GitHub. *@
+                    @if (agent.Deployability == Deployability.NotApplicable)
+                    {
+                        <span class="badge bg-secondary"
+                              title="This is a library / SDK / course, not a deployable application. Open it on GitHub to explore the samples.">
+                            <i class="bi bi-book"></i> Library / SDK
+                        </span>
+                    }
+                    else
+                    {
+                        <button class="btn btn-primary btn-sm"
+                                title="Runs the agentic deployment pipeline: clone, inspect, plan (LLM), approve, execute in a Docker sandbox."
+                                @onclick="() => AgenticDeployAsync(agent)">
+                            <i class="bi bi-magic"></i> Agentic deploy
+                        </button>
+                    }
 
                     @* Only show a direct "Open ARM template" shortcut when the *@
                     @* catalog entry actually has a one-click Deploy-to-Azure URL. *@
@@ -276,7 +293,7 @@
     private async Task AgenticDeployAsync(AgentSample agent)
     {
         if (_deploymentModal is null) return;
-        await _deploymentModal.OpenAsync(agent.GitHubUrl, _region);
+        await _deploymentModal.OpenAsync(agent.GitHubUrl, _region, agent.SamplePath);
     }
 
     private IEnumerable<AgentSample> Filtered =>

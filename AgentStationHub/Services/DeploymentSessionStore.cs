@@ -167,6 +167,7 @@ public sealed class DeploymentSessionStore
         public string Id { get; set; } = "";
         public string RepoUrl { get; set; } = "";
         public string WorkDir { get; set; } = "";
+        public string? SamplePath { get; set; }
         public string AzureLocation { get; set; } = "";
         public DeploymentStatus Status { get; set; }
         public DeploymentPlan? Plan { get; set; }
@@ -180,6 +181,7 @@ public sealed class DeploymentSessionStore
             Id            = s.Id,
             RepoUrl       = s.RepoUrl,
             WorkDir       = s.WorkDir,
+            SamplePath    = s.SamplePath,
             AzureLocation = s.AzureLocation,
             Status        = s.Status,
             Plan          = s.Plan,
@@ -203,6 +205,7 @@ public sealed class DeploymentSessionStore
             {
                 RepoUrl       = RepoUrl,
                 WorkDir       = WorkDir,
+                SamplePath    = SamplePath,
                 AzureLocation = AzureLocation,
                 Status        = Status,
                 Plan          = Plan,

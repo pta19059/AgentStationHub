@@ -248,7 +248,7 @@ public sealed class DeploymentOrchestrator
     }
 
 
-    public string Start(string repoUrl, string? azureLocation = null)
+    public string Start(string repoUrl, string? azureLocation = null, string? samplePath = null)
     {
         var root = string.IsNullOrWhiteSpace(_opt.WorkRootDir)
             ? Path.Combine(Path.GetTempPath(), "agentichub")
@@ -262,11 +262,28 @@ public sealed class DeploymentOrchestrator
         var location = (azureLocation ?? _opt.DefaultAzureLocation ?? "eastus")
             .Trim().ToLowerInvariant();
 
+        // Sanitise the optional monorepo sub-path: trim, strip leading
+        // slashes, reject absolute paths and any '..' traversal so a
+        // catalog entry can never escape the cloned working directory.
+        // A null/empty samplePath means "use repo root" (legacy behaviour).
+        string? cleanSubPath = null;
+        if (!string.IsNullOrWhiteSpace(samplePath))
+        {
+            var t = samplePath.Trim().Replace('\\', '/').Trim('/');
+            if (t.Length > 0
+                && !Path.IsPathRooted(t)
+                && !t.Split('/').Any(seg => seg == ".." || seg == "."))
+            {
+                cleanSubPath = t;
+            }
+        }
+
         var s = new DeploymentSession
         {
             RepoUrl = repoUrl,
             WorkDir = Path.Combine(root, Guid.NewGuid().ToString("N")[..8]),
-            AzureLocation = location
+            AzureLocation = location,
+            SamplePath = cleanSubPath
         };
         _sessions[s.Id] = s;
         _store.SaveLater(s);
@@ -368,8 +385,38 @@ public sealed class DeploymentOrchestrator
             await SetStatus(s, DeploymentStatus.Cloning);
             await GitTool.CloneAsync(s.RepoUrl, s.WorkDir, msg => _ = Log(s, "info", msg), ct);
 
+            // Resolve the directory the rest of the pipeline operates on.
+            // For monorepo catalog entries that point to a sub-folder
+            // (e.g. microsoft/agent-framework -> python/samples/05-end-to-end)
+            // we move "downstream" of the clone: README, key files,
+            // toolchain inspection, agent planning, the staged sandbox
+            // workspace, and step execution all see the sub-folder as
+            // their root. The clone itself stays at s.WorkDir so a
+            // future feature (Doctor reading other parts of the repo,
+            // submodule diagnostics) can still walk upward.
+            var projectDir = s.WorkDir;
+            if (!string.IsNullOrEmpty(s.SamplePath))
+            {
+                var candidate = Path.GetFullPath(
+                    Path.Combine(s.WorkDir, s.SamplePath));
+                var workRootFull = Path.GetFullPath(s.WorkDir);
+                if (!candidate.StartsWith(workRootFull, StringComparison.OrdinalIgnoreCase)
+                    || !Directory.Exists(candidate))
+                {
+                    s.ErrorMessage =
+                        $"Configured sample path '{s.SamplePath}' does not exist " +
+                        $"inside the cloned repo. Cannot continue.";
+                    await Log(s, "err", s.ErrorMessage);
+                    await SetStatus(s, DeploymentStatus.Failed);
+                    return;
+                }
+                projectDir = candidate;
+                await Log(s, "info",
+                    $"Using monorepo sub-folder as project root: {s.SamplePath}");
+            }
+
             await SetStatus(s, DeploymentStatus.Inspecting);
-            var files = new FileTool(s.WorkDir);
+            var files = new FileTool(projectDir);
             // README is the primary source of deployment instructions. Read up
             // to 60 KB so we do not truncate large docs before the 'Deployment'
             // / 'Getting Started' section.
@@ -405,7 +452,7 @@ public sealed class DeploymentOrchestrator
                 $"README: {readme.Length} chars, infra files: {infra.Count}, " +
                 $"key files present: [{string.Join(", ", presentFiles.Keys)}]");
 
-            var toolchain = RepoInspector.Inspect(s.WorkDir);
+            var toolchain = RepoInspector.Inspect(projectDir);
             var detected = string.Join(", ", toolchain.Summary());
             await Log(s, "status",
                 $"Detected toolchains: {(string.IsNullOrEmpty(detected) ? "none" : detected)}");
@@ -446,7 +493,7 @@ public sealed class DeploymentOrchestrator
                     await Log(s, "status",
                         $"Invoking Agent Framework team in sandbox (region: {s.AzureLocation})...");
                     plan = await runnerHost.ExtractPlanAsync(
-                        imageToUse, s.RepoUrl, s.WorkDir, s.AzureLocation,
+                        imageToUse, s.RepoUrl, projectDir, s.AzureLocation,
                         (lvl, line) => _ = Log(s, lvl, line),
                         ct,
                         priorInsights);
@@ -546,7 +593,7 @@ public sealed class DeploymentOrchestrator
             try
             {
                 workspaceVolume = await SandboxWorkspaceVolume.EnsureAsync(
-                    s.Id, s.WorkDir,
+                    s.Id, projectDir,
                     (lvl, line) => _ = Log(s, lvl, line),
                     ct);
             }
@@ -587,7 +634,7 @@ public sealed class DeploymentOrchestrator
             // any +x bit set by postinstall scripts persist across steps
             // for free. See SandboxSession class doc for the full rationale.
             session = await SandboxSession.StartAsync(
-                s.Id, imageToUse, workspaceVolume, s.WorkDir,
+                s.Id, imageToUse, workspaceVolume, projectDir,
                 (lvl, line) => _ = Log(s, lvl, line),
                 ct);
 
@@ -606,7 +653,7 @@ public sealed class DeploymentOrchestrator
             var deployCtx = new Services.Actions.DeployContext(
                 sessionId: s.Id,
                 repoUrl: s.RepoUrl,
-                workDir: s.WorkDir,
+                workDir: projectDir,
                 azureLocation: s.AzureLocation,
                 initialEnv: env);
             deployCtx.MergeFromAzdEnv(env);
@@ -1367,7 +1414,7 @@ public sealed class DeploymentOrchestrator
                             if (foundryDoctor is not null)
                             {
                                 fix = await foundryDoctor.RemediateAsync(
-                                    s.WorkDir,
+                                    projectDir,
                                     plan with { Steps = steps.ToList() },
                                     step.Id, stepTail, previousAttempts,
                                     (lvl, line) => _ = Log(s, lvl, line, step.Id),
@@ -1390,7 +1437,7 @@ public sealed class DeploymentOrchestrator
                             else
                             {
                                 fix = await runnerHost.RemediateAsync(
-                                    imageToUse, s.WorkDir,
+                                    imageToUse, projectDir,
                                     // Rebuild plan DTO from the current (possibly
                                     // already-remediated) step list so the Doctor
                                     // sees the real state.

@@ -102,6 +102,14 @@ public sealed class DeploymentSession
     public required string RepoUrl { get; init; }
     public required string WorkDir { get; init; }
     /// <summary>
+    /// Optional sub-folder relative to <see cref="WorkDir"/> where the
+    /// actual deployable project lives. Used for monorepo catalog
+    /// entries (e.g. <c>microsoft/agent-framework</c> with
+    /// <c>SamplePath = "python/samples/05-end-to-end"</c>). When null
+    /// the orchestrator works from <see cref="WorkDir"/> directly.
+    /// </summary>
+    public string? SamplePath { get; init; }
+    /// <summary>
     /// Azure region chosen by the user for this deploy. Passed through to
     /// the agent team so the Strategist emits the correct 'azd env set
     /// AZURE_LOCATION &lt;x&gt;' (and sibling location env vars) in the plan.
