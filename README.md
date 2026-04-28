@@ -89,7 +89,7 @@ AgentStationHub/
         ├── AzdEnvLoader.cs / AzdEnvSubstitutor.cs
         ├── GitTool.cs / FileTool.cs / RepoInspector.cs
         ├── FoundryDoctorClient.cs             Optional hosted-Doctor HTTP client
-        └── FoundryAgentChatClient.cs          Agent Learn: AOAI chat-completions + function calling
+        └── FoundryAgentChatClient.cs          Agent Learn: thin client over Foundry Agents v2 Responses API
 
 AgentStationHub.SandboxRunner/
 ├── Program.cs                                 stdin/stdout JSON protocol (plan / remediate)
@@ -158,45 +158,44 @@ Built on demand by `SandboxImageBuilder` (tag `agentichub/sandbox:vN`, currently
 | Strategist (sandbox) | Chat Completions | `ash-strategist` | `AzureOpenAI:StrategistDeployment` |
 | Doctor (sandbox or hosted) | Chat Completions / Invocations | `ash-doctor` (`o4-mini`) | `AzureOpenAI:DoctorDeployment` |
 | Other runner agents | Chat Completions | `gpt-5.3-chat` | `AzureOpenAI:RunnerDeployment` |
-| Agent Learn chat | Chat Completions | `gpt-4.1-mini-1` | `Foundry:ChatAgent:Deployment` |
+| Agent Learn chat | Foundry Responses (hosted agent) | `gpt-4.1-mini-1` | `Foundry:ChatAgent:AgentName` |
 
 ---
 
 ## Agent Learn (in-app chat)
 
-Floating circular Microsoft-logo avatar pinned bottom-left of every page (registered in [`MainLayout.razor`](AgentStationHub/Components/Layout/MainLayout.razor)). Clicking it opens a 360×520 chat panel with header *Agent Learn* + a `?` tooltip. The agent recommends Microsoft Learn modules, paths, certifications, exams and instructor-led courses in fluent natural language with Markdown citations to real `learn.microsoft.com` URLs.
+Floating circular Microsoft-logo avatar pinned bottom-left of every page (registered in [`MainLayout.razor`](AgentStationHub/Components/Layout/MainLayout.razor)). Clicking it opens a 360×520 chat panel with header *Agent Learn*. The agent recommends Microsoft Learn modules, paths, certifications, exams and instructor-led courses in fluent natural language with Markdown citations to real `learn.microsoft.com` URLs — and grounds explanatory questions on the official docs surface via the Microsoft Learn MCP server.
+
+The in-app chat **delegates the entire turn** to the Foundry hosted agent `AgentMicrosoftLearn` (configured in the AgenticStationFoundry portal, project `default`). The agent owns instructions, tool routing, and grounding — what users see in the panel is byte-for-byte what the playground returns.
 
 ```
 [User] ──► [Blazor Server: AgentChatPanel]
-                   │  per-circuit thread state (system + user/assistant/tool history)
+                   │  per-circuit threadId = previous_response_id (multi-turn memory)
                    ▼
-          [FoundryAgentChatClient]
-                   │  POST /openai/deployments/gpt-4.1-mini-1/chat/completions?api-version=2024-10-21
-                   │  tool: get_learning_content (function call, no parameters)
+          [FoundryAgentChatClient]  (thin client, no system prompt, no tool routing)
+                   │  POST {ProjectEndpoint}/openai/v1/responses
+                   │  Authorization: Bearer <DefaultAzureCredential, scope https://ai.azure.com/.default>
+                   │  body: { agent_reference:{type:"agent_reference",name:"AgentMicrosoftLearn"},
+                   │          input:[{role:"user",content:[{type:"input_text",text:...}]}],
+                   │          previous_response_id?:"resp_…" }
                    ▼
-          [Azure OpenAI on AgenticStationFoundry, kind=AIServices]
-                   │  emits tool_call when the user asks for training material
+          [Foundry Agent Service — AgenticStationFoundry / project=default]
+                   │  AgentMicrosoftLearn (kind=prompt, model=gpt-4.1-mini-1, v9)
+                   │   ├─ openapi tool: microsoft_learn_catalog → Logic App `logicapp-090730`
+                   │   └─ mcp tool: MicrosoftLearnMCPserver → https://learn.microsoft.com/api/mcp
+                   │       (microsoft_docs_search / microsoft_docs_fetch / microsoft_code_sample_search)
                    ▼
-          [FoundryAgentChatClient.CallLearnAsync]
-                   │  POST https://logicapp-090730.azurewebsites.net/api/Get_Learning_Content/
-                   │       triggers/Request/invoke?api-version=...&sig=... (anonymous SAS)
-                   ▼
-          [Logic App Standard `logicapp-090730` (Sweden Central)]
-                   │  workflow Get_Learning_Content → Microsoft Learn Catalog API
-                   ▼
-          [learn.microsoft.com Catalog API] → ~14 MB JSON
-                   │  truncated to ~120 KB before being passed back to the model
-                   ▼
-          [gpt-4.1-mini-1] → natural-language answer with Markdown citations
+          response.output[].type=="message" → output_text  (with learn.microsoft.com Markdown links)
                    ▼
           [User]
 ```
 
-- **Auth**: `DefaultAzureCredential` inside the Hub container fetches a token for `https://cognitiveservices.azure.com/.default`. The principal in use needs role `Cognitive Services OpenAI User` on the AOAI account (`AgenticStationFoundry`). On the VM both the system-assigned MI and the `ash-doctor-orchestrator` SP (used when `AZURE_CLIENT_ID/SECRET` are set in `.env`) have been granted this role.
-- **Logic App auth**: SAS query parameters are baked into `Foundry:ChatAgent:LearnToolUrl`. Easy Auth excludes `/api/*` so the SAS is the only check on the trigger; the rest of the site requires AAD.
-- **Why bypass Foundry V2 Responses**: the portal-built agent (`AgentMicrosoftLearn`) exposes a Responses-protocol URL of the form `…/api/projects/default/agents/<id>/protocols/openai/v1/responses?api-version=…`, but in `swedencentral` the runtime returned 404 for every probe. The in-process AOAI + function-calling implementation ships the same UX today.
-- **Catalog truncation**: tool-result string is truncated to 120 KB before being added to the conversation history (raw catalog is ~14 MB). The model still sees plenty of items in the head of each array (`modules`, `learningPaths`, `certifications`, `exams`, `courses`).
-- **System prompt** (in [`FoundryAgentChatClient.SystemPrompt`](AgentStationHub/Services/Tools/FoundryAgentChatClient.cs)) enforces natural-language replies in the user's language, 3–6 recommendations woven into prose, Markdown links on titles, no JSON / tool-mention leakage.
+- **Endpoint**: `POST {ProjectEndpoint}/openai/v1/responses` — no `api-version` query param (the `/openai/v1` path rejects it). ProjectEndpoint = `https://agenticstationfoundry.services.ai.azure.com/api/projects/default`.
+- **Auth**: `DefaultAzureCredential` fetches a token with scope `https://ai.azure.com/.default`. The principal needs role **`Azure AI User`** on the project scope (`…/accounts/AgenticStationFoundry/projects/default`). On the VM the `ash-doctor-orchestrator` SP has been granted both `Cognitive Services OpenAI User` (account scope) and `Azure AI User` (project scope).
+- **Multi-turn memory**: the agent's `response.id` is reused as the next call's `previous_response_id`, giving the panel conversation memory inside the same Blazor circuit. A hard reload starts a fresh thread.
+- **Tools live in the portal, not in the code**: `microsoft_learn_catalog` (Logic App `logicapp-090730`, anonymous SAS) and the Microsoft Learn MCP server are attached to `AgentMicrosoftLearn` in the Foundry portal. Editing tools / instructions / model never requires re-deploying the Hub.
+- **Why this beats the previous AOAI bypass**: the old client only had the catalog tool and ran via chat-completions; it could not ground on official docs. With the hosted agent the Hub gets MCP-grounded answers (citing real `learn.microsoft.com` URLs) for free.
+- **Legacy keys** (`Foundry:ChatAgent:OpenAiEndpoint`, `Deployment`, `LearnToolUrl`) are kept in `appsettings.json` for reference but ignored by the new client.
 
 ---
 
@@ -317,7 +316,7 @@ The Hub's port 8080 is `127.0.0.1`-only on the VM. Three unauthenticated debug e
 ## Recent changes
 
 - **README accuracy pass** — corrected the Hub UX description: there is no free-form "paste a repo URL" input, the Hub is a curated catalog with filters and a *Scan the web* growth path; arbitrary URLs go through the debug API. Project layout updated accordingly. The `?` badge in the nav opens an `/about` page that renders this README at runtime via Markdig.
-- **Agent Learn — floating chat avatar in the Hub sidebar** ([`AgentChatPanel.razor`](AgentStationHub/Components/AgentChatPanel.razor), [`FoundryAgentChatClient.cs`](AgentStationHub/Services/Tools/FoundryAgentChatClient.cs), wiring in [`Program.cs`](AgentStationHub/Program.cs)). MS-logo avatar opens a chat powered by Azure OpenAI `gpt-4.1-mini-1` with a single function-calling tool (`get_learning_content`) that fetches the live Microsoft Learn catalog through Logic App Standard `logicapp-090730`. Foundry V2 Responses returned 404 on cluster `hyena-swedencentral-02` (preview), so the agent runs in-process via the chat-completions data plane on the AgenticStationFoundry account. `?` tooltip next to the title surfaces the architecture summary inline.
+- **Agent Learn — floating chat avatar in the Hub sidebar** ([`AgentChatPanel.razor`](AgentStationHub/Components/AgentChatPanel.razor), [`FoundryAgentChatClient.cs`](AgentStationHub/Services/Tools/FoundryAgentChatClient.cs), wiring in [`Program.cs`](AgentStationHub/Program.cs)). MS-logo avatar opens a chat that delegates every turn to the **Foundry hosted agent `AgentMicrosoftLearn`** via the v2 Responses API (`POST {project}/openai/v1/responses` with `agent_reference`). The portal-side agent owns instructions and routes between the `microsoft_learn_catalog` Logic App and the Microsoft Learn MCP server, so answers come back grounded on official docs with `learn.microsoft.com` Markdown citations — identical to what users see in the Foundry playground. `?` tooltip next to the title surfaces the architecture summary inline.
 - **VM-only hosting model**. `start.ps1` / `start.sh` rewritten (Apr 2026) to provision and drive a dedicated Azure VM. The legacy local-Docker launchers are kept as `start-local.ps1` / `start-local.sh` for reference but are not the supported flow.
 - **Copilot CLI reverse proxy via YARP `IHttpForwarder`**. `/copilot/*` is forwarded to the sidecar's ttyd; on the VM the sidecar is attached to the Hub's compose network with no host port publish.
 - **v32 sandbox + amd64 fixes (Apr 2026)** — closed the 8/8 saga on `azure-ai-travel-agents`:

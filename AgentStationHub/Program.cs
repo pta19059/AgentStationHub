@@ -216,11 +216,14 @@ builder.Services.AddSingleton<AgentStationHub.Services.Tools.FoundryAgentChatCli
 {
     var cfg = builder.Configuration;
     var http = sp.GetRequiredService<IHttpClientFactory>().CreateClient("FoundryAgentChat");
+    // Path B: delegate the whole turn to the Foundry hosted agent
+    // (AgentMicrosoftLearn) via the v2 Responses API. ProjectEndpoint
+    // is the project-level URL `https://<resource>.services.ai.azure.com/api/projects/<project>`;
+    // AgentName is the resolvable agent name in the same project.
     return new AgentStationHub.Services.Tools.FoundryAgentChatClient(
         http,
-        openAiEndpoint:    cfg["Foundry:ChatAgent:OpenAiEndpoint"],
-        deployment:        cfg["Foundry:ChatAgent:Deployment"],
-        learnToolUrl:      cfg["Foundry:ChatAgent:LearnToolUrl"],
+        projectEndpoint:   cfg["Foundry:ChatAgent:ProjectEndpoint"],
+        agentName:         cfg["Foundry:ChatAgent:AgentName"],
         tenantId:          cfg["AzureOpenAI:TenantId"],
         assistantIdLabel:  cfg["Foundry:ChatAgent:AssistantId"]);
 });

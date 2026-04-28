@@ -54,3 +54,5 @@ local-*
 # 'git status' clean when the workspace is opened with different IDEs.
 docker-desktop-diagnostics/
 .azure
+sync.tar
+
