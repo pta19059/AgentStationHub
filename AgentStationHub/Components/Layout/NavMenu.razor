@@ -46,6 +46,16 @@
                 <span class="bi bi-list-nested-nav-menu" aria-hidden="true"></span> Azure AI Toolkit
             </NavLink>
         </div>
+
+        @* Sign-out link. Plain anchor (not NavLink) because /logout is a
+           server-side endpoint that returns a redirect — Blazor's
+           SPA-style NavLink would intercept the click and try to
+           render it as a route. *@
+        <div class="nav-item px-3 mt-auto">
+            <a class="nav-link" href="/logout">
+                <span class="bi bi-list-nested-nav-menu" aria-hidden="true"></span> Sign out
+            </a>
+        </div>
     </nav>
 </div>
 

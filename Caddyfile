@@ -35,15 +35,11 @@
     # untouched by `encode`, so this is purely a win for HTML/JS/CSS.
     encode gzip zstd
 
-    # Basic auth gate. The hash is bcrypt, generated once with
-    # `caddy hash-password --plaintext '<pw>'` on the VM and stored
-    # in the .env as BASIC_AUTH_HASH. Username is "demo" (or whatever
-    # BASIC_AUTH_USER is set to). Anyone hitting any path on the site
-    # — including the SignalR negotiate, /copilot/* websocket and
-    # static assets — has to clear this challenge first.
-    basic_auth {
-        {$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
-    }
+    # NOTE: basic_auth removed. The Hub now ships its own /login page
+    # backed by ASP.NET Core cookie auth (see Services/Security/SimpleAuth.cs).
+    # Caddy keeps doing TLS termination + reverse proxy + security
+    # headers, but the credential check happens inside the app so we
+    # get a branded form, friendly error messages and a real /logout.
 
     # Reverse-proxy everything to the app container on its internal
     # port. The compose service name `agentichub` resolves over the
