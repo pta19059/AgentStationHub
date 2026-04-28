@@ -72,6 +72,14 @@ public static class PlanValidator
         if (step.WorkingDirectory.Contains("..") || Path.IsPathRooted(step.WorkingDirectory))
             return (false, "Working directory must be relative and inside workdir.");
 
+        // Correctness guard (separate from the security blacklist above):
+        // catches LLM-emitted patterns that are structurally guaranteed
+        // to fail or hang (e.g. `az resource wait --created --name <hardcoded>`
+        // for a resource that will never exist). See CommandSafetyGuard.
+        var corr = CommandSafetyGuard.Validate(cmd);
+        if (corr is not null)
+            return (false, $"[{corr.Code}] {corr.Reason}");
+
         return (true, null);
     }
 
