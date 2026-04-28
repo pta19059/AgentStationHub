@@ -18,7 +18,18 @@ public enum DeploymentStatus
     /// tutorial, pure library, docs site). Different from Failed � the
     /// pipeline did its job, the repo simply doesn't have anything to run.
     /// </summary>
-    NotDeployable
+    NotDeployable,
+    /// <summary>
+    /// Terminal state: the Doctor (in-sandbox or hosted Foundry) emitted an
+    /// [Escalate] verdict. The repository IS a deployment target, but the
+    /// failure is rooted in the repo source itself (missing azure.yaml,
+    /// broken Bicep, corrupt lockfile, ...) and cannot be patched from
+    /// inside the sandbox. Different from Failed: the pipeline did its job
+    /// and correctly identified that the next move is on the user (open a
+    /// PR on the source repo, or pick a different sample). The UI surfaces
+    /// this as an INFO alert, not a red error box.
+    /// </summary>
+    BlockedNeedsHumanOrSourceFix
 }
 
 public sealed record DeploymentStep(
