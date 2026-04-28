@@ -2,7 +2,7 @@
 
 A Blazor Server (.NET 8) application — hosted on a dedicated Azure VM — that ties together three operator surfaces:
 
-1. **Hub / Agentic Deploy** — paste a GitHub repo URL, an AI agent team builds a deployment plan inside a Docker sandbox, you approve it, the orchestrator executes it end-to-end against your Azure subscription with live logs streamed via SignalR.
+1. **Hub / Agentic Deploy** — a curated catalog of public Azure AI agent samples plus a *Scan the web* button that queries the GitHub Search API and grows the catalog at runtime. Click **Agentic Deploy** on any card and an AI agent team builds a deployment plan inside a Docker sandbox; you approve it; the orchestrator executes it end-to-end against your Azure subscription with live logs streamed via SignalR. Arbitrary repo URLs (outside the catalog) are accepted only via the debug HTTP API.
 2. **Agent Learn** — a floating MS-logo avatar opens an in-app chat that recommends Microsoft Learn modules, paths, certifications, exams and instructor-led courses, powered by Azure OpenAI `gpt-4.1-mini` + a Logic App tool that proxies the live Microsoft Learn catalog.
 3. **GitHub Copilot CLI** — a floating launcher pill embeds a real terminal (ttyd) attached to a long-lived sidecar container, reverse-proxied through the Hub's port 8080.
 
@@ -61,7 +61,7 @@ AgentStationHub/
 │   ├── Layout/MainLayout.razor                NavMenu + AgentChatPanel + CopilotLauncher overlays
 │   ├── Layout/NavMenu.razor
 │   ├── Pages/Home.razor                       Landing page
-│   ├── Pages/Hub.razor                        Agentic Deploy entry (region picker + repo URL + samples)
+│   ├── Pages/Hub.razor                        Agentic Deploy entry (catalog cards, search/category/target filters, region picker, "Scan the web")
 │   ├── Pages/Toolkit.razor                    AI Toolkit info surface
 │   ├── DeploymentModal.razor                  Live plan checklist + log + approve/cancel
 │   ├── AgentChatPanel.razor                   Floating MS-logo chat (Agent Learn)
@@ -109,7 +109,15 @@ AgentStationHub.DoctorAgent/
 
 ## Agentic Deploy
 
-The Hub page (`/hub`) lists curated samples and a free-form repo URL input + Azure region dropdown. Clicking **Agentic Deploy** drives `DeploymentOrchestrator` through seven phases. Live logs and the plan checklist stream into [`DeploymentModal.razor`](AgentStationHub/Components/DeploymentModal.razor) over SignalR (`/hubs/deployment`).
+The Hub page (`/hub`) shows a curated catalog of public Azure AI agent repositories as cards. Filters narrow the catalog by free-text search, `AgentCategory` (Medical / Legal / Financial / Customer Service / Human Resources / Education / Retail / …) and `DeploymentTarget` (Copilot Studio / Azure AI Foundry / Both). A region dropdown picks the Azure location used by the deploy. The **Scan the web** button calls [`AgentCatalogService.ScanAsync`](AgentStationHub/Services/AgentCatalogService.cs), which fans out a list of curated GitHub Search queries (`search/repositories?q=...&sort=stars`), filters relevant hits, and persists new entries to the `agentichub-state` named volume so they survive restarts. Each card exposes:
+
+- **Agentic Deploy** — hands `agent.GitHubUrl` + the selected region to `DeploymentModal.OpenAsync`, which kicks off the seven-phase orchestrator described below.
+- **Open ARM template** (when the catalog entry has `DeployToAzureUrl`) — opens the one-click Deploy-to-Azure URL in a new tab.
+- **Open in Copilot Studio** (when the entry targets Copilot Studio) — opens Copilot Studio so the operator can import the solution manually.
+
+Arbitrary repo URLs that are NOT in the catalog can be deployed via the [debug HTTP API](#debug-http-api) (`POST /api/debug/deploy/start`).
+
+Live logs and the plan checklist stream into [`DeploymentModal.razor`](AgentStationHub/Components/DeploymentModal.razor) over SignalR (`/hubs/deployment`). The orchestrator drives seven phases:
 
 ### Phases
 
@@ -308,6 +316,7 @@ The Hub's port 8080 is `127.0.0.1`-only on the VM. Three unauthenticated debug e
 
 ## Recent changes
 
+- **README accuracy pass** — corrected the Hub UX description: there is no free-form "paste a repo URL" input, the Hub is a curated catalog with filters and a *Scan the web* growth path; arbitrary URLs go through the debug API. Project layout updated accordingly. The `?` badge in the nav opens an `/about` page that renders this README at runtime via Markdig.
 - **Agent Learn — floating chat avatar in the Hub sidebar** ([`AgentChatPanel.razor`](AgentStationHub/Components/AgentChatPanel.razor), [`FoundryAgentChatClient.cs`](AgentStationHub/Services/Tools/FoundryAgentChatClient.cs), wiring in [`Program.cs`](AgentStationHub/Program.cs)). MS-logo avatar opens a chat powered by Azure OpenAI `gpt-4.1-mini-1` with a single function-calling tool (`get_learning_content`) that fetches the live Microsoft Learn catalog through Logic App Standard `logicapp-090730`. Foundry V2 Responses returned 404 on cluster `hyena-swedencentral-02` (preview), so the agent runs in-process via the chat-completions data plane on the AgenticStationFoundry account. `?` tooltip next to the title surfaces the architecture summary inline.
 - **VM-only hosting model**. `start.ps1` / `start.sh` rewritten (Apr 2026) to provision and drive a dedicated Azure VM. The legacy local-Docker launchers are kept as `start-local.ps1` / `start-local.sh` for reference but are not the supported flow.
 - **Copilot CLI reverse proxy via YARP `IHttpForwarder`**. `/copilot/*` is forwarded to the sidecar's ttyd; on the VM the sidecar is attached to the Hub's compose network with no host port publish.
