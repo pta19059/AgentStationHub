@@ -52,6 +52,19 @@ public static class GitTool
 
             Repository.Clone(repoUrl, workDir, opts);
 
+            // Pull in any git submodules. Some samples in the catalog
+            // (notably Azure/GPT-RAG, whose entire `infra/` Bicep stack
+            // lives in `Azure/bicep-ptn-aiml-landing-zone` declared as a
+            // submodule) are completely undeployable without this — the
+            // top-level clone leaves `infra/` empty, and the planner then
+            // chooses an `azd up` path that fails at provision-time with
+            // a missing main.bicep. LibGit2Sharp doesn't expose a
+            // RecurseSubmodules flag on CloneOptions, so we walk the
+            // submodule list explicitly after the parent clone has
+            // finished. Best-effort: a private submodule we can't read
+            // is logged and skipped instead of failing the whole clone.
+            UpdateSubmodules(workDir, onProgress, ct);
+
             // LibGit2Sharp (like git-for-windows with core.autocrlf=true) may
             // have converted LF -> CRLF on checkout. When the workspace is
             // later bind-mounted into a Linux container, shell scripts whose
@@ -62,6 +75,41 @@ public static class GitTool
             // 'azd' hooks and similar scripts run correctly.
             NormalizeShellScripts(workDir, onProgress);
         }, ct);
+
+    private static void UpdateSubmodules(
+        string workDir, Action<string>? onProgress, CancellationToken ct)
+    {
+        try
+        {
+            using var repo = new Repository(workDir);
+            var subs = repo.Submodules.ToList();
+            if (subs.Count == 0) return;
+
+            onProgress?.Invoke($"submodules: {subs.Count} declared, initialising...");
+            foreach (var sub in subs)
+            {
+                if (ct.IsCancellationRequested) return;
+                try
+                {
+                    repo.Submodules.Update(
+                        sub.Name,
+                        new SubmoduleUpdateOptions { Init = true });
+                    onProgress?.Invoke($"  • submodule '{sub.Name}' -> {sub.Path}");
+                }
+                catch (Exception subEx)
+                {
+                    onProgress?.Invoke(
+                        $"  • submodule '{sub.Name}' FAILED ({subEx.GetType().Name}: " +
+                        $"{subEx.Message}) — continuing without it");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            onProgress?.Invoke(
+                $"submodule update skipped: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
 
     private static void NormalizeShellScripts(string workDir, Action<string>? onProgress)
     {
