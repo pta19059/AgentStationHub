@@ -209,7 +209,8 @@ public sealed class DeploymentOrchestrator
                     or DeploymentStatus.Failed
                     or DeploymentStatus.Cancelled
                     or DeploymentStatus.Rejected
-                    or DeploymentStatus.NotDeployable;
+                    or DeploymentStatus.NotDeployable
+                    or DeploymentStatus.BlockedNeedsHumanOrSourceFix;
 
                 if (!wasTerminal)
                 {
@@ -1590,7 +1591,22 @@ public sealed class DeploymentOrchestrator
                     }
                     else if (fix is { Kind: "give_up" })
                     {
-                        await Log(s, "err",
+                        // The Doctor walked away. Two flavours:
+                        //   (a) regular give_up — we failed and we don't
+                        //       know how to recover; surfaced as 'err'
+                        //       and the session ends Failed.
+                        //   (b) [Escalate] verdict — the repo source is
+                        //       the bug; the pipeline did its job and the
+                        //       next move is on the user. Surfaced as
+                        //       'info' (NOT 'err') and the session ends
+                        //       BlockedNeedsHumanOrSourceFix so the UI
+                        //       renders an info alert instead of the red
+                        //       'Deployment error' box.
+                        var isEscalate = !string.IsNullOrWhiteSpace(fix.Reasoning)
+                            && fix.Reasoning!.TrimStart().StartsWith("[Escalate]",
+                                StringComparison.OrdinalIgnoreCase);
+
+                        await Log(s, isEscalate ? "info" : "err",
                             $"Doctor gave up: {fix.Reasoning ?? "(no reason provided)"}",
                             step.Id);
 
@@ -1611,11 +1627,9 @@ public sealed class DeploymentOrchestrator
                         // BlockedNeedsHumanOrSourceFix signal so the user
                         // can either (a) apply a fix on the source repo
                         // and retry, or (b) skip the offending service.
-                        if (!string.IsNullOrWhiteSpace(fix.Reasoning)
-                            && fix.Reasoning.TrimStart().StartsWith("[Escalate]",
-                                StringComparison.OrdinalIgnoreCase))
+                        if (isEscalate)
                         {
-                            await Log(s, "err",
+                            await Log(s, "info",
                                 "Doctor emitted an [Escalate] verdict: the failure is in the " +
                                 "repository source and cannot be patched from inside the sandbox. " +
                                 "Apply the proposed fix on the repo (PR / commit) and retry the " +
@@ -1624,7 +1638,7 @@ public sealed class DeploymentOrchestrator
                             s.ErrorMessage =
                                 $"BlockedNeedsHumanOrSourceFix: step #{step.Id} " +
                                 $"'{step.Description}' — {fix.Reasoning}";
-                            await SetStatus(s, DeploymentStatus.Failed);
+                            await SetStatus(s, DeploymentStatus.BlockedNeedsHumanOrSourceFix);
                             return;
                         }
                     }

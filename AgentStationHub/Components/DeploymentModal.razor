@@ -160,6 +160,24 @@
                     </div>
                 </div>
             }
+            else if (_status == "BlockedNeedsHumanOrSourceFix")
+            {
+                <div class="alert alert-info mt-3 d-flex align-items-start">
+                    <i class="bi bi-info-circle-fill fs-4 me-2"></i>
+                    <div>
+                        <strong>Deployment blocked — needs a fix on the source repo</strong>
+                        <div class="small mt-1">@_error</div>
+                        <div class="small mt-2 text-muted">
+                            <i class="bi bi-lightbulb me-1"></i>
+                            The Doctor determined the failure is rooted in the
+                            repository itself (e.g. missing <code>azure.yaml</code>,
+                            broken Bicep, corrupt lockfile). Open a PR on
+                            <code>@_repoShort</code> with the proposed fix and retry
+                            the deploy, or pick a different sample.
+                        </div>
+                    </div>
+                </div>
+            }
             else
             {
                 <div class="alert alert-danger mt-3 d-flex align-items-start">
@@ -525,7 +543,8 @@
                  or "Failed"
                  or "Cancelled"
                  or "Rejected"
-                 or "NotDeployable";
+                 or "NotDeployable"
+                 or "BlockedNeedsHumanOrSourceFix";
 
     public async ValueTask DisposeAsync()
     {
@@ -578,6 +597,16 @@
             var planningIdx = Array.IndexOf(_stages, "Planning");
             if (order < planningIdx) return "done";
             if (order == planningIdx) return "done";
+            return "";
+        }
+        // BlockedNeedsHumanOrSourceFix is also informational (the Doctor
+        // correctly identified the next move is on the user). Reached
+        // from inside Executing, so mark every stage up to and including
+        // Executing as done; later stages stay neutral.
+        if (_status == "BlockedNeedsHumanOrSourceFix")
+        {
+            var execIdx = Array.IndexOf(_stages, "Executing");
+            if (order <= execIdx) return "done";
             return "";
         }
         // When the final stage is reached (Succeeded is a terminal state,
