@@ -1,0 +1,85 @@
+# =============================================================================
+# Caddy v2 reverse-proxy in front of the AgentStationHub app.
+#
+# Why Caddy (not nginx / Apache / App Gateway):
+# - Automatic Let's Encrypt TLS via the HTTP-01 challenge — zero
+#   certbot cron, zero renew scripts, zero PEM management. Just point
+#   the FQDN at the public IP and Caddy obtains + renews the cert.
+# - Built-in WebSocket support (the Hub uses Blazor Server SignalR over
+#   WS, plus the embedded ttyd terminal at /copilot/* speaks raw WS).
+# - Built-in HTTP basic_auth — enough to keep the public demo behind a
+#   login wall without standing up an OIDC stack.
+#
+# This file is the SINGLE source of truth for the public surface.
+# The app container no longer publishes :8080 on the host (see
+# docker-compose.yml) so the only way in from the public Internet is
+# port 80/443 → Caddy → agentichub:8080 over the internal docker
+# network. Even if basic_auth is disabled, you can never bypass Caddy.
+# =============================================================================
+
+# Global options block — applies to every site below.
+{
+    # The email address Let's Encrypt uses to contact us about certs
+    # that fail to renew. Pulled from .env so we don't have to bake a
+    # personal address into a public repo.
+    email {$CADDY_ACME_EMAIL}
+}
+
+# Public site. {$PUBLIC_FQDN} comes from the .env on the VM (e.g.
+# `agentichub-host.eastus2.cloudapp.azure.com`). Caddy detects the
+# trailing dot is a real DNS hostname (not localhost / IP) and
+# automatically provisions a Let's Encrypt cert via HTTP-01 on :80.
+{$PUBLIC_FQDN} {
+    # Enable on-the-wire compression for the Razor / static-asset
+    # responses. SignalR WebSocket frames are already binary and
+    # untouched by `encode`, so this is purely a win for HTML/JS/CSS.
+    encode gzip zstd
+
+    # Basic auth gate. The hash is bcrypt, generated once with
+    # `caddy hash-password --plaintext '<pw>'` on the VM and stored
+    # in the .env as BASIC_AUTH_HASH. Username is "demo" (or whatever
+    # BASIC_AUTH_USER is set to). Anyone hitting any path on the site
+    # — including the SignalR negotiate, /copilot/* websocket and
+    # static assets — has to clear this challenge first.
+    basic_auth {
+        {$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+    }
+
+    # Reverse-proxy everything to the app container on its internal
+    # port. The compose service name `agentichub` resolves over the
+    # default bridge network. `flush_interval -1` is required to keep
+    # SignalR / Server-Sent-Events / ttyd streams from buffering and
+    # so the chat UI feels instant.
+    reverse_proxy agentichub:8080 {
+        flush_interval -1
+        # Tell ASP.NET Core / Blazor the original scheme + host so any
+        # absolute URL it builds (Set-Cookie domain, redirects, OAuth
+        # callbacks, …) reflects the public FQDN, not the docker
+        # network's `agentichub:8080`.
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Host  {host}
+        header_up X-Real-IP         {remote_host}
+    }
+
+    # Defensive headers: small, no false negatives, no perf cost.
+    # HSTS is only meaningful once we have a valid cert (which Caddy
+    # will obtain on first request) so it kicks in automatically.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options    "nosniff"
+        Referrer-Policy           "strict-origin-when-cross-origin"
+        # The Hub embeds an iframe to /copilot/, served by the same
+        # origin, so we don't need to allow any cross-origin frame
+        # ancestors. Block the rest.
+        X-Frame-Options           "SAMEORIGIN"
+        # Strip the nginx-style Server header Caddy emits by default.
+        -Server
+    }
+
+    # Access log to stdout so `docker logs caddy` shows every request.
+    # Per-route filters / sampling can be added later if it gets noisy.
+    log {
+        output stdout
+        format console
+    }
+}

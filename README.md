@@ -15,17 +15,21 @@ Validated end-to-end (Apr 2026): [`Azure-Samples/azure-ai-travel-agents`](https:
 The Hub runs **only on an Azure VM** that you provision once with [`start.ps1`](start.ps1) / [`start.sh`](start.sh). No laptop Docker Desktop, no nested containers on a developer machine.
 
 ```
-Operator browser ──HTTPS──► Azure VM (agentichub-host, Standard_D2as_v6, Ubuntu)
+Operator browser ──HTTPS──► https://agentichub-host.eastus2.cloudapp.azure.com
+                            │   (Let's Encrypt cert, HTTP basic auth)
+                            ▼
+                            Azure VM (agentichub-host, Standard_D2as_v6, Ubuntu)
                             │
                             ├── docker compose up
-                            │     ├── agentichub-app   (Blazor :8080)
+                            │     ├── agentichub-caddy  (TLS terminator, :80/:443 public)
+                            │     ├── agentichub-app    (Blazor :8080, internal-only)
                             │     └── agentichub-copilot-cli (ttyd sidecar)
                             │
                             └── Sibling sandbox containers spawned per deploy
                                   via /var/run/docker.sock (DooD)
 ```
 
-- VM lives in resource group `rg-agentichub-host` in `eastus2`. NSG opens 22 + 8080 to your **current public IP only** (refreshed on every `start.ps1` run via `api.ipify.org`).
+- VM lives in resource group `rg-agentichub-host` in `eastus2`. The public surface is **TCP 443 (HTTPS) + TCP 80 (Let's Encrypt HTTP-01 challenge only)** open to `*`, plus TCP 22 to your current public IP/24. Port `8080` is **not** mapped to the host — Caddy is the only thing that talks to the Hub, over the internal docker network. See [Public access & TLS](#public-access--tls).
 - `start.ps1` is idempotent: starts the VM if deallocated, syncs the repo + `.env` + `~/.azure` profile, runs `docker compose up -d --force-recreate`, probes `http://<vm-ip>:8080/`, opens the browser.
 - `stop.ps1` deallocates the VM (compute billing stops; OS disk + IP remain ~\$3-5/month). `stop.ps1 -Destroy` deletes the whole RG.
 - One-time bootstrap: `pwsh .\start.ps1 -Bootstrap` creates the VM, the SSH key (`~/.ssh/agentichub-host`), the system-assigned identity, and bootstraps Docker CE + `docker compose` + Azure CLI on the VM.
@@ -274,12 +278,55 @@ Read by `docker-compose.yml`. Notably:
 
 - `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_TENANT_ID` — when set, `DefaultAzureCredential` inside the container picks up the SP (`ash-doctor-orchestrator`) instead of the VM's system-assigned MI.
 - `FOUNDRY_USE_FOUNDRY_DOCTOR=true` and `FOUNDRY_DOCTOR_AGENT_ENDPOINT=...` — enable the Foundry Hosted Doctor.
+- `PUBLIC_FQDN` — public hostname Caddy will request a Let's Encrypt cert for. Defaults to `agentichub-host.eastus2.cloudapp.azure.com` (Azure-provided FQDN attached to the VM's public IP).
+- `BASIC_AUTH_USER` / `BASIC_AUTH_HASH` — the single account that gates the public surface. The hash is bcrypt and **must have its `$` signs escaped to `$$`** in `.env` so docker-compose interpolation leaves it intact (compose treats `$` as a variable). Generate it on the VM with `sudo docker run --rm caddy:2-alpine caddy hash-password --plaintext '<password>'`.
+- `CADDY_ACME_EMAIL` — contact for the ACME account. Must be a syntactically valid email with a public TLD; Let's Encrypt rejects `.local`. Using something like `admin@<PUBLIC_FQDN>` works.
+
+---
+
+## Public access & TLS
+
+The VM is reachable from the open internet at **`https://agentichub-host.eastus2.cloudapp.azure.com`** behind a [Caddy v2](https://caddyserver.com/) reverse proxy. The full posture is:
+
+```
+Internet ──► NSG (TCP 443 + 80 from *, TCP 22 from your /24)
+        ──► VM eth0
+        ──► docker host:443/80
+        ──► agentichub-caddy (TLS termination + HTTP basic auth)
+        ──► docker network ──► agentichub-app:8080  (no host port published)
+```
+
+What this gives us:
+
+- **Auto-TLS via Let's Encrypt HTTP-01.** Caddy provisions and renews the cert with no manual step, persisting account key + chain in the named volumes `agentichub-caddy-data` / `agentichub-caddy-config`. ZeroSSL is the configured fallback.
+- **HTTP basic auth at the edge.** Anything other than `/.well-known/acme-challenge/*` returns `401` until the user provides credentials. Caddy validates a single bcrypt hash kept in `.env` (gitignored). The Blazor app itself stays untouched and continues to assume "trusted operator" semantics.
+- **Hub origin not exposed.** `agentichub-app` declares `expose: ["8080"]` instead of `ports:`, so 8080 is not bound on the host. The only path to the Hub is via Caddy on the same docker network. The `agentichub-copilot-cli` sidecar continues to be attached to the same network — `/copilot/*` is YARP-forwarded inside the Hub, so the same edge auth applies to the terminal too.
+- **Hardening headers.** [`Caddyfile`](Caddyfile) sets HSTS (`max-age=63072000; includeSubDomains; preload`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: SAMEORIGIN`, removes the `Server` header, and enables gzip + zstd encoding.
+- **HTTP→HTTPS 308 redirect** is automatic. Plain HTTP only stays open so the ACME HTTP-01 challenge can complete.
+
+NSG layout in `rg-agentichub-host` / `agentichub-hostNSG`:
+
+| Rule | Priority | Source | Dest port | Purpose |
+|---|---|---|---|---|
+| `AllowSshFromMyIp` | 1010 | your `/24` | 22 | SSH (refreshed by `start.ps1`) |
+| `AllowHTTP` | 1020 | `*` | 80 | Let's Encrypt HTTP-01 + 308 to HTTPS |
+| `AllowHTTPS` | 1030 | `*` | 443 | Public app traffic (basic-auth gated) |
+
+Credentials are not in the repo. They live only in `~/agentichub/.env` on the VM. To rotate, regenerate the bcrypt hash and `sudo docker compose up -d --force-recreate --no-deps caddy`.
+
+Smoke test from any machine:
+```
+curl -I https://agentichub-host.eastus2.cloudapp.azure.com/                # 401
+curl -u <user>:<pass> -I https://agentichub-host.eastus2.cloudapp.azure.com/  # 200/302
+```
+
+Files involved: [`Caddyfile`](Caddyfile), [`docker-compose.yml`](docker-compose.yml) (`caddy` service + `caddy-data` / `caddy-config` volumes).
 
 ---
 
 ## Debug HTTP API
 
-The Hub's port 8080 is `127.0.0.1`-only on the VM. Three unauthenticated debug endpoints help autopilot scripts drive deploys without the Blazor UI:
+The Hub's port 8080 is bound only to the internal docker network (no host publish), so these endpoints are only reachable from inside the VM (e.g. via `docker exec` or by going through Caddy with basic auth). Three unauthenticated debug endpoints help autopilot scripts drive deploys without the Blazor UI:
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
