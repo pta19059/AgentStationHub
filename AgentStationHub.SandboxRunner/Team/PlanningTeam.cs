@@ -674,6 +674,19 @@ public sealed class PlanningTeam
               Do NOT use 'yes y |' / 'echo y |' pipelines (the validator
               rejects '| bash' patterns).
 
+          � "Cannot find module '/workspace/<helper>.js'" / MODULE_NOT_FOUND
+            on a name like 'relocate-node-modules' / 'agentic-*' / etc.
+            (the Strategist mistakenly wrapped a SHELL helper in 'node ...js')
+            ? Helpers like `relocate-node-modules`, `relocate-venv`,
+              `agentic-azd-up`, `agentic-acr-build`, `agentic-bicep`, ...
+              are SHELL binaries on PATH (/usr/local/bin), NOT Node.js
+              modules. EMIT a `replace_step` that drops the 'node' prefix
+              and the '.js' suffix:
+                WRONG: node relocate-node-modules.js /workspace
+                RIGHT: relocate-node-modules /workspace
+              Do NOT add `npm install <helper>` � the helper is not on
+              npm. Do NOT try to recover by symlinking into /workspace.
+
           � OSCILLATION DETECTION � HARD STOP
             If the REGION TRIAL HISTORY shows you are about to propose a
             region whose combination of (region, error signature) is
@@ -2061,6 +2074,15 @@ public sealed class PlanningTeam
             sb.AppendLine("  No bash wrapping, no quoting, no variables — emit the command");
             sb.AppendLine("  exactly as shown. The helper is idempotent and safe to call");
             sb.AppendLine("  even when no package.json is present.");
+            sb.AppendLine("  CRITICAL: 'relocate-node-modules' is a SHELL helper baked into");
+            sb.AppendLine("  /usr/local/bin of the sandbox image — it is NOT a Node.js script");
+            sb.AppendLine("  in the repo. NEVER prefix it with 'node ' and NEVER append '.js'.");
+            sb.AppendLine("  WRONG (will fail with 'Cannot find module /workspace/relocate-node-modules.js'):");
+            sb.AppendLine("    node relocate-node-modules.js /workspace");
+            sb.AppendLine("  RIGHT:");
+            sb.AppendLine("    relocate-node-modules /workspace");
+            sb.AppendLine("  The same applies to ALL agentic-* / relocate-* helpers — they are");
+            sb.AppendLine("  single-token commands on PATH, never invoked through 'node' or 'bash -lc'.");
             sb.AppendLine();
             sb.AppendLine("  This is INVISIBLE to npm/azd (they see node_modules where they");
             sb.AppendLine("  expect it) but the actual files live on /tmp where the exec bit");

@@ -93,13 +93,22 @@ public sealed class FoundryDoctorClient
         // as '.../agents/<name>/endpoint' (which is the value emitted by
         // the Foundry portal "agent endpoint URL" copy-button) gets
         // doubled into '/endpoint/endpoint/protocols/invocations' and
-        // the call returns 404.
-        if (path.EndsWith("/endpoint/protocols/invocations", StringComparison.OrdinalIgnoreCase))
-            path = path[..^"/endpoint/protocols/invocations".Length];
-        else if (path.EndsWith("/invocations", StringComparison.OrdinalIgnoreCase))
-            path = path[..^"/invocations".Length];
-        else if (path.EndsWith("/endpoint", StringComparison.OrdinalIgnoreCase))
-            path = path[..^"/endpoint".Length];
+        // the call returns 404. We loop because some misconfigured env
+        // vars are ALREADY doubled (e.g. '.../endpoint/endpoint/protocols/invocations'):
+        // a single strip would leave a trailing '/endpoint' that the
+        // re-append step duplicates again.
+        bool stripped;
+        do
+        {
+            stripped = false;
+            if (path.EndsWith("/endpoint/protocols/invocations", StringComparison.OrdinalIgnoreCase))
+            { path = path[..^"/endpoint/protocols/invocations".Length]; stripped = true; }
+            else if (path.EndsWith("/invocations", StringComparison.OrdinalIgnoreCase))
+            { path = path[..^"/invocations".Length]; stripped = true; }
+            else if (path.EndsWith("/endpoint", StringComparison.OrdinalIgnoreCase))
+            { path = path[..^"/endpoint".Length]; stripped = true; }
+            path = path.TrimEnd('/');
+        } while (stripped);
 
         // Drop /versions/{n} � the platform routes traffic across versions
         // automatically; pinning a specific version on the data-plane
