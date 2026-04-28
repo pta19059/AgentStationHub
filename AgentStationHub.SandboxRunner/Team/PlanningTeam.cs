@@ -608,6 +608,22 @@ public sealed class PlanningTeam
               prep step; otherwise the next 'azd up' will hit
               'InvalidResourceLocation: resource already exists in location X'.
 
+          � "ServiceUnavailable" + "high demand in <region> region for the
+            zonal redundant" / "Availability Zones" (Cosmos DB capacity)
+            ? Azure Cosmos DB cannot fulfil a zone-redundant account in
+              that region right now. The fastest, repo-local fix is to
+              DROP the zone-redundancy flag from the Bicep template and
+              retry � Cosmos remains highly available without zone
+              redundancy. Emit a sed prep step that flips
+              `isZoneRedundant: true` to `isZoneRedundant: false` (and
+              `zoneRedundant: true` -> `false`) across the bicep tree:
+                find . -type f \( -name '*.bicep' -o -name '*.bicepparam' \) \
+                  -exec sed -i -E 's/(is)?[Zz]oneRedundant[[:space:]]*:[[:space:]]*true/\1zoneRedundant: false/g' {} +
+              followed by re-running the same `az deployment group create`
+              step. ONLY consider switching to a different region (e.g.
+              westus3, swedencentral) if the same fix has already been
+              tried in PREVIOUS ATTEMPTS for this signature.
+
           � "InvalidResourceLocation" / "already exists in location X. A
             resource with the same name cannot be created in location Y"
             (partial state from a cancelled / failed provision)
