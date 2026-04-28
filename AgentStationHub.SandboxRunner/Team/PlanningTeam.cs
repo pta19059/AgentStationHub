@@ -662,6 +662,28 @@ public sealed class PlanningTeam
                    2. azd env set AZURE_LOCATION <Y>
               NEVER propose option (b) without the az group delete first.
 
+          � "Could not connect to the registry login server '<name>.azurecr.io'"
+            / "registry exists and the URL '<...>.azurecr.io' is reachable" /
+            ACR login failed because the registry name is wrong (the Bicep
+            template added a deterministic random suffix the Strategist
+            could not predict, e.g. real name `aiinvestacrtnggmxliptxjw`
+            but the step used `aiinvest`)
+            ? DO NOT emit `az acr wait` or `az resource wait --created` �
+              the named resource does not exist and `az resource wait`
+              will block for up to an hour. EMIT `kind="insert_before"`
+              with a NEW step that QUERIES the actual registry login
+              server from the resource group and exports it to a known
+              file the next step can `source`:
+                bash -c 'set -e; rg=<rg>; loginServer=$(az acr list -g "$rg" --query "[0].loginServer" -o tsv); echo "ACR_LOGIN_SERVER=$loginServer" > /workspace/.acr-env; echo "ACR_NAME=${loginServer%%.*}" >> /workspace/.acr-env; cat /workspace/.acr-env'
+              Then emit a `replace_step` for the failing build/push step
+              that sources the file and substitutes the real registry:
+                bash -c 'set -e; . /workspace/.acr-env; bash infra/2-build-and-push-images.sh -r "$ACR_LOGIN_SERVER"'
+              (use the `-r` flag the script's getopts documents). The
+              same pattern applies to `infra/3-deploy-apps.sh -g <rg>` �
+              source `/workspace/.acr-env` first if the script needs the
+              registry name. NEVER hardcode the random suffix; ALWAYS
+              query Azure for the actual name in the resource group.
+
           � "InvalidTemplate" with "allowed value(s)" list
             ? The new AZURE_LOCATION MUST be a member of the BICEP
               TEMPLATE ALLOWED REGIONS list included in this input.
