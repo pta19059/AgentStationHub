@@ -866,6 +866,31 @@ public sealed class DeploymentOrchestrator
                         ? TimeSpan.FromMinutes(Math.Max(60, _opt.StepSilenceBudget.TotalMinutes))
                         : _opt.StepSilenceBudget;
 
+                    // Fragile-wait override: `az resource wait --created`
+                    // and `az group wait --created` legitimately produce
+                    // ZERO output for their entire run. With the default
+                    // 15-minute silence budget that is fine, but when
+                    // the --name has been guessed wrong (a recurring
+                    // failure mode for Bicep templates that suffix names
+                    // with a uniqueString hash) the command sits silent
+                    // for its full 60-minute Azure-side cap, wedging
+                    // the entire deploy. Cap such commands at 4 minutes
+                    // of silence — long enough for legitimate
+                    // provisioning waits (ACR, Cosmos, KV typically
+                    // settle in <2 min once ARM has the request) but
+                    // short enough that a wrong-name wait can't burn
+                    // an hour. Note: CommandSafetyGuard already blocks
+                    // the obvious cases up-front; this is the secondary
+                    // defence for dynamic / variable-substituted forms
+                    // the regex cannot statically catch.
+                    if (System.Text.RegularExpressions.Regex.IsMatch(
+                            sbCmdLower,
+                            @"\baz\s+(resource|group|deployment)\s+wait\b.*--(created|exists|deleted)"))
+                    {
+                        var fragileCap = TimeSpan.FromMinutes(4);
+                        if (stepSilence > fragileCap) stepSilence = fragileCap;
+                    }
+
                     result = await docker.RunAsync(
                         commandToRun, step.WorkingDirectory,
                         env, stepTimeout, ct,
@@ -1491,6 +1516,36 @@ public sealed class DeploymentOrchestrator
                                 $"step {step.Id} [{SummariseErrorSignature(stepTail)}] REJECTED_DUP: " +
                                 Truncate(fix.NewSteps[0].Command, 100));
                             fix = null;
+                        }
+
+                        // Correctness guard: reject Doctor remediations
+                        // that emit known-broken patterns (e.g.
+                        // `az resource wait --created --name <hardcoded>`
+                        // that will hang for 60 minutes, or `az acr wait`
+                        // which is not a valid subcommand). Surface the
+                        // violation Code in PREVIOUS_ATTEMPTS so the
+                        // next Doctor pass sees WHY and pivots, instead
+                        // of wasting a slot executing the broken step.
+                        if (fix is not null)
+                        {
+                            AgentStationHub.Services.Security.CommandSafetyGuard.Violation? guardHit = null;
+                            foreach (var ns in fix.NewSteps)
+                            {
+                                guardHit = AgentStationHub.Services.Security.CommandSafetyGuard.Validate(ns.Command);
+                                if (guardHit is not null) break;
+                            }
+                            if (guardHit is not null)
+                            {
+                                await Log(s, "warn",
+                                    $"Rejected Doctor remediation: [{guardHit.Code}] {guardHit.Reason} " +
+                                    "Re-invoking Doctor with this attempt recorded so it pivots.",
+                                    step.Id);
+                                previousAttempts.Add(
+                                    $"step {step.Id} [{SummariseErrorSignature(stepTail)}] " +
+                                    $"REJECTED_GUARD[{guardHit.Code}]: " +
+                                    Truncate(fix.NewSteps[0].Command, 100));
+                                fix = null;
+                            }
                         }
                     }
 
