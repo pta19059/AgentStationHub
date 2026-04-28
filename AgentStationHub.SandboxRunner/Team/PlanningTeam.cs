@@ -634,6 +634,22 @@ public sealed class PlanningTeam
               fix has already been tried in PREVIOUS ATTEMPTS for this
               signature.
 
+          � "BadRequest" + "DatabaseAccount <name> is in a failed
+            provisioning state" + "Please delete the previous instance
+            before attempting to recreate this account" (Cosmos DB
+            stuck-failed)
+            ? A previous Cosmos DB creation attempt left the account in
+              a terminal `Failed` provisioning state. Azure refuses to
+              re-create an account with the same name until the failed
+              one is purged. Emit `kind="insert_before"` with a NEW step
+              whose command queries and deletes ALL failed Cosmos accounts
+              in the resource group, then waits for the deletion:
+                bash -c 'rg=rg-<env>-agentichub; for name in $(az cosmosdb list -g "$rg" --query "[?provisioningState==\`Failed\`].name" -o tsv); do echo "Deleting failed Cosmos $name"; az cosmosdb delete -g "$rg" -n "$name" --yes; done'
+              (substitute the actual `-g <rg>` from the failing step's
+              command tail). Leave the failing `az deployment group create`
+              step UNCHANGED so it retries verbatim after the deletion.
+              NEVER fold the delete into a `replace_step` bash chain.
+
           � "InvalidResourceLocation" / "already exists in location X. A
             resource with the same name cannot be created in location Y"
             (partial state from a cancelled / failed provision)
