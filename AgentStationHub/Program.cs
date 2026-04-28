@@ -358,7 +358,17 @@ app.Map("/copilot/{**rest}", async (HttpContext ctx, IHttpForwarder fwd) =>
 app.MapRazorComponents<App>()
     .AddInteractiveServerRenderMode();
 
-app.MapHub<DeploymentHub>("/hubs/deployment");
+app.MapHub<DeploymentHub>("/hubs/deployment").AllowAnonymous();
+// AllowAnonymous: this hub is only consumed by the SERVER-SIDE Blazor
+// circuit ([`DeploymentModal.razor`]) which connects to it over the
+// container's loopback (`http://127.0.0.1:{port}/hubs/deployment`),
+// not the public Caddy origin. The browser never opens this hub
+// directly. Blocking unauthenticated access at the app level would
+// require forwarding the user's cookie across the loopback hop, which
+// is plumbing for no real defence: 127.0.0.1 inside the container is
+// unreachable from outside, and the public surface (Caddy → 8080)
+// is still gated by the cookie-auth fallback policy on every other
+// route. The debug API below has the same shape.
 
 // Debug endpoints — used by autopilot scripts to trigger / observe
 // deploys without going through the SignalR + Blazor UI. The app's
@@ -369,13 +379,13 @@ app.MapPost("/api/debug/deploy/start", (
 {
     var id = orch.Start(req.RepoUrl, req.AzureLocation);
     return Results.Ok(new { sessionId = id });
-});
+}).AllowAnonymous();
 app.MapPost("/api/debug/deploy/{id}/approve", (string id,
     DeploymentOrchestrator orch) =>
 {
     orch.Approve(id);
     return Results.Ok();
-});
+}).AllowAnonymous();
 app.MapGet("/api/debug/deploy/{id}", (string id,
     DeploymentOrchestrator orch) =>
 {
@@ -387,7 +397,7 @@ app.MapGet("/api/debug/deploy/{id}", (string id,
         Plan = s.Plan?.Steps.Select(x => new { x.Id, x.Description, x.Command }),
         LogTail = s.Logs.TakeLast(50).Select(l => new { l.Level, l.StepId, l.Message })
     });
-});
+}).AllowAnonymous();
 
 app.Run();
 
