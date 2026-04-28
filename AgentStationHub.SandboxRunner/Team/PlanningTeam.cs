@@ -1648,7 +1648,7 @@ public sealed class PlanningTeam
                     s.TryGetProperty("id", out var sIdEl) ? ReadIntTolerant(sIdEl, stepId) : stepId,
                     s.TryGetProperty("description", out var sDesc) ? sDesc.GetString() ?? "" : "",
                     s.TryGetProperty("cmd", out var sCmd) ? sCmd.GetString() ?? "" : "",
-                    s.TryGetProperty("cwd", out var sCwd) ? sCwd.GetString() ?? "." : ".")
+                    NormalizeCwd(s.TryGetProperty("cwd", out var sCwd) ? sCwd.GetString() : null))
                 {
                     ActionJson = actionJson
                 });
@@ -1684,6 +1684,47 @@ public sealed class PlanningTeam
             default:
                 return fallback;
         }
+    }
+
+    /// <summary>
+    /// Coerces an LLM-produced 'cwd' field into a value the host's
+    /// PlanValidator will accept. The validator rejects rooted paths and
+    /// any path containing '..'. The Strategist sometimes emits absolutes
+    /// like '/workspace', '/workspace/api-app', '~/repo', or sprinkles
+    /// '..' to climb directories. We strip the well-known sandbox prefix
+    /// and fall back to '.' on anything else suspicious. Without this
+    /// normalization the entire plan was rejected with
+    /// "Working directory must be relative and inside workdir" on Step 1
+    /// and the user lost the whole run.
+    /// </summary>
+    private static string NormalizeCwd(string? raw)
+    {
+        var v = (raw ?? ".").Trim();
+        if (string.IsNullOrEmpty(v)) return ".";
+        // Strip surrounding quotes if the LLM wrapped the path.
+        if (v.Length >= 2 && (v[0] == '"' || v[0] == '\'') && v[^1] == v[0])
+            v = v[1..^1].Trim();
+        if (string.IsNullOrEmpty(v)) return ".";
+        // Normalize backslashes the LLM may emit on Windows-style paths.
+        v = v.Replace('\\', '/');
+        // Drop trailing slash for a cleaner relative form.
+        while (v.Length > 1 && v.EndsWith('/')) v = v[..^1];
+        // Strip the well-known sandbox workdir prefixes.
+        foreach (var prefix in new[] { "/workspace/", "/workdir/", "/repo/", "/app/", "/home/agent/workspace/" })
+        {
+            if (v.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                v = v[prefix.Length..];
+                break;
+            }
+        }
+        // Bare workdir aliases collapse to '.'
+        if (v is "/workspace" or "/workdir" or "/repo" or "/app" or "~" or "/")
+            return ".";
+        // Anything still rooted, climbing, or containing '..' is unsafe -> '.'
+        if (v.Length == 0 || v.StartsWith('/') || v.StartsWith('~') || v.Contains(".."))
+            return ".";
+        return v;
     }
 
 
@@ -2097,6 +2138,16 @@ public sealed class PlanningTeam
         - If the relevant file lives in a subfolder, put that subfolder in
           the step's 'cwd' field instead of using 'cd' inside 'cmd'.
 
+        CWD FORMAT (HARD RULE)
+        - 'cwd' MUST be a RELATIVE path inside the cloned repo. Allowed:
+          '.', 'api-app', 'app/frontend', 'infra'. FORBIDDEN: '/workspace',
+          '/workspace/api-app', '/repo', '~', '..', '../api-app', or any
+          path that starts with '/' or '~' or contains '..'. The repo is
+          mounted at the working directory; the runner runs each step
+          there with no other context. Using an absolute path causes the
+          host validator to REJECT THE ENTIRE PLAN with
+          "Working directory must be relative and inside workdir."
+
         STRATEGY
         1. If 'azure.yaml' exists with services + Bicep/Terraform under
            infra/, use the three-step azd flow above. Ignore README prose
@@ -2213,7 +2264,7 @@ public sealed class PlanningTeam
                     s.TryGetProperty("id", out var id) ? ReadIntTolerant(id, steps.Count + 1) : steps.Count + 1,
                     s.TryGetProperty("description", out var d) ? d.GetString() ?? "" : "",
                     s.TryGetProperty("cmd", out var c) ? c.GetString() ?? "" : "",
-                    s.TryGetProperty("cwd", out var cwd) ? cwd.GetString() ?? "." : ".")
+                    NormalizeCwd(s.TryGetProperty("cwd", out var cwd) ? cwd.GetString() : null))
                 {
                     ActionJson = actionJson
                 });
