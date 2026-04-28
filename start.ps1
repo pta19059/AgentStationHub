@@ -246,10 +246,15 @@ if (-not $SkipSync) {
     Write-Info "Syncing repo from $repoRoot ..."
     Push-Location $repoRoot
     try {
+        # Hard-exclude .env and appsettings.Development.json from the repo
+        # archive: those files live ONLY on the VM (rotated independently of
+        # source) and a stray copy in the local checkout would otherwise
+        # silently overwrite the production secrets via this sync.
         tar -cf - `
             --exclude='*/bin/*' --exclude='*/obj/*' --exclude='.git' `
             --exclude='*/node_modules/*' --exclude='*.user' `
-            --exclude='azure-readonly' --exclude='*.log' . `
+            --exclude='azure-readonly' --exclude='*.log' `
+            --exclude='./.env' --exclude='**/appsettings.Development.json' . `
             | & ssh @sshOpts "$AdminUser@$ip" 'mkdir -p /home/azureuser/agentichub && cd /home/azureuser/agentichub && tar -xf -' `
             | Out-Null
     } finally { Pop-Location }
