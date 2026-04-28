@@ -20,8 +20,15 @@ services:
       dockerfile: Dockerfile
     image: agentichub/app:latest
     container_name: agentichub-app
-    ports:
-      - "8080:8080"
+    # NOTE: no `ports:` mapping. The app is reachable only through the
+    # `caddy` reverse proxy (which lives on the same docker network and
+    # resolves `agentichub:8080` by service name). This is the security
+    # boundary: the public Internet can hit 80/443 → Caddy → app, but
+    # never the app directly. Bare-metal `dotnet run` on dev machines
+    # still works because launchSettings.json publishes 5000/5001
+    # locally, separate from this compose graph.
+    expose:
+      - "8080"
     environment:
       ASPNETCORE_ENVIRONMENT: "Production"
       AzureOpenAI__Endpoint: "${AZURE_OPENAI_ENDPOINT}"
@@ -93,8 +100,45 @@ services:
     restart: unless-stopped
     hostname: agentichub
 
+  # =========================================================================
+  # Caddy v2 reverse proxy. Terminates TLS (Let's Encrypt, fully automatic),
+  # gates the public surface behind HTTP basic auth, and forwards everything
+  # to the `agentichub` service on the internal docker network. See the
+  # top-level `Caddyfile` for the routing logic and the README's "Public
+  # access & TLS" section for the full posture.
+  # =========================================================================
+  caddy:
+    image: caddy:2-alpine
+    container_name: agentichub-caddy
+    restart: unless-stopped
+    depends_on:
+      - agentichub
+    ports:
+      - "80:80"
+      - "443:443"
+      # QUIC / HTTP/3. Caddy advertises Alt-Svc only when this is open,
+      # so leaving it disabled is safe (clients fall back to HTTP/2).
+      - "443:443/udp"
+    environment:
+      # Pulled from the .env. Set BASIC_AUTH_HASH with:
+      #   docker run --rm caddy:2-alpine caddy hash-password --plaintext '<pw>'
+      PUBLIC_FQDN:       "${PUBLIC_FQDN}"
+      BASIC_AUTH_USER:   "${BASIC_AUTH_USER:-demo}"
+      BASIC_AUTH_HASH:   "${BASIC_AUTH_HASH}"
+      CADDY_ACME_EMAIL:  "${CADDY_ACME_EMAIL:-admin@example.com}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Persist the issued cert + ACME account key across recreates,
+      # otherwise we'd hit Let's Encrypt rate limits on every redeploy.
+      - caddy-data:/data
+      - caddy-config:/config
+
 volumes:
   agentichub-state:
     name: agentichub-state
   agentichub-azure-profile:
     name: agentichub-azure-profile
+  caddy-data:
+    name: agentichub-caddy-data
+  caddy-config:
+    name: agentichub-caddy-config
