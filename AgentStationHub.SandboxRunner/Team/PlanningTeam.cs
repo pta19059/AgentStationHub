@@ -662,6 +662,18 @@ public sealed class PlanningTeam
               which flag accepts which value. NEVER guess flag names not
               present in the printed Usage block.
 
+          � shipped deploy script aborts after printing its OWN banner
+            echos but BEFORE doing any real work, with no specific error
+            line � most often the script contains `read -p "Continue? (y/N)"`
+            and `set -e`. With no TTY, `read` returns non-zero on EOF and
+            `set -e` aborts the script (exit 1).
+            ? `read_workspace_file` the script and grep for `read -p` to
+              confirm. EMIT a `replace_step` that re-invokes the script
+              with a here-string answer:
+                bash infra/<script>.sh -g <rg> -l <region> <<< y
+              Do NOT use 'yes y |' / 'echo y |' pipelines (the validator
+              rejects '| bash' patterns).
+
           � OSCILLATION DETECTION � HARD STOP
             If the REGION TRIAL HISTORY shows you are about to propose a
             region whose combination of (region, error signature) is
@@ -1946,6 +1958,16 @@ public sealed class PlanningTeam
             sb.AppendLine("  If unsure which flags exist, the SHELL DEPLOY SCRIPTS section below shows");
             sb.AppendLine("  the head of each shipped script � read its 'Usage:' / 'getopts' / 'case'");
             sb.AppendLine("  block to map values to flags before emitting the step.");
+            sb.AppendLine("- INTERACTIVE PROMPT RULE (CRITICAL): shipped deploy scripts often contain");
+            sb.AppendLine("  'read -p \"Continue? (y/N): \"' confirmation prompts. The sandbox has no");
+            sb.AppendLine("  TTY, so 'read' returns non-zero on EOF and 'set -e' aborts the script with");
+            sb.AppendLine("  exit 1 BEFORE any real work happens (the user only sees the banner echos).");
+            sb.AppendLine("  ALWAYS feed a 'y' answer to shipped deploy scripts via a here-string:");
+            sb.AppendLine("    bash infra/1-deploy-azure-infra.sh -g rg-<env> -l <region> <<< y");
+            sb.AppendLine("  Use the literal '<<< y' suffix; do NOT pipe 'yes' / 'echo y' through a");
+            sb.AppendLine("  pipeline (the security validator rejects '| bash' patterns). Apply this");
+            sb.AppendLine("  to EVERY shipped '*.sh' deploy step (1-deploy-*.sh, 2-build-*.sh, 3-deploy-apps.sh).");
+            sb.AppendLine("  This is harmless when the script has no prompts.");
             sb.AppendLine("- If a deploy.sh / Makefile target / npm-script ships in the repo, prefer");
             sb.AppendLine("  reproducing it verbatim.");
             sb.AppendLine("- ONLY if NEITHER infra/*.bicep, *.tf, Dockerfile NOR a documented deploy");
