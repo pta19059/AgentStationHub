@@ -190,6 +190,47 @@ public sealed class PlanningTeam
         var planJson = await InvokeAsync(strategist, strategistInput, ct);
         _trace(new AgentTraceDto("DeploymentStrategist", "output", Truncate(planJson, 400)));
 
+        // ---- Server-side guard: NO 'azure.yaml' -> NEVER 'azd up/provision/
+        // deploy/env new' ----
+        // The Strategist has been told this in its instructions (Strategy 1b)
+        // but LLM compliance with negative constraints is unreliable; a
+        // single hallucinated 'azd env new' sends the deploy down a dead
+        // end (we burn a Doctor attempt, the Doctor escalates, the user
+        // sees BlockedNeedsHumanOrSourceFix even though the repo IS
+        // deployable via the Bicep-direct route the Strategist was
+        // supposed to pick). Detect the violation deterministically and
+        // re-prompt the Strategist with an explicit, in-message
+        // directive. Only ONE retry: if the Strategist insists, the
+        // Reviewer + runtime will catch the failure.
+        if (!manifest.Azd && ContainsForbiddenAzdAgainstNoAzureYaml(planJson, out var forbiddenCmd))
+        {
+            _trace(new AgentTraceDto("DeploymentStrategist", "warning",
+                $"Plan violated Strategy 1b: emitted '{forbiddenCmd}' but the " +
+                "repo has no azure.yaml. Re-prompting with explicit Bicep-direct directive."));
+
+            var retryInput = strategistInput +
+                "\n\n" +
+                "----- VALIDATION FAILURE - YOU MUST CORRECT -----\n" +
+                $"Your previous plan emitted '{forbiddenCmd}'.\n" +
+                "This repository has NO 'azure.yaml' at the root. The 'azd <up/provision/deploy/env new>' " +
+                "family of commands REQUIRES azure.yaml and will fail with 'no project exists'.\n" +
+                "\n" +
+                "MANDATORY: Re-emit the plan using Strategy 1b (Bicep-direct), reproducing ONLY the " +
+                "deployment artifacts the authors actually shipped:\n" +
+                "  - If 'infra/*.bicep' exists: az group create / az deployment group create -f <main.bicep>\n" +
+                "  - For every Dockerfile that ships an image: agentic-acr-build <ctx> <Dockerfile> <imageName>\n" +
+                "  - Wire the resulting images into the deployed Container Apps / App Services via\n" +
+                "    'az containerapp update --image' or 'az webapp config container set'.\n" +
+                "  - If a deploy.sh / Makefile target exists, prefer reproducing that.\n" +
+                "  - DO NOT scaffold a fresh azure.yaml. DO NOT use 'azd init --from-code' or '--template-empty'.\n" +
+                "Respond with ONLY the corrected JSON plan.";
+
+            var retryJson = await InvokeAsync(strategist, retryInput, ct);
+            _trace(new AgentTraceDto("DeploymentStrategist", "output",
+                "(retry after Strategy 1b violation) " + Truncate(retryJson, 360)));
+            planJson = retryJson;
+        }
+
         // ---- Reviewer (LLM): final audit. Passes through or amends. ----
         var reviewer = _chatClient.AsAIAgent(
             name: "SecurityReviewer",
@@ -211,6 +252,31 @@ public sealed class PlanningTeam
         _trace(new AgentTraceDto("SecurityReviewer", "output", Truncate(reviewedJson, 400)));
 
         return ParsePlan(reviewedJson, manifest);
+    }
+
+    /// <summary>
+    /// Detects whether <paramref name="planJson"/> contains an 'azd' step
+    /// of the up/provision/deploy/env-new family. Used as a deterministic
+    /// guard against the Strategist ignoring its own Strategy 1b rule
+    /// when the repo has no azure.yaml. Substring match on the step
+    /// command field is sufficient: the planner only emits a single line
+    /// per step with the literal command and we explicitly do NOT want
+    /// to false-trigger on, e.g., 'azd env get-values' or 'azd version'.
+    /// </summary>
+    private static bool ContainsForbiddenAzdAgainstNoAzureYaml(string planJson, out string forbiddenCmd)
+    {
+        forbiddenCmd = "";
+        // Cheap regex against the raw JSON. Whitelisted azd subcommands
+        // (env get-values, env list, version) are NOT flagged. The
+        // forbidden subcommands are explicitly the ones that require an
+        // existing azure.yaml ("project context").
+        var rx = new System.Text.RegularExpressions.Regex(
+            @"\bazd\s+(up|provision|deploy|env\s+new)\b",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var m = rx.Match(planJson);
+        if (!m.Success) return false;
+        forbiddenCmd = m.Value;
+        return true;
     }
 
     /// <summary>
@@ -1758,6 +1824,36 @@ public sealed class PlanningTeam
         sb.AppendLine("DETECTED TOOLCHAINS:");
         sb.AppendLine(string.Join(", ", m.Summary()));
         sb.AppendLine();
+
+        // Inspector ground-truth on azure.yaml. Banner-style so the
+        // Strategist cannot miss it: this is the difference between
+        // "use the azd flow" and "you MUST use Strategy 1b". We put it
+        // BEFORE rationale because LLMs weight banners higher than
+        // bullet lists buried in long context.
+        if (!m.Azd)
+        {
+            sb.AppendLine("================================================================");
+            sb.AppendLine("HARD CONSTRAINT - NO 'azure.yaml' AT THE REPO ROOT.");
+            sb.AppendLine("================================================================");
+            sb.AppendLine("- DO NOT emit 'azd up', 'azd provision', 'azd deploy', 'azd env new'.");
+            sb.AppendLine("  These commands REQUIRE an existing azure.yaml and will fail with");
+            sb.AppendLine("  'no project exists'.");
+            sb.AppendLine("- DO NOT scaffold a new azure.yaml ('azd init --template-empty',");
+            sb.AppendLine("  'azd init --from-code', hand-written azure.yaml).");
+            sb.AppendLine("- USE Strategy 1b (Bicep-direct):");
+            sb.AppendLine("    az group create -n rg-<env> -l <region>");
+            sb.AppendLine("    az deployment group create -g rg-<env> -f <main.bicep> --parameters @<params>");
+            sb.AppendLine("    agentic-acr-build <ctx> <Dockerfile> <imageName>     # one per Dockerfile");
+            sb.AppendLine("    az containerapp update --image <acr>.azurecr.io/<img>:latest ...");
+            sb.AppendLine("- If a deploy.sh / Makefile target / npm-script ships in the repo, prefer");
+            sb.AppendLine("  reproducing it verbatim.");
+            sb.AppendLine("- ONLY if NEITHER infra/*.bicep, *.tf, Dockerfile NOR a documented deploy");
+            sb.AppendLine("  command exists, emit a 1-step plan with 'agentic-summary' and a");
+            sb.AppendLine("  description prefixed '[Escalate] repository ships no deployment artifacts'.");
+            sb.AppendLine("================================================================");
+            sb.AppendLine();
+        }
+
         if (m.Rationale.Count > 0)
         {
             sb.AppendLine("FILE LOCATIONS (use these exact paths, do not guess):");
