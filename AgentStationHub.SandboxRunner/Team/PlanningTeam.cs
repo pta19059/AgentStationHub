@@ -186,7 +186,7 @@ public sealed class PlanningTeam
         var strategist = _chatClient.AsAIAgent(
             name: "DeploymentStrategist",
             instructions: StrategistInstructions);
-        var strategistInput = BuildStrategistInput(repoUrl, manifest, classification, region, priorInsights);
+        var strategistInput = BuildStrategistInput(repoUrl, manifest, classification, region, priorInsights, workspace);
         var planJson = await InvokeAsync(strategist, strategistInput, ct);
         _trace(new AgentTraceDto("DeploymentStrategist", "output", Truncate(planJson, 400)));
 
@@ -640,6 +640,27 @@ public sealed class PlanningTeam
             ? The new AZURE_LOCATION MUST be a member of the BICEP
               TEMPLATE ALLOWED REGIONS list included in this input.
               Picking anything else is guaranteed to fail the same way.
+
+          � "Unknown option <value>" / "Usage: <script.sh> -X <...>"
+            (a shell deploy script invoked with POSITIONAL args while it
+            actually requires NAMED FLAGS; the script printed its own
+            usage on stderr)
+            ? The error tail INCLUDES the script's own usage block. Read
+              it: every required flag is listed under 'Required:' and
+              every optional one under 'Optional:'. EMIT a `replace_step`
+              that re-invokes the same script using the documented flags
+              and the values from the previous (positional) attempt.
+              Example: if the previous step was
+                bash 1-deploy-azure-infra.sh "rg-foo" "eastus"
+              and the usage shows
+                Required: -g, --resource-group ...
+                Optional: -l, --location (default: westus2)
+              emit:
+                bash 1-deploy-azure-infra.sh -g rg-foo -l eastus
+              When in doubt about the mapping, use `read_workspace_file`
+              on the script and grep for `case` / `getopts` to confirm
+              which flag accepts which value. NEVER guess flag names not
+              present in the printed Usage block.
 
           � OSCILLATION DETECTION � HARD STOP
             If the REGION TRIAL HISTORY shows you are about to propose a
@@ -1870,7 +1891,7 @@ public sealed class PlanningTeam
 
     private static string BuildStrategistInput(string repoUrl,
         RepoInspector.ToolchainManifest m, string classification, string region,
-        IReadOnlyList<PriorInsightDto>? priorInsights)
+        IReadOnlyList<PriorInsightDto>? priorInsights, string? workspace = null)
     {
         var sb = new StringBuilder();
         sb.Append("REPO: ").AppendLine(repoUrl);
@@ -1916,6 +1937,15 @@ public sealed class PlanningTeam
             sb.AppendLine("  in numerical / lexical order � the authors already encoded the right CLI");
             sb.AppendLine("  invocations, parameter values, and step ordering. Hand-rolling the steps");
             sb.AppendLine("  from the bicep alone duplicates work and tends to invent parameter files.");
+            sb.AppendLine("- DEPLOY SCRIPT ARG RULE (CRITICAL): when invoking a shipped deploy script,");
+            sb.AppendLine("  NEVER pass POSITIONAL arguments. Real-world scripts almost always use named");
+            sb.AppendLine("  flags (-g/--resource-group, -l/--location, -p/--name-prefix, -e/--environment,");
+            sb.AppendLine("  ...). Invoking 'bash deploy.sh \"my-rg\" \"eastus\"' fails with");
+            sb.AppendLine("  'Unknown option my-rg' and forces a Doctor cycle. ALWAYS spell out the flags:");
+            sb.AppendLine("    bash infra/1-deploy-azure-infra.sh -g rg-<env> -l <region>");
+            sb.AppendLine("  If unsure which flags exist, the SHELL DEPLOY SCRIPTS section below shows");
+            sb.AppendLine("  the head of each shipped script � read its 'Usage:' / 'getopts' / 'case'");
+            sb.AppendLine("  block to map values to flags before emitting the step.");
             sb.AppendLine("- If a deploy.sh / Makefile target / npm-script ships in the repo, prefer");
             sb.AppendLine("  reproducing it verbatim.");
             sb.AppendLine("- ONLY if NEITHER infra/*.bicep, *.tf, Dockerfile NOR a documented deploy");
@@ -1943,6 +1973,42 @@ public sealed class PlanningTeam
             foreach (var f in m.InfraFiles.Take(40)) sb.AppendLine("  " + f);
             if (m.InfraFiles.Count > 40) sb.AppendLine($"  ... and {m.InfraFiles.Count - 40} more");
             sb.AppendLine();
+        }
+
+        // Surface the head of each shell deploy script (infra/*.sh,
+        // deploy*.sh) so the Strategist can read the script's actual
+        // 'Usage:' / argument-parsing block. Without this, the Strategist
+        // tends to invoke 'bash deploy.sh "rg" "region"' positionally,
+        // and any script that uses getopts (-g/-l/--resource-group/...)
+        // fails immediately with 'Unknown option ...' and burns a
+        // Doctor attempt on a problem that is trivially answerable from
+        // the script source.
+        if (!string.IsNullOrWhiteSpace(workspace))
+        {
+            var shellScripts = m.InfraFiles
+                .Where(f => f.EndsWith(".sh", StringComparison.OrdinalIgnoreCase))
+                .Take(6)
+                .ToList();
+            if (shellScripts.Count > 0)
+            {
+                sb.AppendLine("SHELL DEPLOY SCRIPTS (head of each - read the flags before invoking):");
+                foreach (var rel in shellScripts)
+                {
+                    var full = Path.Combine(workspace!, rel.Replace('/', Path.DirectorySeparatorChar));
+                    string head;
+                    try
+                    {
+                        if (!File.Exists(full)) continue;
+                        var text = File.ReadAllText(full);
+                        head = text.Length > 2400 ? text[..2400] + "\n... [truncated]" : text;
+                    }
+                    catch { continue; }
+                    sb.AppendLine("--- " + rel + " ---");
+                    sb.AppendLine(head);
+                    sb.AppendLine("--- end " + rel + " ---");
+                }
+                sb.AppendLine();
+            }
         }
 
         AppendPriorInsights(sb, priorInsights);
