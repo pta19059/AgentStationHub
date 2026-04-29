@@ -1457,6 +1457,64 @@ public sealed class DeploymentOrchestrator
                             $"(attempt #{previousAttempts.Count + 1})...",
                             step.Id);
 
+                        // Pre-Doctor deterministic patch: 'azd init -t
+                        // <template>' refuses to overwrite a non-empty
+                        // working dir and aborts with exit 1 + the prompt
+                        // "Continue initializing an app in '/workspace'?
+                        // (y/N)". Our step runs without a TTY so the
+                        // prompt always defaults to N. The fix is a
+                        // deterministic one-character edit (wrap with
+                        // `yes |`) � invoking the LLM Doctor here is
+                        // pure overhead and risks a buggy "echo skipping"
+                        // remediation that defeats the bootstrap and
+                        // re-introduces the very ARM-empty-template
+                        // failure the bootstrap step exists to prevent.
+                        // Match: command contains 'azd init' AND tail
+                        // contains the canonical prompt string. The
+                        // patched command pipes 'y\n' lines into the
+                        // command via `yes` so the confirmation auto-
+                        // accepts. We only auto-patch ONCE per step
+                        // (guard via previousAttempts) so a follow-up
+                        // failure still reaches the Doctor.
+                        var azdInitContinue =
+                            (step.Command ?? "").Contains("azd init", StringComparison.OrdinalIgnoreCase)
+                            && (stepTail ?? "").Contains("Continue initializing an app",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:azd-init-yes]"));
+                        if (azdInitContinue)
+                        {
+                            // Strip an existing 'bash -lc "..."' wrapper if
+                            // present so we don't end up with nested quotes.
+                            var inner = (step.Command ?? "").Trim();
+                            var bashLc = System.Text.RegularExpressions.Regex.Match(
+                                inner,
+                                @"^bash\s+-lc\s+""(.+)""\s*$",
+                                System.Text.RegularExpressions.RegexOptions.Singleline);
+                            if (bashLc.Success)
+                                inner = bashLc.Groups[1].Value.Replace("\\\"", "\"");
+                            // Avoid double-wrapping if the planner already used `yes |`.
+                            if (!inner.TrimStart().StartsWith("yes ", StringComparison.Ordinal)
+                                && !inner.Contains("yes |", StringComparison.Ordinal))
+                            {
+                                inner = "yes | " + inner;
+                            }
+                            var patched = $"bash -lc \"{inner.Replace("\"", "\\\"")}\"";
+
+                            previousAttempts.Add(
+                                $"[AutoPatch:azd-init-yes] step {step.Id} azd-init prompted " +
+                                "for confirmation in non-empty dir; wrapped with 'yes |' so " +
+                                "the (y/N) prompt auto-confirms.");
+                            await Log(s, "status",
+                                $"Auto-patch: 'azd init' aborted on the directory-not-empty " +
+                                $"prompt. Wrapping the command with 'yes |' to auto-confirm, " +
+                                $"replacing step {step.Id} and re-running (skipping LLM Doctor).",
+                                step.Id);
+                            steps[i] = step with { Command = patched };
+                            i--; // re-execute the patched step at the same index
+                            continue;
+                        }
+
                         // 8.8: prefill previousAttempts with cross-session
                         // failed attempts for the same error signature on
                         // the same repo so the Doctor pivots instead of
