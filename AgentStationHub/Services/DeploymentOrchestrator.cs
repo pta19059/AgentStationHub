@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using AgentStationHub.Hubs;
 using AgentStationHub.Models;
 using AgentStationHub.Services.Agents;
@@ -1742,7 +1742,7 @@ public sealed class DeploymentOrchestrator
                         // refuses, the orchestrator fills the gap deterministically.
                         // ----------------------------------------------------------
                         var autoPatch = TryAutoPatchEscalation(
-                            fix.Reasoning ?? string.Empty, stepTail, step.Id);
+                            fix.Reasoning ?? string.Empty, stepTail, step.Id, step.Command ?? string.Empty);
                         if (autoPatch is not null && autoPatch.NewSteps is { Count: > 0 })
                         {
                             await Log(s, "status",
@@ -2539,10 +2539,111 @@ public sealed class DeploymentOrchestrator
     ///     files in the workspace, then re-run the failing step.
     /// </summary>
     private static AgentStationHub.Models.Remediation?
-        TryAutoPatchEscalation(string reasoning, string stepTail, int failingStepId)
+        TryAutoPatchEscalation(string reasoning, string stepTail, int failingStepId, string failingCommand)
     {
         var blob = (reasoning ?? string.Empty) + "\n" + (stepTail ?? string.Empty);
         if (blob.Length == 0) return null;
+
+        // -----------------------------------------------------------------
+        // Pattern A: ContainerAppSecretInvalid for empty secret values.
+        // ACA rejects `--parameters foo=''` when foo is wired into a
+        // Container App secret. The classical signature on `azd up`
+        // bypassed via `az deployment sub/group create` is:
+        //   "Container app secret(s) with name(s) 'a, b, c' are invalid:
+        //    value or keyVaultUrl and identity should be provided."
+        // The deterministic fix is to strip the empty `=''` parameters
+        // from the failing command and re-run; the Bicep modules
+        // typically have `@secure() string foo = ''` defaults so dropping
+        // the parameter altogether satisfies validation.
+        // -----------------------------------------------------------------
+        if (blob.Contains("ContainerAppSecretInvalid", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(failingCommand)
+            && System.Text.RegularExpressions.Regex.IsMatch(failingCommand, @"=''|=\""\""")
+            && failingCommand.Contains("az deployment", StringComparison.OrdinalIgnoreCase))
+        {
+            // Drop every `name=''` (or `name=""`) token from the command.
+            // The token shape is `[A-Za-z_][A-Za-z0-9_]*=(''|"")` and is
+            // typically space-separated after `--parameters`.
+            var rewritten = System.Text.RegularExpressions.Regex.Replace(
+                failingCommand,
+                @"\s+[A-Za-z_][A-Za-z0-9_]*=(?:''|"""")",
+                "");
+            // If after stripping every empty kv pair the `--parameters`
+            // flag is now bare or trailed by another flag, leave it; az
+            // tolerates an empty `--parameters` list.
+            if (!string.Equals(rewritten, failingCommand, StringComparison.Ordinal))
+            {
+                var newStepA = new AgentStationHub.Models.DeploymentStep(
+                    Id: 0,
+                    Description:
+                        "[Auto-patch] re-run deployment without empty Container App secret parameters " +
+                        "(synthesised after Doctor escalation on ContainerAppSecretInvalid)",
+                    Command: rewritten,
+                    WorkingDirectory: ".");
+                return new AgentStationHub.Models.Remediation(
+                    Kind: "replace_step",
+                    StepId: failingStepId,
+                    NewSteps: new[] { newStepA },
+                    Reasoning:
+                        "[auto-patched escalation] ACA rejected the deployment because four secret " +
+                        "parameters were passed as empty strings. Stripped the empty `=''` arguments " +
+                        "and re-issued the deployment so the Bicep `@secure()` defaults take over.");
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Pattern B: InvalidPrincipalId on role-assignment sub-deployments.
+        // Bicep templates that ship `roleAssignments.bicep` for storage /
+        // Key Vault grants need a non-empty `principalId`. azd normally
+        // populates it from `azd env get-values AZURE_PRINCIPAL_ID`; when
+        // the Strategist bypasses azd it forgets to set it, and ARM
+        // returns "A valid principal ID must be provided for role
+        // assignment.". The fix wraps the failing `az deployment` call so
+        // it first resolves PRINCIPAL_ID (signed-in user, falling back to
+        // the SP behind AZURE_CLIENT_ID), then re-runs the same command
+        // with `principalId=$PID` appended to `--parameters`.
+        // -----------------------------------------------------------------
+        if (blob.Contains("InvalidPrincipalId", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(failingCommand)
+            && failingCommand.Contains("az deployment", StringComparison.OrdinalIgnoreCase)
+            && !System.Text.RegularExpressions.Regex.IsMatch(
+                   failingCommand, @"\bprincipalId="))
+        {
+            // Wrap the original command in a bash chain that resolves
+            // PRINCIPAL_ID. We use `bash -lc` and inject the original
+            // command literally; we must escape single quotes inside it.
+            var inner = failingCommand
+                .Replace("'", "'\"'\"'", StringComparison.Ordinal);
+            var wrapped =
+                "bash -lc 'set -e; " +
+                "PID=$(az ad signed-in-user show --query id -o tsv 2>/dev/null " +
+                "|| (test -n \"$AZURE_CLIENT_ID\" && az ad sp show --id \"$AZURE_CLIENT_ID\" --query id -o tsv)); " +
+                "if [ -z \"$PID\" ]; then echo \"[auto-patch] could not resolve principalId\" >&2; exit 1; fi; " +
+                "echo \"[auto-patch] principalId=$PID\"; " +
+                $"{inner} principalId=$PID'";
+
+            var newStepB = new AgentStationHub.Models.DeploymentStep(
+                Id: 0,
+                Description:
+                    "[Auto-patch] resolve current principalId and re-run deployment with it appended " +
+                    "to --parameters (synthesised after Doctor escalation on InvalidPrincipalId)",
+                Command: wrapped,
+                WorkingDirectory: ".");
+            return new AgentStationHub.Models.Remediation(
+                Kind: "replace_step",
+                StepId: failingStepId,
+                NewSteps: new[] { newStepB },
+                Reasoning:
+                    "[auto-patched escalation] role-assignment sub-deployment failed with " +
+                    "InvalidPrincipalId because principalId was missing from the parameters. " +
+                    "Wrapped the original command to resolve principalId from the signed-in user " +
+                    "(fallback: the AZURE_CLIENT_ID service principal) and append it.");
+        }
+
+        // -----------------------------------------------------------------
+        // Pattern C: deprecated / unsupported OpenAI model + optional version.
+        // Existing logic; preserved verbatim.
+        // -----------------------------------------------------------------
 
         // Trigger words. The Foundry Doctor uses a wide vocabulary for
         // "this model is the wrong choice": deprecated, unsupported, not
