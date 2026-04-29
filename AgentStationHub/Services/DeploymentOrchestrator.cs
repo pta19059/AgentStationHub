@@ -1743,20 +1743,77 @@ public sealed class DeploymentOrchestrator
                         // ----------------------------------------------------------
                         var autoPatch = TryAutoPatchEscalation(
                             fix.Reasoning ?? string.Empty, stepTail, step.Id, step.Command ?? string.Empty);
+
+                        // ----------------------------------------------------------
+                        // Long-tail fallback: if the deterministic auto-patch table
+                        // didn't match, ask the EscalationResolverAgent (Meta-Doctor)
+                        // for an LLM-synthesised fix BEFORE we surface the
+                        // BlockedNeedsHumanOrSourceFix verdict to the user. The agent
+                        // sees the failing command, log tail, Doctor's reasoning, and
+                        // the list of previous attempts in this session; it can return
+                        // either a `replace_step` or `insert_before` Remediation, or
+                        // give_up (in which case we proceed to the original escalate
+                        // path). Every emitted step is validated by PlanValidator
+                        // inside the agent itself.
+                        // ----------------------------------------------------------
+                        if (autoPatch is null && isEscalate)
+                        {
+                            try
+                            {
+                                var resolver = _sp.GetService<AgentStationHub.Services.Agents.EscalationResolverAgent>();
+                                if (resolver is not null)
+                                {
+                                    await Log(s, "info",
+                                        "Doctor escalated and no deterministic auto-patch matched — " +
+                                        "consulting EscalationResolver agent…",
+                                        step.Id);
+                                    autoPatch = await resolver.ResolveAsync(
+                                        failingStep: step,
+                                        failingCommand: step.Command ?? string.Empty,
+                                        stepTail: stepTail,
+                                        doctorReasoning: fix.Reasoning ?? string.Empty,
+                                        previousAttempts: previousAttempts.ToList(),
+                                        ct: ct);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                _log.LogWarning(ex,
+                                    "EscalationResolver invocation failed; falling back to escalate path.");
+                            }
+                        }
                         if (autoPatch is not null && autoPatch.NewSteps is { Count: > 0 })
                         {
+                            var applyKind = string.Equals(
+                                autoPatch.Kind, "replace_step", StringComparison.OrdinalIgnoreCase)
+                                ? "replace_step" : "insert_before";
+
                             await Log(s, "status",
                                 $"🩺 Doctor escalated, but the orchestrator recognised the " +
                                 $"failure signature as auto-patchable. Applying synthesised " +
-                                $"insert_before: {autoPatch.NewSteps[0].Description}",
+                                $"{applyKind}: {autoPatch.NewSteps[0].Description}",
                                 step.Id);
                             previousAttempts.Add(
                                 $"step {step.Id} [{SummariseErrorSignature(stepTail)}] " +
-                                $"AUTO_PATCH: {Truncate(autoPatch.NewSteps[0].Command, 100)}");
-                            for (int k = 0; k < autoPatch.NewSteps.Count; k++)
-                                steps.Insert(i + k, autoPatch.NewSteps[k]);
+                                $"AUTO_PATCH/{applyKind}: {Truncate(autoPatch.NewSteps[0].Command, 100)}");
+
+                            if (applyKind == "replace_step")
+                            {
+                                // Replace the failing step with the first new step,
+                                // then insert any remaining new steps right after it.
+                                steps[i] = autoPatch.NewSteps[0];
+                                for (int k = 1; k < autoPatch.NewSteps.Count; k++)
+                                    steps.Insert(i + k, autoPatch.NewSteps[k]);
+                            }
+                            else
+                            {
+                                // insert_before: keep the original failing step in
+                                // place and insert the new steps before it.
+                                for (int k = 0; k < autoPatch.NewSteps.Count; k++)
+                                    steps.Insert(i + k, autoPatch.NewSteps[k]);
+                            }
                             await PublishUpdatedPlanAsync(s, plan, steps, ct);
-                            i--; // step at position i is now the first auto-patch step
+                            i--; // re-execute starting at the (now patched) index
                             continue;
                         }
 

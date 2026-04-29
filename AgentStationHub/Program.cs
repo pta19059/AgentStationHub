@@ -144,6 +144,50 @@ builder.Services.AddSingleton<OpenAIResponseClient>(sp =>
 builder.Services.AddScoped<PlanExtractorAgent>();
 builder.Services.AddScoped<VerifierAgent>();
 
+// EscalationResolverAgent ("Meta-Doctor"): last-line LLM resolver
+// invoked by DeploymentOrchestrator when the Doctor returns
+// [Escalate] AND the deterministic auto-patch table doesn't match.
+// Uses the same Azure OpenAI account as the rest of the host pipeline,
+// pinned to the Doctor deployment (o4-mini-class reasoning model).
+// Falls back to RunnerDeployment / Deployment if DoctorDeployment
+// isn't configured.
+#pragma warning disable OPENAI001, AOAI001
+builder.Services.AddSingleton<AgentStationHub.Services.Agents.EscalationResolverAgent>(sp =>
+{
+    var cfg = sp.GetRequiredService<IConfiguration>();
+    var endpoint = cfg["AzureOpenAI:Endpoint"]
+        ?? throw new InvalidOperationException("AzureOpenAI:Endpoint not configured");
+    var deployment = cfg["AzureOpenAI:DoctorDeployment"]
+        ?? cfg["AzureOpenAI:RunnerDeployment"]
+        ?? cfg["AzureOpenAI:Deployment"]
+        ?? throw new InvalidOperationException(
+            "AzureOpenAI:DoctorDeployment/RunnerDeployment/Deployment not configured");
+    var tenantId = cfg["AzureOpenAI:TenantId"];
+    var apiKey   = cfg["AzureOpenAI:ApiKey"];
+
+    AzureOpenAIClient azureClient;
+    if (!string.IsNullOrWhiteSpace(apiKey))
+    {
+        azureClient = new AzureOpenAIClient(new Uri(endpoint), new AzureKeyCredential(apiKey));
+    }
+    else
+    {
+        var credOpts = new DefaultAzureCredentialOptions();
+        if (!string.IsNullOrWhiteSpace(tenantId))
+        {
+            credOpts.TenantId = tenantId;
+            credOpts.VisualStudioTenantId = tenantId;
+            credOpts.SharedTokenCacheTenantId = tenantId;
+            credOpts.InteractiveBrowserTenantId = tenantId;
+        }
+        azureClient = new AzureOpenAIClient(new Uri(endpoint), new DefaultAzureCredential(credOpts));
+    }
+    var chat = azureClient.GetChatClient(deployment);
+    var log  = sp.GetRequiredService<ILogger<AgentStationHub.Services.Agents.EscalationResolverAgent>>();
+    return new AgentStationHub.Services.Agents.EscalationResolverAgent(chat, log);
+});
+#pragma warning restore OPENAI001, AOAI001
+
 // Host-side bridge that invokes the multi-agent SandboxRunner inside the
 // Docker sandbox for the Planning phase. The legacy PlanExtractorAgent in
 // the host remains registered as a fallback. The sandbox image is resolved
