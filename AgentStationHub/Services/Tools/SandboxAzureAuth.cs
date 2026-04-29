@@ -40,16 +40,37 @@ public static class SandboxAzureAuth
     /// code login inside the container and streams progress to the provided
     /// logger. Subsequent calls are no-ops.
     /// </summary>
+    /// <param name="tenantId">
+    /// Optional Azure AD tenant id. When provided we (a) PIN the device-code
+    /// login to this tenant via <c>az login --tenant &lt;id&gt;</c>, and (b)
+    /// validate that any pre-existing cached profile in the volume is bound
+    /// to the SAME tenant; if not, we wipe the cache and re-login. This is
+    /// what lets the UI pre-specify the tenant and avoid the "wrong default
+    /// tenant" loop.
+    /// </param>
+    /// <param name="subscriptionId">
+    /// Optional Azure subscription id. After a successful login we run
+    /// <c>az account set --subscription &lt;id&gt;</c> so every later step
+    /// targets this subscription, even when the tenant has many.
+    /// </param>
     public static async Task EnsureAsync(
         string sandboxImage,
         string? tenantId,
+        string? subscriptionId,
         Action<string, string> log,
         CancellationToken ct)
     {
         await _sem.WaitAsync(ct);
         try
         {
-            if (_verified) return;
+            // The static "_verified" cache is keyed by process lifetime, not
+            // by (tenant, subscription) tuple. If the user retries a deploy
+            // after switching identity in the UI we MUST re-validate, so we
+            // never short-circuit when the caller passed an explicit tenant
+            // or subscription. The fast path stays for the common
+            // "no UI override" case.
+            if (_verified && string.IsNullOrWhiteSpace(tenantId)
+                          && string.IsNullOrWhiteSpace(subscriptionId)) return;
 
             await EnsureVolumeExistsAsync(VolumeName, ct);
             // Same defensive logic for the docker-config volume so every
@@ -58,33 +79,106 @@ public static class SandboxAzureAuth
             // every step (slower, but correctness-equivalent).
             await EnsureVolumeExistsAsync(DockerConfigVolumeName, ct);
 
-            // Probe: is the volume already authenticated for our tenant?
+            // Probe: is the volume already authenticated, AND (when the
+            // user pinned a tenant) for the SAME tenant? We run a single
+            // 'az account show' and capture stdout so we can compare the
+            // tenantId field. Any mismatch -> force re-login. This is
+            // the central fix for the "tenant loop" the user reported:
+            // before, a stale cache from a previous deploy on a
+            // different tenant would silently win and azd would deploy
+            // into the wrong directory.
+            var probeOut = new System.Text.StringBuilder();
             var probeOk = await RunInContainerAsync(
-                sandboxImage, "az account show --only-show-errors",
-                _ => { }, ct);
+                sandboxImage,
+                "az account show --only-show-errors -o json",
+                line => { lock (probeOut) probeOut.AppendLine(line); },
+                ct);
+
+            string? cachedTenant = null;
+            string? cachedSub = null;
             if (probeOk)
             {
-                log("info", "Sandbox Azure profile already authenticated; reusing cached credentials.");
-                _verified = true;
-                return;
+                try
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(probeOut.ToString());
+                    if (doc.RootElement.TryGetProperty("tenantId", out var t))
+                        cachedTenant = t.GetString();
+                    if (doc.RootElement.TryGetProperty("id", out var i))
+                        cachedSub = i.GetString();
+                }
+                catch { /* malformed json -> treat as not authenticated */ }
             }
 
-            log("status", "Sandbox has no cached Azure credentials. Starting device code login...");
-            log("info", "==> Copy the code below, open the URL, and approve the sign-in.");
+            var tenantMismatch = !string.IsNullOrWhiteSpace(tenantId)
+                && !string.IsNullOrWhiteSpace(cachedTenant)
+                && !string.Equals(tenantId, cachedTenant, StringComparison.OrdinalIgnoreCase);
 
-            var tenantArg = string.IsNullOrWhiteSpace(tenantId) ? "" : $"--tenant {tenantId} ";
-            var loginCmd = $"az login --use-device-code {tenantArg}--only-show-errors";
-            var loginOk = await RunInContainerAsync(
-                sandboxImage, loginCmd,
-                line => log("info", line), ct);
+            if (probeOk && !tenantMismatch)
+            {
+                log("info",
+                    $"Sandbox Azure profile already authenticated " +
+                    $"(tenant={cachedTenant ?? "?"}); reusing cached credentials.");
+            }
+            else
+            {
+                if (tenantMismatch)
+                {
+                    log("status",
+                        $"Cached Azure login is for tenant '{cachedTenant}' but the " +
+                        $"deploy was pinned to tenant '{tenantId}'. Wiping the cached " +
+                        "profile and starting a fresh device-code login.");
+                    // 'az logout' is the supported way to clear MSAL cache;
+                    // fallback to deleting the cache files if it fails (the
+                    // volume content is owned by root inside the container).
+                    await RunInContainerAsync(
+                        sandboxImage,
+                        "az logout --only-show-errors 2>/dev/null; " +
+                        "rm -rf /root/.azure/msal_token_cache.* /root/.azure/azureProfile.json " +
+                        "/root/.azure/accessTokens.json /root/.azure/service_principal_entries.json " +
+                        "2>/dev/null; true",
+                        _ => { }, ct);
+                }
+                else
+                {
+                    log("status",
+                        "Sandbox has no cached Azure credentials. Starting device code login...");
+                }
+                log("info", "==> Copy the code below, open the URL, and approve the sign-in.");
 
-            if (!loginOk)
-                throw new InvalidOperationException(
-                    "Device code login failed inside the sandbox. " +
-                    "Check the log above for the device code URL and retry.");
+                var tenantArg = string.IsNullOrWhiteSpace(tenantId) ? "" : $"--tenant {tenantId} ";
+                var loginCmd = $"az login --use-device-code {tenantArg}--only-show-errors";
+                var loginOk = await RunInContainerAsync(
+                    sandboxImage, loginCmd,
+                    line => log("info", line), ct);
 
-            // Set the default subscription / location hints if we have a tenant.
-            if (!string.IsNullOrWhiteSpace(tenantId))
+                if (!loginOk)
+                    throw new InvalidOperationException(
+                        "Device code login failed inside the sandbox. " +
+                        "Check the log above for the device code URL and retry.");
+            }
+
+            // Pin the active subscription:
+            //   1. Explicit user choice wins (s.SubscriptionId from UI).
+            //   2. Otherwise, when a tenant was pinned, fall back to the
+            //      first subscription in that tenant (mirrors old behaviour).
+            //   3. No-op when neither is set � 'az' / 'azd' use their
+            //      own default discovery.
+            if (!string.IsNullOrWhiteSpace(subscriptionId))
+            {
+                var setOk = await RunInContainerAsync(
+                    sandboxImage,
+                    $"az account set --subscription \"{subscriptionId}\" --only-show-errors",
+                    line => log("info", line), ct);
+                if (setOk)
+                    log("info", $"Active subscription pinned to {subscriptionId}.");
+                else
+                    log("warn",
+                        $"Could not pin active subscription to '{subscriptionId}'. " +
+                        "The id may be invalid for this tenant or the user lacks " +
+                        "access. Continuing with the default subscription of the " +
+                        "logged-in identity.");
+            }
+            else if (!string.IsNullOrWhiteSpace(tenantId))
             {
                 await RunInContainerAsync(
                     sandboxImage,

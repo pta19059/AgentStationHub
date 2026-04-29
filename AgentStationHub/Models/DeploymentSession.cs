@@ -115,6 +115,29 @@ public sealed class DeploymentSession
     /// AZURE_LOCATION &lt;x&gt;' (and sibling location env vars) in the plan.
     /// </summary>
     public required string AzureLocation { get; init; }
+
+    /// <summary>
+    /// Optional Azure AD tenant id chosen by the user up-front in the UI.
+    /// When set, the sandbox 'az login --use-device-code' is pinned to
+    /// this tenant from the very first deploy, removing the loop where
+    /// the cached login lands on a default tenant that has no
+    /// subscription / no permission to deploy. If the existing cached
+    /// profile inside the sandbox volume is bound to a DIFFERENT tenant,
+    /// the auth helper invalidates it and triggers a fresh device-code
+    /// login on the right tenant. Null = legacy behaviour (no pinning).
+    /// </summary>
+    public string? TenantId { get; init; }
+
+    /// <summary>
+    /// Optional Azure subscription id chosen by the user up-front. After
+    /// login the sandbox runs <c>az account set --subscription &lt;id&gt;</c>
+    /// so every subsequent step (azd up, az group create, ...) targets
+    /// this subscription, even when the tenant has many. Null means
+    /// "let azd / az pick the default subscription of the logged-in
+    /// identity".
+    /// </summary>
+    public string? SubscriptionId { get; init; }
+
     public DeploymentStatus Status { get; set; } = DeploymentStatus.Pending;
     public DeploymentPlan? Plan { get; set; }
     public List<LogEntry> Logs { get; } = new();
