@@ -53,6 +53,15 @@ public sealed class PlanningTeam
         foreach (var r in manifest.Rationale)
             _trace(new AgentTraceDto("Scout", "rationale", r));
 
+        // ---- DeployIntentExtractor (LLM, tool-using): read README + manifests
+        //      to extract the canonical deploy procedure documented by the
+        //      authors. The Strategist receives this as an authoritative block
+        //      so it can copy a documented `azd init -t … && azd ai agent init
+        //      && azd up` sequence verbatim instead of inferring `azd up` from
+        //      structural signals. Failure here is non-fatal: empty intent =>
+        //      Strategist falls back to manifest-only reasoning. ----------------
+        var deployIntentJson = await ExtractDeployIntentAsync(workspace, ct);
+
         // ---- TechClassifier (LLM): narrow + enrich the tech choice ----
         var classifier = _chatClient.AsAIAgent(
             name: "TechClassifier",
@@ -186,7 +195,7 @@ public sealed class PlanningTeam
         var strategist = _chatClient.AsAIAgent(
             name: "DeploymentStrategist",
             instructions: StrategistInstructions);
-        var strategistInput = BuildStrategistInput(repoUrl, manifest, classification, region, priorInsights, workspace);
+        var strategistInput = BuildStrategistInput(repoUrl, manifest, classification, region, priorInsights, workspace, deployIntentJson);
         var planJson = await InvokeAsync(strategist, strategistInput, ct);
         _trace(new AgentTraceDto("DeploymentStrategist", "output", Truncate(planJson, 400)));
 
@@ -1848,6 +1857,171 @@ public sealed class PlanningTeam
         return response.Text?.Trim() ?? "";
     }
 
+    // ---------------------------------------------------------------
+    // DeployIntentExtractor � tool-using LLM that reads README +
+    // manifests with read_workspace_file / list_workspace_directory and
+    // extracts the canonical deploy command sequence the authors
+    // documented. Output is fed to the Strategist as a banner block in
+    // BuildStrategistInput. Failure modes (no README, network error,
+    // LLM refusal) return null/empty so the Strategist falls back to
+    // pure manifest inference.
+    // ---------------------------------------------------------------
+    private async Task<string?> ExtractDeployIntentAsync(string workspace, CancellationToken ct)
+    {
+        try
+        {
+            _trace(new AgentTraceDto("DeployIntentExtractor", "start",
+                "Reading README + manifests to extract canonical deploy procedure."));
+
+            // Reuse DoctorToolbox: same read_workspace_file +
+            // list_workspace_directory semantics, same path safety
+            // guards. Note: we deliberately also expose run_diagnostic
+            // and check_tool_available since extracting intent from a
+            // README sometimes requires e.g. checking that 'azd' is
+            // present at all (the deploy section may be conditional
+            // on it). They are read-only so the extractor cannot
+            // mutate the workspace.
+            var toolbox = new DoctorToolbox(workspace,
+                (lvl, line) => _trace(new AgentTraceDto("DeployIntentExtractor", lvl, line)));
+            var extractor = _chatClient.AsAIAgent(
+                name: "DeployIntentExtractor",
+                instructions: DeployIntentInstructions,
+                tools: toolbox.AsAITools().ToList());
+
+            var input = """
+                Read the repository at /workspace and extract the CANONICAL
+                deploy procedure documented by the authors. Start with:
+                  1. list_workspace_directory(".", "*")     to see the top level;
+                  2. read_workspace_file("README.md")       for the deploy section;
+                  3. read_workspace_file("agent.yaml") and ("azure.yaml") if listed;
+                  4. read_workspace_file("Dockerfile") and any "scripts/deploy*.sh" /
+                     "infra/*.sh" / "deploy.sh" if referenced.
+
+                Return ONLY the JSON object specified in your instructions.
+                """;
+
+            var raw = await InvokeAsync(extractor, input, ct);
+
+            // Validate: must parse as JSON object containing a 'commands'
+            // array. Anything else => return null and let the Strategist
+            // fall back. We do not attempt to repair malformed JSON here
+            // because a confused extractor is strictly worse than no
+            // extractor at all (Strategist would weight a wrong intent
+            // higher than its own manifest reasoning).
+            var trimmed = raw?.Trim() ?? "";
+            // Strip ```json fences if the LLM ignored the format rule.
+            if (trimmed.StartsWith("```"))
+            {
+                var firstNl = trimmed.IndexOf('\n');
+                if (firstNl > 0) trimmed = trimmed[(firstNl + 1)..];
+                if (trimmed.EndsWith("```"))
+                    trimmed = trimmed[..^3].TrimEnd();
+            }
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(trimmed);
+                if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object
+                    || !doc.RootElement.TryGetProperty("commands", out var cmds)
+                    || cmds.ValueKind != System.Text.Json.JsonValueKind.Array)
+                {
+                    _trace(new AgentTraceDto("DeployIntentExtractor", "warn",
+                        "Output did not contain a 'commands' array; ignoring."));
+                    return null;
+                }
+
+                double confidence = 0;
+                if (doc.RootElement.TryGetProperty("confidence", out var c)
+                    && c.ValueKind == System.Text.Json.JsonValueKind.Number)
+                    confidence = c.GetDouble();
+
+                _trace(new AgentTraceDto("DeployIntentExtractor", "done",
+                    $"Extracted {cmds.GetArrayLength()} command(s), confidence={confidence:F2}."));
+
+                return trimmed;
+            }
+            catch (System.Text.Json.JsonException ex)
+            {
+                _trace(new AgentTraceDto("DeployIntentExtractor", "warn",
+                    $"Output is not valid JSON ({ex.Message}); ignoring."));
+                return null;
+            }
+        }
+        catch (Exception ex)
+        {
+            // Non-fatal: planning continues with manifest-only signals.
+            _trace(new AgentTraceDto("DeployIntentExtractor", "warn",
+                $"Extractor failed: {ex.GetType().Name}: {ex.Message}; planning continues without canonical intent."));
+            return null;
+        }
+    }
+
+    private const string DeployIntentInstructions = """
+        You are a deploy-procedure archaeologist. The user has cloned a
+        repository at /workspace and wants to deploy it. Your job: read the
+        README, agent.yaml, azure.yaml, Dockerfile, scripts/, infra/ and
+        figure out the EXACT sequence of CLI commands the authors
+        documented as the deploy procedure � including any scaffolding /
+        bootstrap commands that must run BEFORE the main deploy.
+
+        ABSOLUTE RULES:
+        1. Use the tools (read_workspace_file, list_workspace_directory) to
+           ground every command in actual file content. NEVER infer a
+           command from your training data; if the README does not say it,
+           it does not exist.
+        2. If the README has a "Deploy", "Deployment", "Quickstart deploy",
+           "Run on Azure", "Get started" section, READ IT IN FULL. Quote
+           the exact command lines including their order.
+        3. SCAFFOLDING COMMANDS MATTER. Many samples document:
+              azd init -t <template>      # bootstrap from a template
+              azd ai agent init -m ...    # generate Bicep from manifest
+              terraform init               # provider download
+              sam deploy --guided          # one-time interactive setup
+           These MUST be included in 'commands' BEFORE the main deploy.
+           A 30-byte stub Bicep / empty terraform / placeholder
+           azure.yaml is the strongest possible signal that scaffolding
+           is required.
+        4. Include only commands that DEPLOY (provision Azure resources,
+           build+push images, configure container apps). Exclude:
+             � local dev commands (python main.py, npm start, uvicorn);
+             � testing (pytest, npm test, validate.py);
+             � cleanup (azd down, az group delete) UNLESS the README
+               says they must run before deploy;
+             � verification (curl, health-check) UNLESS they are part of
+               the deploy procedure itself.
+        5. If multiple deploy options are documented (e.g. "Option A: azd"
+           vs "Option B: SDK script"), pick the FIRST option labelled
+           'recommended' / 'fastest' / 'default'. If no preference is
+           given, pick the simplest (fewest steps).
+        6. If no deploy section exists, return commands=[] and explain
+           why in 'notes'. DO NOT make up an azd up sequence to be
+           helpful; the Strategist will fall back to manifest reasoning
+           (which is the correct behaviour for repos without docs).
+
+        OUTPUT FORMAT (strict JSON, no markdown, no prose):
+          {
+            "commands": [
+              {
+                "cmd": "<exact shell command, single line>",
+                "source": "<filename>",
+                "sourceLine": <line number or null>,
+                "purpose": "<one-line description of what this step does>"
+              },
+              ...
+            ],
+            "prereqs": ["<tool or env var the README says must exist>", ...],
+            "envVars": { "<KEY>": "<documented default or example value>" },
+            "notes": "<one paragraph explaining what you found, what you
+                       skipped, and any caveats the Strategist should know>",
+            "confidence": <float 0.0-1.0 reflecting how clearly the README
+                            documents a deploy procedure: 1.0 = explicit
+                            section with command block, 0.5 = scattered
+                            references, 0.0 = no deploy info found>
+          }
+
+        Do NOT include any text outside the JSON object.
+        """;
+
+
     private static string Truncate(string s, int max)
         => s.Length <= max ? s : s[..max] + "...";
 
@@ -1964,7 +2138,8 @@ public sealed class PlanningTeam
 
     private static string BuildStrategistInput(string repoUrl,
         RepoInspector.ToolchainManifest m, string classification, string region,
-        IReadOnlyList<PriorInsightDto>? priorInsights, string? workspace = null)
+        IReadOnlyList<PriorInsightDto>? priorInsights, string? workspace = null,
+        string? deployIntentJson = null)
     {
         var sb = new StringBuilder();
         sb.Append("REPO: ").AppendLine(repoUrl);
@@ -1972,6 +2147,41 @@ public sealed class PlanningTeam
         sb.AppendLine("CLASSIFICATION:");
         sb.AppendLine(classification);
         sb.AppendLine();
+
+        // Authoritative deploy intent extracted from the repo's own README +
+        // manifests by the DeployIntentExtractor agent. When present and
+        // confident, this is the SINGLE SOURCE OF TRUTH for what the authors
+        // intended you to run; reproduce the listed commands verbatim and in
+        // order before falling back to manifest inference. Failure modes
+        // (missing README, no deploy section, low confidence) leave this block
+        // empty � fall through to the rest of the input as before.
+        if (!string.IsNullOrWhiteSpace(deployIntentJson)
+            && !deployIntentJson.Contains("\"commands\": []", StringComparison.Ordinal)
+            && !deployIntentJson.Contains("\"commands\":[]", StringComparison.Ordinal))
+        {
+            sb.AppendLine("================================================================");
+            sb.AppendLine("CANONICAL DEPLOY INTENT (extracted from this repo's README + manifests)");
+            sb.AppendLine("================================================================");
+            sb.AppendLine("These commands are what the AUTHORS documented as the deploy procedure.");
+            sb.AppendLine("When 'confidence' >= 0.7 you MUST reproduce them VERBATIM, in the listed");
+            sb.AppendLine("order, as the FIRST steps of your plan. This includes any bootstrap /");
+            sb.AppendLine("scaffolding commands (e.g. 'azd init -t <template>', 'azd ai agent init',");
+            sb.AppendLine("'terraform init', 'sam deploy --guided') that must run BEFORE the actual");
+            sb.AppendLine("deploy command. Skipping bootstrap is the #1 cause of 'ARM template");
+            sb.AppendLine("contains no resources' and similar empty-template failures.");
+            sb.AppendLine("Adapt only:");
+            sb.AppendLine("  � strip interactive prompts (use --no-prompt / --yes / --force flags);");
+            sb.AppendLine("  � substitute placeholder values (<your-...>, <region>) with concrete");
+            sb.AppendLine("    values from TARGET REGION / env vars;");
+            sb.AppendLine("  � add 'agentic-azd-up' instead of 'azd up' so the sandbox helper runs.");
+            sb.AppendLine("DO NOT invent commands not listed here. DO NOT skip listed commands.");
+            sb.AppendLine();
+            sb.AppendLine(deployIntentJson.Trim());
+            sb.AppendLine();
+            sb.AppendLine("================================================================");
+            sb.AppendLine();
+        }
+
         sb.AppendLine("DETECTED TOOLCHAINS:");
         sb.AppendLine(string.Join(", ", m.Summary()));
         sb.AppendLine();
