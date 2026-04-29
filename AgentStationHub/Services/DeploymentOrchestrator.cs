@@ -692,6 +692,20 @@ public sealed class DeploymentOrchestrator
             // deploy "succeed" with no real work done.
             int consecutiveEmptySuccesses = 0;
 
+            // 8.3: Track which Doctor fix is currently "on probation".
+            // When the Doctor proposes a remediation we record (errSig,
+            // command); when the NEXT step in the loop succeeds we
+            // persist that pair as a doctor.fix.{errSig} insight so the
+            // next deploy of the same repo sees a proven fix and can try
+            // it before speculating. Cleared on success (after persist)
+            // or on subsequent fix application (overwritten).
+            (string ErrSig, string Command)? pendingDoctorAttribution = null;
+
+            // 8.8: Per-session set of error signatures for which we have
+            // already prepended cross-session failed attempts to
+            // previousAttempts. Avoids re-injecting on every Doctor pass.
+            var injectedHistoricalSigs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             for (int i = 0; i < steps.Count; i++)
             {
                 var step = steps[i];
@@ -1163,6 +1177,34 @@ public sealed class DeploymentOrchestrator
                             ct);
                         deployCtx.MergeFromAzdEnv(env);
                     }
+
+                    // 8.3: a Doctor fix from the previous failure unblocked
+                    // us — persist (errSig -> command) so the next session's
+                    // Doctor sees the proven fix as a prior insight before
+                    // speculating. Confidence 0.85: high enough to influence
+                    // the prompt without being treated as canonical truth.
+                    if (pendingDoctorAttribution is { } pa)
+                    {
+                        try
+                        {
+                            _memory.UpsertInsight(
+                                s.RepoUrl,
+                                $"doctor.fix.{pa.ErrSig}",
+                                pa.Command,
+                                confidence: 0.85);
+                            await Log(s, "info",
+                                $"Memory: persisted Doctor fix for signature " +
+                                $"[{pa.ErrSig}] — next deploy of this repo will see " +
+                                $"this command as a proven remediation.",
+                                step.Id);
+                        }
+                        catch (Exception ex)
+                        {
+                            _log.LogDebug(ex,
+                                "Failed to persist doctor.fix insight (non-fatal).");
+                        }
+                        pendingDoctorAttribution = null;
+                    }
                     continue; // step succeeded, next.
                 }
 
@@ -1394,6 +1436,56 @@ public sealed class DeploymentOrchestrator
                             $"Invoking DeploymentDoctor agent for remediation " +
                             $"(attempt #{previousAttempts.Count + 1})...",
                             step.Id);
+
+                        // 8.8: prefill previousAttempts with cross-session
+                        // failed attempts for the same error signature on
+                        // the same repo so the Doctor pivots instead of
+                        // re-trying known dead-ends. Only inject once per
+                        // signature per session (subsequent Doctor calls in
+                        // the same session already see them in the list).
+                        var preDoctorErrSig = SummariseErrorSignature(stepTail);
+                        if (!string.IsNullOrEmpty(preDoctorErrSig)
+                            && injectedHistoricalSigs.Add(preDoctorErrSig))
+                        {
+                            try
+                            {
+                                var historical = _memory.GetRelevantInsights(s.RepoUrl)
+                                    .FirstOrDefault(insight =>
+                                        string.Equals(insight.Key,
+                                            $"doctor.giveup.{preDoctorErrSig}",
+                                            StringComparison.OrdinalIgnoreCase));
+                                if (historical is not null
+                                    && !string.IsNullOrWhiteSpace(historical.Value))
+                                {
+                                    var lines = historical.Value.Split(
+                                        '\n',
+                                        StringSplitOptions.RemoveEmptyEntries
+                                        | StringSplitOptions.TrimEntries);
+                                    int injected = 0;
+                                    foreach (var line in lines)
+                                    {
+                                        var marker = $"[prior-session FAILED] {Truncate(line, 180)}";
+                                        if (!previousAttempts.Contains(marker, StringComparer.Ordinal))
+                                        {
+                                            previousAttempts.Insert(0, marker);
+                                            injected++;
+                                        }
+                                    }
+                                    if (injected > 0)
+                                        await Log(s, "info",
+                                            $"Memory: prepended {injected} prior-session " +
+                                            $"failed attempt(s) for signature " +
+                                            $"[{preDoctorErrSig}] to PREVIOUS_ATTEMPTS so the " +
+                                            "Doctor avoids known dead-ends.",
+                                            step.Id);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                _log.LogDebug(ex,
+                                    "Failed to load doctor.giveup insights (non-fatal).");
+                            }
+                        }
 
                         try
                         {
@@ -1690,6 +1782,10 @@ public sealed class DeploymentOrchestrator
                             for (int k = 1; k < fix.NewSteps.Count; k++)
                                 steps.Insert(targetIndex + k, fix.NewSteps[k]);
                             await PublishUpdatedPlanAsync(s, plan, steps, ct);
+                            // 8.3: arm attribution. If the (now replaced)
+                            // step exits 0 on the next iteration we will
+                            // record (errSig -> command) as a proven fix.
+                            pendingDoctorAttribution = (errSig, fix.NewSteps[0].Command ?? string.Empty);
                             // Re-execute starting from the replaced step,
                             // not from i, when the Doctor retargeted a
                             // future step — we want to run that one now.
@@ -1709,6 +1805,9 @@ public sealed class DeploymentOrchestrator
                             for (int k = 0; k < fix.NewSteps.Count; k++)
                                 steps.Insert(i + k, fix.NewSteps[k]);
                             await PublishUpdatedPlanAsync(s, plan, steps, ct);
+                            // 8.3: arm attribution against the first prep
+                            // step's command. If it exits 0 we record it.
+                            pendingDoctorAttribution = (errSig, fix.NewSteps[0].Command ?? string.Empty);
                             i--; // step at position i is now the first prep step
                             continue;
                         }
@@ -1837,6 +1936,10 @@ public sealed class DeploymentOrchestrator
                                     steps.Insert(i + k, autoPatch.NewSteps[k]);
                             }
                             await PublishUpdatedPlanAsync(s, plan, steps, ct);
+                            // 8.3: arm attribution for the auto-patch / resolver fix.
+                            pendingDoctorAttribution = (
+                                SummariseErrorSignature(stepTail),
+                                autoPatch.NewSteps[0].Command ?? string.Empty);
                             i--; // re-execute starting at the (now patched) index
                             continue;
                         }
@@ -1852,6 +1955,36 @@ public sealed class DeploymentOrchestrator
                         {
                             _memory.UpsertInsight(s.RepoUrl, "doctor.lastGiveUp",
                                 fix.Reasoning, confidence: 0.7);
+                        }
+
+                        // 8.8: per-signature failure store. Used at the
+                        // START of the next Doctor invocation for the same
+                        // repo+errSig (in this or a future session) to
+                        // prefill previousAttempts so the Doctor pivots
+                        // instead of re-trying known dead-ends.
+                        var giveUpSig = SummariseErrorSignature(stepTail);
+                        if (!string.IsNullOrEmpty(giveUpSig))
+                        {
+                            var attemptsBlob = string.Join(
+                                "\n",
+                                previousAttempts.TakeLast(8)
+                                                .Select(a => Truncate(a, 180)));
+                            if (!string.IsNullOrWhiteSpace(attemptsBlob))
+                            {
+                                try
+                                {
+                                    _memory.UpsertInsight(
+                                        s.RepoUrl,
+                                        $"doctor.giveup.{giveUpSig}",
+                                        attemptsBlob,
+                                        confidence: 0.7);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _log.LogDebug(ex,
+                                        "Failed to persist doctor.giveup insight (non-fatal).");
+                                }
+                            }
                         }
 
                         // [Escalate] verdict — the Doctor has determined that
