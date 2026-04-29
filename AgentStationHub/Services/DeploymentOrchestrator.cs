@@ -2720,6 +2720,59 @@ public sealed class DeploymentOrchestrator
         }
 
         // -----------------------------------------------------------------
+        // Pattern D: InvalidResourceLocation cross-region collision.
+        // ARM signature:
+        //   "The resource '<name>' already exists in location '<existingRegion>'
+        //    in resource group '<rg>'. A resource with the same name cannot
+        //    be created in location '<newRegion>'."
+        // Cause: a previous deploy of the same repo (same AZURE_ENV_NAME,
+        // hence same deterministic resource names + same RG name) was
+        // provisioned in <existingRegion>; the current attempt targets a
+        // different region, but `azd` derives RG/identity names from the
+        // env name, so ARM rejects it. Region-pinned resources like
+        // managed identities, ACR, etc. cannot move.
+        // Smallest surgical fix: pivot the current azd env to the
+        // existing region and re-run agentic-azd-up. This converges on
+        // whatever was already partially provisioned instead of fighting
+        // ARM. We deliberately do NOT delete the old RG (destructive,
+        // requires explicit human consent).
+        // -----------------------------------------------------------------
+        if (blob.Contains("InvalidResourceLocation", StringComparison.OrdinalIgnoreCase))
+        {
+            var locMatch = System.Text.RegularExpressions.Regex.Match(
+                blob,
+                @"already\s+exists\s+in\s+location\s+'([a-z0-9]+)'",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (locMatch.Success)
+            {
+                var existingRegion = locMatch.Groups[1].Value.ToLowerInvariant();
+                var pivot =
+                    $"bash -lc 'set -e; cd /workspace; " +
+                    $"echo \"[auto-patch] pivoting AZURE_LOCATION to {existingRegion} \" " +
+                    $"\"to match the resource group already provisioned by a previous run\"; " +
+                    $"azd env set AZURE_LOCATION {existingRegion}; " +
+                    $"agentic-azd-up'";
+                var newStepD = new AgentStationHub.Models.DeploymentStep(
+                    Id: 0,
+                    Description:
+                        $"[Auto-patch] pivot AZURE_LOCATION to '{existingRegion}' (region of pre-existing RG) " +
+                        "and re-run agentic-azd-up (synthesised after Doctor escalation on InvalidResourceLocation)",
+                    Command: pivot,
+                    WorkingDirectory: "/workspace");
+                return new AgentStationHub.Models.Remediation(
+                    Kind: "replace_step",
+                    StepId: failingStepId,
+                    NewSteps: new[] { newStepD },
+                    Reasoning:
+                        $"[auto-patched escalation] ARM rejected the deployment because a previous run " +
+                        $"of the same repo provisioned region-pinned resources (e.g. managed identity) " +
+                        $"in '{existingRegion}', and the current attempt targets a different region. " +
+                        $"Pivoted azd env to '{existingRegion}' so the deploy converges on the existing RG " +
+                        $"instead of fighting ARM over name collisions.");
+            }
+        }
+
+        // -----------------------------------------------------------------
         // Pattern C: deprecated / unsupported OpenAI model + optional version.
         // Existing logic; preserved verbatim.
         // -----------------------------------------------------------------
