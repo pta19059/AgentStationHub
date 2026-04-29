@@ -1890,12 +1890,26 @@ public sealed class PlanningTeam
 
             var input = """
                 Read the repository at /workspace and extract the CANONICAL
-                deploy procedure documented by the authors. Start with:
-                  1. list_workspace_directory(".", "*")     to see the top level;
-                  2. read_workspace_file("README.md")       for the deploy section;
-                  3. read_workspace_file("agent.yaml") and ("azure.yaml") if listed;
-                  4. read_workspace_file("Dockerfile") and any "scripts/deploy*.sh" /
-                     "infra/*.sh" / "deploy.sh" if referenced.
+                deploy procedure documented by the authors. MANDATORY plan:
+
+                  1. list_workspace_directory(".", "*")     to see the top level.
+                  2. read_workspace_file("README.md")       AND READ IT END TO END.
+                     The tool returns up to 64 KB. Most READMEs fit entirely.
+                     Local-dev sections like "Quick Start", "Get started",
+                     "Run locally" are NOT the deploy procedure even when
+                     they contain CLI commands; the deploy procedure is in
+                     a SEPARATE later section ("Deploy", "Deployment",
+                     "Deploy to Azure", "Deploy to Microsoft Foundry",
+                     "Run on Azure"). After reading, list every section
+                     heading you saw in the JSON field 'readmeSectionsScanned'.
+                  3. read_workspace_file("agent.yaml") and ("azure.yaml") if listed.
+                  4. ALWAYS open infra/main.bicep (or equivalent IaC entry).
+                     If its body is essentially empty (only `targetScope = ...`,
+                     fewer than ~10 lines, zero `resource ...` declarations),
+                     the deploy MUST start with a scaffolding command from
+                     the README, even if 'azd up' would normally suffice.
+                  5. read_workspace_file for any "scripts/deploy*.sh" /
+                     "infra/*.sh" / "deploy.sh" / Makefile if referenced.
 
                 Return ONLY the JSON object specified in your instructions.
                 """;
@@ -1964,13 +1978,42 @@ public sealed class PlanningTeam
         bootstrap commands that must run BEFORE the main deploy.
 
         ABSOLUTE RULES:
+
+        0. READ THE README END-TO-END BEFORE DECIDING. The first sections
+           ("Quick Start", "Run locally", "Get the sample running in 5
+           minutes", "Try it out") almost ALWAYS document LOCAL DEVELOPMENT
+           ONLY (python main.py, npm start, .venv activation, pip install,
+           bash scripts/start.sh, "browser UI on localhost:7860"). They are
+           NOT the deploy procedure even when they contain CLI commands.
+           The deploy procedure is in a SEPARATE, LATER section titled
+           "Deploy to Microsoft Foundry", "Deploy to Azure", "Deploy",
+           "Deployment", "Production deployment", "Run on Azure",
+           "Provision and deploy", or similar. After you read README.md,
+           list every section heading you found, and report which heading
+           you used in 'notes'. If you only inspected the first ~5 KB of
+           a long README and stopped, you are doing it WRONG � call
+           read_workspace_file('README.md') and read the FULL content the
+           tool returns (up to 64 KB).
+
         1. Use the tools (read_workspace_file, list_workspace_directory) to
            ground every command in actual file content. NEVER infer a
            command from your training data; if the README does not say it,
            it does not exist.
         2. If the README has a "Deploy", "Deployment", "Quickstart deploy",
            "Run on Azure", "Get started" section, READ IT IN FULL. Quote
-           the exact command lines including their order.
+           the exact command lines including their order. When the deploy
+           section offers MULTIPLE OPTIONS labelled like "Option A: <CLI>"
+           and "Option B: <SDK>", pick the FIRST option marked
+           'recommended' / 'fastest' / 'default' (or simply Option A
+           when no preference is given) and reproduce ALL of its steps.
+           Common deploy-section CLI families to recognise:
+             � azd init -t <template> ; azd ai agent init -m <yaml> ; azd up
+             � azd init --from-code ; azd up
+             � az group create ; az deployment group create -f <bicep>
+             � docker build/push + python scripts/deploy_*.py
+             � terraform init ; terraform apply
+             � sam deploy --guided
+             � make deploy / bash deploy.sh / bash infra/*.sh
         3. SCAFFOLDING COMMANDS MATTER. Many samples document:
               azd init -t <template>      # bootstrap from a template
               azd ai agent init -m ...    # generate Bicep from manifest
@@ -1979,11 +2022,20 @@ public sealed class PlanningTeam
            These MUST be included in 'commands' BEFORE the main deploy.
            A 30-byte stub Bicep / empty terraform / placeholder
            azure.yaml is the strongest possible signal that scaffolding
-           is required.
+           is required: ALWAYS open infra/main.bicep (or equivalent) and
+           if its body is essentially empty (only `targetScope = ...`,
+           or fewer than ~10 lines, or zero `resource ...` declarations),
+           the deploy MUST start with a scaffolding command from the
+           README, even if 'azd up' would succeed on a richer template.
         4. Include only commands that DEPLOY (provision Azure resources,
            build+push images, configure container apps). Exclude:
-             � local dev commands (python main.py, npm start, uvicorn);
-             � testing (pytest, npm test, validate.py);
+             � local dev commands (python main.py, npm start, uvicorn,
+               bash scripts/start.sh, anything that opens localhost);
+             � virtual-env / dependency setup commands inside Quick
+               Start (.venv activation, pip install -r requirements.txt,
+               npm install) UNLESS the deploy section itself lists them
+               as a prereq;
+             � testing (pytest, npm test, validate.py, bash test_*.sh);
              � cleanup (azd down, az group delete) UNLESS the README
                says they must run before deploy;
              � verification (curl, health-check) UNLESS they are part of
@@ -1996,6 +2048,17 @@ public sealed class PlanningTeam
            why in 'notes'. DO NOT make up an azd up sequence to be
            helpful; the Strategist will fall back to manifest reasoning
            (which is the correct behaviour for repos without docs).
+        7. CONFIDENCE CALIBRATION:
+             � 0.9-1.0: explicit deploy section with a fenced code block
+               of CLI commands, in order, no ambiguity.
+             � 0.7-0.9: deploy section exists, commands present but with
+               minor placeholders to substitute (region, resource group).
+             � 0.4-0.7: scattered references to azd / terraform / az
+               across the README but no single canonical block.
+             � 0.0-0.4: the only commands in the README are local-dev
+               (Quick Start). DO NOT promote local-dev commands here �
+               return commands=[] with a low confidence and explain in
+               'notes' that no deploy procedure was found.
 
         OUTPUT FORMAT (strict JSON, no markdown, no prose):
           {
@@ -2010,12 +2073,11 @@ public sealed class PlanningTeam
             ],
             "prereqs": ["<tool or env var the README says must exist>", ...],
             "envVars": { "<KEY>": "<documented default or example value>" },
+            "readmeSectionsScanned": ["<heading>", "<heading>", ...],
+            "deploySectionHeading": "<exact heading you used as the source, or null>",
             "notes": "<one paragraph explaining what you found, what you
                        skipped, and any caveats the Strategist should know>",
-            "confidence": <float 0.0-1.0 reflecting how clearly the README
-                            documents a deploy procedure: 1.0 = explicit
-                            section with command block, 0.5 = scattered
-                            references, 0.0 = no deploy info found>
+            "confidence": <float 0.0-1.0; see calibration above>
           }
 
         Do NOT include any text outside the JSON object.
