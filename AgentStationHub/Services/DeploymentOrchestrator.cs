@@ -1777,7 +1777,8 @@ public sealed class DeploymentOrchestrator
                                         stepTail: stepTail,
                                         doctorReasoning: fix.Reasoning ?? string.Empty,
                                         previousAttempts: previousAttempts.ToList(),
-                                        ct: ct);
+                                        ct: ct,
+                                        azureRegion: s.AzureLocation);
                                 }
                                 else
                                 {
@@ -1794,7 +1795,8 @@ public sealed class DeploymentOrchestrator
                                             stepTail: stepTail,
                                             doctorReasoning: fix.Reasoning ?? string.Empty,
                                             previousAttempts: previousAttempts.ToList(),
-                                            ct: ct);
+                                            ct: ct,
+                                            azureRegion: s.AzureLocation);
                                     }
                                 }
                             }

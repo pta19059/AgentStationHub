@@ -1,6 +1,7 @@
 using System.Text.Json;
 using AgentStationHub.Models;
 using AgentStationHub.Services.Security;
+using AgentStationHub.Services.Tools;
 using OpenAI.Chat;
 
 namespace AgentStationHub.Services.Agents;
@@ -32,11 +33,16 @@ public sealed class EscalationResolverAgent
 {
     private readonly ChatClient _chat;
     private readonly ILogger<EscalationResolverAgent> _log;
+    private readonly AzureModelCatalogProbe? _modelProbe;
 
-    public EscalationResolverAgent(ChatClient chat, ILogger<EscalationResolverAgent> log)
+    public EscalationResolverAgent(
+        ChatClient chat,
+        ILogger<EscalationResolverAgent> log,
+        AzureModelCatalogProbe? modelProbe = null)
     {
         _chat = chat;
         _log = log;
+        _modelProbe = modelProbe;
     }
 
     private const string SystemPrompt = """
@@ -95,6 +101,16 @@ public sealed class EscalationResolverAgent
               sandbox-side patch is plausible.
         7. Look at "previousAttempts" — DO NOT propose anything that
            was already tried (you would just re-fail the same way).
+        8. AUTHORITATIVE GROUNDING: when the input contains a non-empty
+           "azureModelCatalog" block, treat it as the ground truth for
+           which (model name, version) pairs are deployable in the
+           current region. If you propose a Bicep/azd model swap, BOTH
+           the new name AND the new version MUST appear together in
+           that catalog. NEVER propose a (name, version) that is not
+           listed there — it WILL fail ARM validation and burn another
+           remediation attempt. If no replacement in the catalog is a
+           reasonable substitute for the deprecated/unsupported model,
+           return "give_up" instead of guessing.
 
         Output JSON ONLY. No markdown, no prose, no code fences.
         """;
@@ -105,8 +121,29 @@ public sealed class EscalationResolverAgent
         string stepTail,
         string doctorReasoning,
         IReadOnlyList<string> previousAttempts,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? azureRegion = null)
     {
+        // Live-fetch the AOAI model catalog for the target region so the
+        // resolver proposes (model, version) pairs that actually exist —
+        // instead of hallucinating retired versions and ping-ponging
+        // with the Doctor. Cached 24 h in-process. Empty string when the
+        // probe is unavailable; the resolver still works without it.
+        string modelCatalogBlock = "";
+        if (_modelProbe is not null && !string.IsNullOrWhiteSpace(azureRegion))
+        {
+            try
+            {
+                modelCatalogBlock = await _modelProbe
+                    .GetCatalogPromptBlockAsync(azureRegion, ct);
+            }
+            catch (Exception ex)
+            {
+                _log.LogInformation(ex,
+                    "AzureModelCatalogProbe failed; resolver will run without live catalog grounding.");
+            }
+        }
+
         var userPayload = new
         {
             failingStep = new
@@ -116,6 +153,8 @@ public sealed class EscalationResolverAgent
                 command = failingCommand,
                 workingDirectory = failingStep.WorkingDirectory,
             },
+            azureRegion = azureRegion ?? "",
+            azureModelCatalog = modelCatalogBlock,
             errorTail = Truncate(stepTail, 6000),
             doctorReasoning = Truncate(doctorReasoning, 2000),
             previousAttempts = previousAttempts.Take(20).ToArray(),

@@ -36,6 +36,7 @@ public sealed class FoundryEscalationResolverClient
     private readonly string _agentName;
     private readonly string? _tenantId;
     private readonly ILogger<FoundryEscalationResolverClient> _log;
+    private readonly AzureModelCatalogProbe? _modelProbe;
 
     private TokenCredential? _credential;
     private AccessToken _cachedToken;
@@ -45,13 +46,15 @@ public sealed class FoundryEscalationResolverClient
         string projectEndpoint,
         string agentName,
         string? tenantId,
-        ILogger<FoundryEscalationResolverClient> log)
+        ILogger<FoundryEscalationResolverClient> log,
+        AzureModelCatalogProbe? modelProbe = null)
     {
         _http = http;
         _projectEndpoint = projectEndpoint.TrimEnd('/');
         _agentName = agentName;
         _tenantId = string.IsNullOrWhiteSpace(tenantId) ? null : tenantId;
         _log = log;
+        _modelProbe = modelProbe;
     }
 
     public async Task<Remediation?> ResolveAsync(
@@ -60,10 +63,29 @@ public sealed class FoundryEscalationResolverClient
         string stepTail,
         string doctorReasoning,
         IReadOnlyList<string> previousAttempts,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? azureRegion = null)
     {
         try
         {
+            // Live AOAI model catalog (24h cached) for the target region
+            // — grounds the hosted agent against the same authoritative
+            // surface the in-process resolver uses.
+            string modelCatalogBlock = "";
+            if (_modelProbe is not null && !string.IsNullOrWhiteSpace(azureRegion))
+            {
+                try
+                {
+                    modelCatalogBlock = await _modelProbe
+                        .GetCatalogPromptBlockAsync(azureRegion, ct);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogInformation(ex,
+                        "AzureModelCatalogProbe failed; hosted resolver will run without live catalog grounding.");
+                }
+            }
+
             // Same envelope shape used by the in-process agent so the
             // hosted agent's instructions can be authored once and work
             // across both call sites.
@@ -76,6 +98,8 @@ public sealed class FoundryEscalationResolverClient
                     command = failingCommand,
                     workingDirectory = failingStep.WorkingDirectory,
                 },
+                azureRegion = azureRegion ?? "",
+                azureModelCatalog = modelCatalogBlock,
                 errorTail = TruncateTail(stepTail, 6000),
                 doctorReasoning = TruncateTail(doctorReasoning, 2000),
                 previousAttempts = previousAttempts.Take(20).ToArray(),
