@@ -55,6 +55,17 @@ services:
       Foundry__DoctorAgentEndpoint: "${FOUNDRY_DOCTOR_AGENT_ENDPOINT:-}"
       Foundry__DoctorInvokeUrl:     "${FOUNDRY_DOCTOR_INVOKE_URL:-}"
       Foundry__DoctorApiKey:        "${FOUNDRY_DOCTOR_API_KEY:-}"
+      # Foundry Hosted-EscalationResolver migration. Set
+      # FOUNDRY_USE_FOUNDRY_ESCALATION_RESOLVER=true on a VM whose
+      # Foundry project hosts an agent named e.g.
+      # 'AgentEscalationResolver' (kind=prompt, JSON-mode-capable model)
+      # to route the LLM-driven last-line escalation resolver to that
+      # hosted agent over the Responses API. When false (default) the
+      # in-process EscalationResolverAgent (Chat Completions over
+      # AzureOpenAI:DoctorDeployment) is used.
+      Foundry__UseFoundryEscalationResolver:           "${FOUNDRY_USE_FOUNDRY_ESCALATION_RESOLVER:-false}"
+      Foundry__EscalationResolver__ProjectEndpoint:    "${FOUNDRY_ESCALATION_RESOLVER_PROJECT_ENDPOINT:-}"
+      Foundry__EscalationResolver__AgentName:          "${FOUNDRY_ESCALATION_RESOLVER_AGENT_NAME:-AgentEscalationResolver}"
       # Service-Principal credentials picked up by Azure.Identity's
       # EnvironmentCredential (first link in DefaultAzureCredential's
       # chain). Required for the FoundryDoctorClient because the host's

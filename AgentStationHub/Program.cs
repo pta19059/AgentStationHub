@@ -261,6 +261,44 @@ builder.Services.AddHttpClient("FoundryDoctor", c =>
     }
 }
 
+// Foundry Hosted-EscalationResolver client. When
+// Foundry:UseFoundryEscalationResolver=true and the project endpoint
+// + agent name are configured, the orchestrator routes the LLM-driven
+// last-line escalation resolution to a Foundry hosted agent (typically
+// 'AgentEscalationResolver') over the Responses API — same transport
+// shape as Agent Learn (FoundryAgentChatClient). Instructions, model
+// and tool routing live in the Foundry portal; the client is just the
+// transport. Falls back to the in-process EscalationResolverAgent when
+// the flag is off or the registration is skipped.
+builder.Services.AddHttpClient("FoundryEscalationResolver", c =>
+{
+    c.Timeout = TimeSpan.FromMinutes(5);
+});
+{
+    var cfg = builder.Configuration;
+    if (cfg.GetValue<bool>("Foundry:UseFoundryEscalationResolver"))
+    {
+        var projectEndpoint = cfg["Foundry:EscalationResolver:ProjectEndpoint"]
+            ?? cfg["Foundry:ChatAgent:ProjectEndpoint"]; // default to the same project as Agent Learn
+        var agentName = cfg["Foundry:EscalationResolver:AgentName"]
+            ?? "AgentEscalationResolver";
+        if (!string.IsNullOrWhiteSpace(projectEndpoint))
+        {
+            builder.Services.AddSingleton<AgentStationHub.Services.Tools.FoundryEscalationResolverClient>(sp =>
+            {
+                var http = sp.GetRequiredService<IHttpClientFactory>().CreateClient("FoundryEscalationResolver");
+                var log = sp.GetRequiredService<ILogger<AgentStationHub.Services.Tools.FoundryEscalationResolverClient>>();
+                return new AgentStationHub.Services.Tools.FoundryEscalationResolverClient(
+                    http,
+                    projectEndpoint!,
+                    agentName!,
+                    tenantId: cfg["AzureOpenAI:TenantId"],
+                    log);
+            });
+        }
+    }
+}
+
 // Foundry chat-agent client used by the floating AgentChatPanel in the
 // nav sidebar. ALWAYS registered (singleton) — the client itself
 // reports IsConfigured=false when ProjectEndpoint/AssistantId are blank,
