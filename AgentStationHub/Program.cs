@@ -144,6 +144,14 @@ builder.Services.AddSingleton<OpenAIResponseClient>(sp =>
 builder.Services.AddScoped<PlanExtractorAgent>();
 builder.Services.AddScoped<VerifierAgent>();
 
+// Live Azure OpenAI model-catalog probe. Singleton because its 24 h
+// per-region cache must be shared across all sessions on the host.
+// Used by the EscalationResolver agents (in-process and Foundry-hosted)
+// to ground their (model, version) suggestions against what's actually
+// deployable in the target region — stops the resolver from proposing
+// retired versions that ARM rejects on validation.
+builder.Services.AddSingleton<AgentStationHub.Services.Tools.AzureModelCatalogProbe>();
+
 // EscalationResolverAgent ("Meta-Doctor"): last-line LLM resolver
 // invoked by DeploymentOrchestrator when the Doctor returns
 // [Escalate] AND the deterministic auto-patch table doesn't match.
@@ -184,7 +192,8 @@ builder.Services.AddSingleton<AgentStationHub.Services.Agents.EscalationResolver
     }
     var chat = azureClient.GetChatClient(deployment);
     var log  = sp.GetRequiredService<ILogger<AgentStationHub.Services.Agents.EscalationResolverAgent>>();
-    return new AgentStationHub.Services.Agents.EscalationResolverAgent(chat, log);
+    var probe = sp.GetService<AgentStationHub.Services.Tools.AzureModelCatalogProbe>();
+    return new AgentStationHub.Services.Agents.EscalationResolverAgent(chat, log, probe);
 });
 #pragma warning restore OPENAI001, AOAI001
 
@@ -293,7 +302,8 @@ builder.Services.AddHttpClient("FoundryEscalationResolver", c =>
                     projectEndpoint!,
                     agentName!,
                     tenantId: cfg["AzureOpenAI:TenantId"],
-                    log);
+                    log,
+                    modelProbe: sp.GetService<AgentStationHub.Services.Tools.AzureModelCatalogProbe>());
             });
         }
     }
