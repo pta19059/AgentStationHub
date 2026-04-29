@@ -104,7 +104,7 @@ public static class SandboxImageBuilder
     //             `azd deploy --no-prompt`. Idempotent and safe to call
     //             multiple times. Single source of truth for every
     //             post-`azd up` deploy step.
-    private const string LocalTag = "agentichub/sandbox:v32";
+    private const string LocalTag = "agentichub/sandbox:v33";
 
     // Azure Linux (Mariner)-based azure-cli is multi-arch and ships with bash
     // and curl. We install the system toolchain via tdnf (tar, git, python,
@@ -385,7 +385,7 @@ public static class SandboxImageBuilder
         "# in Azure (~2-4 min/svc) and avoids the qemu trap entirely.\n" +
         "set -euo pipefail\n" +
         "echo \"=========================================================\"\n" +
-        "echo \"[agentic-azd-up v32] starting (split provision+ACR-build, fixed paths + ca_name + per-svc log capture + BuildKit-flag stripping + ca-update stderr capture)\"\n" +
+        "echo \"[agentic-azd-up v33] starting (resolve CA by azd-service-name tag first; falls back to name match)\"\n" +
         "echo \"=========================================================\"\n" +
         "agentic-azd-env-prime /workspace/.env || true\n" +
         "if ! azd env get-value AZURE_LOCATION >/dev/null 2>&1; then\n" +
@@ -536,12 +536,29 @@ public static class SandboxImageBuilder
         "  # template uses non-standard output keys (and azd writes 'Suggestion:' text\n" +
         "  # to stdout on missing keys, contaminating command substitution). Go directly\n" +
         "  # to az containerapp list, with strict match strategies.\n" +
-        "  ca_name=\"$(az containerapp list -g \"$rg\" --query \"[?name=='$svc'].name | [0]\" -o tsv 2>/dev/null | tr -d '[:space:]' || true)\"\n" +
+        "  # 1) PRIMARY: azd-service-name tag — this is what azd itself uses to map\n" +
+        "  #    services to resources. Bicep templates set tags.azd-service-name='<svc>'\n" +
+        "  #    on the containerapp resource, so the CA can be named anything (e.g.\n" +
+        "  #    'ca-api-<uniqueString>') and we still find it. Required for samples\n" +
+        "  #    like Azure-Samples/get-started-with-ai-agents where the bicep names\n" +
+        "  #    the CA with a uniqueString and the service id is 'api_and_frontend'.\n" +
+        "  ca_name=\"$(az containerapp list -g \"$rg\" --query \"[?tags.\\\"azd-service-name\\\"=='$svc'].name | [0]\" -o tsv 2>/dev/null | tr -d '[:space:]' || true)\"\n" +
+        "  if [ -z \"$ca_name\" ]; then\n" +
+        "    ca_name=\"$(az containerapp list -g \"$rg\" --query \"[?name=='$svc'].name | [0]\" -o tsv 2>/dev/null | tr -d '[:space:]' || true)\"\n" +
+        "  fi\n" +
         "  if [ -z \"$ca_name\" ]; then\n" +
         "    ca_name=\"$(az containerapp list -g \"$rg\" --query \"[?starts_with(name,'$svc')].name | [0]\" -o tsv 2>/dev/null | tr -d '[:space:]' || true)\"\n" +
         "  fi\n" +
         "  if [ -z \"$ca_name\" ]; then\n" +
         "    ca_name=\"$(az containerapp list -g \"$rg\" --query \"[?contains(name,'$svc')].name | [0]\" -o tsv 2>/dev/null | tr -d '[:space:]' || true)\"\n" +
+        "  fi\n" +
+        "  # 2) Last resort: services with underscores (e.g. 'api_and_frontend') often\n" +
+        "  #    map to CAs with hyphens; try a sanitized variant.\n" +
+        "  if [ -z \"$ca_name\" ]; then\n" +
+        "    svc_alt=\"$(echo \"$svc\" | tr '_' '-')\"\n" +
+        "    if [ \"$svc_alt\" != \"$svc\" ]; then\n" +
+        "      ca_name=\"$(az containerapp list -g \"$rg\" --query \"[?contains(name,'$svc_alt')].name | [0]\" -o tsv 2>/dev/null | tr -d '[:space:]' || true)\"\n" +
+        "    fi\n" +
         "  fi\n" +
         "  # Sanity: reject anything that looks like azd error/suggestion text.\n" +
         "  case \"$ca_name\" in *' '*|*ERROR*|*Suggestion*|*$'\\n'*) ca_name=\"\" ;; esac\n" +
