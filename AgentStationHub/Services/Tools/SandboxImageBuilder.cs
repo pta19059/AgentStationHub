@@ -104,7 +104,7 @@ public static class SandboxImageBuilder
     //             `azd deploy --no-prompt`. Idempotent and safe to call
     //             multiple times. Single source of truth for every
     //             post-`azd up` deploy step.
-    private const string LocalTag = "agentichub/sandbox:v33";
+    private const string LocalTag = "agentichub/sandbox:v34";
 
     // Azure Linux (Mariner)-based azure-cli is multi-arch and ships with bash
     // and curl. We install the system toolchain via tdnf (tar, git, python,
@@ -385,8 +385,30 @@ public static class SandboxImageBuilder
         "# in Azure (~2-4 min/svc) and avoids the qemu trap entirely.\n" +
         "set -euo pipefail\n" +
         "echo \"=========================================================\"\n" +
-        "echo \"[agentic-azd-up v33] starting (resolve CA by azd-service-name tag first; falls back to name match)\"\n" +
+        "echo \"[agentic-azd-up v34] starting (sanitize azd .env + resolve CA by azd-service-name tag)\"\n" +
         "echo \"=========================================================\"\n" +
+        "# Sanitize the azd env file BEFORE any azd call. azd refuses to load\n" +
+        "# the env if a single line is malformed (e.g. JSON value injected\n" +
+        "# without quoting, embedded newline, key starting with '{'). When that\n" +
+        "# happens every azd call returns 'loading .env: unexpected character'\n" +
+        "# and the deploy is wedged. Drop any line whose key is not a valid\n" +
+        "# shell identifier; keep a .bak copy for forensics.\n" +
+        "_sanitize_azd_env() {\n" +
+        "  local envfile rc\n" +
+        "  if [ ! -d .azure ]; then return 0; fi\n" +
+        "  while IFS= read -r envfile; do\n" +
+        "    [ -f \"$envfile\" ] || continue\n" +
+        "    if awk -F= 'BEGIN{bad=0} /^[[:space:]]*$/{next} /^[[:space:]]*#/{next} { if ($1 !~ /^[A-Za-z_][A-Za-z0-9_]*$/) { bad=1; exit } } END{ exit bad }' \"$envfile\"; then\n" +
+        "      continue\n" +
+        "    fi\n" +
+        "    echo \"[agentic-azd-up] WARN azd env file $envfile is corrupted — quarantining bad lines\" >&2\n" +
+        "    awk -F= '/^[[:space:]]*$/{next} /^[[:space:]]*#/{next} { if ($1 ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print }' \"$envfile\" > \"$envfile.tmp\" || true\n" +
+        "    cp \"$envfile\" \"$envfile.bak.$(date +%s)\" 2>/dev/null || true\n" +
+        "    mv \"$envfile.tmp\" \"$envfile\"\n" +
+        "    echo \"[agentic-azd-up] sanitized $envfile (kept $(wc -l < \"$envfile\") good line(s))\" >&2\n" +
+        "  done < <(find .azure -mindepth 2 -maxdepth 3 -name .env -type f 2>/dev/null)\n" +
+        "}\n" +
+        "_sanitize_azd_env || true\n" +
         "agentic-azd-env-prime /workspace/.env || true\n" +
         "if ! azd env get-value AZURE_LOCATION >/dev/null 2>&1; then\n" +
         "  [ -n \"${AZURE_LOCATION:-}\" ] && azd env set AZURE_LOCATION \"$AZURE_LOCATION\" || { echo \"[agentic-azd-up] AZURE_LOCATION missing\" >&2; exit 3; }\n" +
