@@ -2236,6 +2236,16 @@ public sealed class PlanningTeam
             sb.AppendLine("  � substitute placeholder values (<your-...>, <region>) with concrete");
             sb.AppendLine("    values from TARGET REGION / env vars;");
             sb.AppendLine("  � add 'agentic-azd-up' instead of 'azd up' so the sandbox helper runs.");
+            sb.AppendLine("CRITICAL � NON-INTERACTIVE WRAPPING for commands that PROMPT WITHOUT");
+            sb.AppendLine("a non-prompt flag (notably 'azd init -t <template>' which asks");
+            sb.AppendLine("\"Continue initializing an app in '/workspace'? (y/N)\" because the");
+            sb.AppendLine("dir already contains the cloned repo). Wrap them with `yes` so");
+            sb.AppendLine("the prompt is auto-confirmed:");
+            sb.AppendLine("  bash -lc \"yes | azd init -t <template> -e <envname>\"");
+            sb.AppendLine("DO NOT replace 'azd init -t' with 'echo skipping'; the bootstrap");
+            sb.AppendLine("step is what materialises infra/main.bicep from the upstream template,");
+            sb.AppendLine("skipping it is what causes the original 'ARM template contains no");
+            sb.AppendLine("resources' failure � the very thing the bootstrap step is for.");
             sb.AppendLine("DO NOT invent commands not listed here. DO NOT skip listed commands.");
             sb.AppendLine();
             sb.AppendLine(deployIntentJson.Trim());
