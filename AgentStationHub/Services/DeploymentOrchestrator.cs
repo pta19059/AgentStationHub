@@ -2544,33 +2544,49 @@ public sealed class DeploymentOrchestrator
         var blob = (reasoning ?? string.Empty) + "\n" + (stepTail ?? string.Empty);
         if (blob.Length == 0) return null;
 
-        // Match: deprecated ... model ... 'name'  OR  model 'name' ... deprecated
-        // Names are quoted in the Doctor's reasoning + Azure REST errors
-        // ("'gpt-4o-realtime-preview'"). Don't match unquoted free text.
-        var rxDepWithName = new System.Text.RegularExpressions.Regex(
-            @"deprecat\w*[\s\S]{0,80}?['""]([A-Za-z0-9][A-Za-z0-9\-_.]{2,80})['""]",
-            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        var rxNameThenDep = new System.Text.RegularExpressions.Regex(
-            @"['""]([A-Za-z0-9][A-Za-z0-9\-_.]{2,80})['""][\s\S]{0,80}?deprecat\w*",
-            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-
-        var m = rxDepWithName.Match(blob);
-        if (!m.Success) m = rxNameThenDep.Match(blob);
-        if (!m.Success) return null;
-
-        var deprecated = m.Groups[1].Value;
-        // Sanity: the captured token must look like a real OpenAI model
-        // name (must contain at least one digit OR start with 'gpt'/'text-'/'whisper'/'tts').
-        if (!System.Text.RegularExpressions.Regex.IsMatch(
-                deprecated,
-                @"^(gpt-|text-|whisper|tts|dall-e|o\d|chatgpt-)",
+        // Trigger words. The Foundry Doctor uses a wide vocabulary for
+        // "this model is the wrong choice": deprecated, unsupported, not
+        // supported, retired, no longer available, …. All of them imply
+        // the same mechanical fix on our side: sed-replace the offending
+        // model/version pair with a known-good one.
+        if (!System.Text.RegularExpressions.Regex.IsMatch(blob,
+                @"deprecat\w*|unsupported|not\s+supported|retired|no\s+longer\s+available",
                 System.Text.RegularExpressions.RegexOptions.IgnoreCase))
             return null;
 
-        // Map deprecated -> replacement. Conservative: only families we
-        // have observed working in eastus2 / swedencentral / westeurope
-        // as of Apr 2026.
-        string? replacement = deprecated.ToLowerInvariant() switch
+        // Extract model name (quoted in the Doctor's reasoning + Azure
+        // REST errors, e.g. "'gpt-4o-realtime-preview'" or "'gpt-realtime'").
+        // Sanity-check the captured token looks like an OpenAI model id.
+        string? modelName = null;
+        foreach (System.Text.RegularExpressions.Match mm in
+                 System.Text.RegularExpressions.Regex.Matches(
+                     blob,
+                     @"['""]([A-Za-z0-9][A-Za-z0-9\-_.]{2,80})['""]"))
+        {
+            var cand = mm.Groups[1].Value;
+            if (System.Text.RegularExpressions.Regex.IsMatch(
+                    cand,
+                    @"^(gpt-|text-|whisper|tts|dall-e|o\d|chatgpt-)",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            {
+                modelName = cand;
+                break;
+            }
+        }
+        if (modelName is null) return null;
+
+        // Extract version (YYYY-MM-DD) when the Doctor mentions one.
+        // Pattern: "version '2024-12-17'", "version 2024-12-17", "v 2024-12-17".
+        string? badVersion = null;
+        var vm = System.Text.RegularExpressions.Regex.Match(
+            blob,
+            @"version\s+['""]?(\d{4}-\d{2}-\d{2})['""]?",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (vm.Success) badVersion = vm.Groups[1].Value;
+
+        // Model-name replacement table (Apr 2026): conservative set
+        // observed working in eastus2 / swedencentral / westeurope.
+        string? modelReplacement = modelName.ToLowerInvariant() switch
         {
             "gpt-4o-realtime-preview"      => "gpt-realtime",
             "gpt-4o-mini-realtime-preview" => "gpt-realtime",
@@ -2586,52 +2602,99 @@ public sealed class DeploymentOrchestrator
             "text-davinci-002"             => "gpt-4o-mini",
             _ => null
         };
-        if (replacement is null) return null;
-        if (string.Equals(deprecated, replacement, StringComparison.OrdinalIgnoreCase))
-            return null;
 
-        // Build a single bash command that finds every infra/config file
-        // referencing the deprecated name and rewrites it in place. Scope
-        // to common IaC + config extensions to avoid mangling unrelated
-        // text. The whole script is wrapped in `bash -lc '...'` (single
-        // quotes) so we don't have to escape `$files` / `"..."` echos.
-        // The deprecated/replacement names are validated above to be
-        // OpenAI-style identifiers ([A-Za-z0-9._-]+) so they cannot break
-        // out of the single-quoted context.
-        var sedPattern = System.Text.RegularExpressions.Regex
-            .Escape(deprecated)
-            .Replace("|", "\\|");
-        var sed =
-            "set -e; cd /workspace; " +
-            $"echo \"[auto-patch] replacing deprecated OpenAI model {deprecated} -> {replacement}\"; " +
-            "files=$(grep -rl --include=\"*.bicep\" --include=\"*.bicepparam\" " +
+        // (model, badVersion) -> goodVersion table. Used when the model
+        // itself is fine but the pinned version is no longer available.
+        // Keys are normalised to lower-case + the version string.
+        string? versionReplacement = null;
+        if (badVersion is not null)
+        {
+            versionReplacement = (modelName.ToLowerInvariant(), badVersion) switch
+            {
+                ("gpt-realtime",   "2024-12-17") => "2025-08-28",
+                ("gpt-realtime",   "2024-10-01") => "2025-08-28",
+                ("gpt-4o",         "2024-05-13") => "2024-11-20",
+                ("gpt-4o",         "2024-08-06") => "2024-11-20",
+                ("gpt-4o-mini",    "2024-07-18") => "2024-07-18", // still GA
+                _ => null
+            };
+            if (string.Equals(versionReplacement, badVersion, StringComparison.Ordinal))
+                versionReplacement = null;
+        }
+
+        // If we have neither a model swap nor a version swap, bail.
+        var willSwapModel   = modelReplacement is not null
+                               && !string.Equals(modelName, modelReplacement, StringComparison.OrdinalIgnoreCase);
+        var willSwapVersion = versionReplacement is not null;
+        if (!willSwapModel && !willSwapVersion) return null;
+
+        // Build the bash patch. The whole script is wrapped in `bash -lc
+        // '...'` (single-quoted) so we don't have to escape inner double
+        // quotes. The model/version tokens are validated above to be
+        // [A-Za-z0-9._-]+ / YYYY-MM-DD so they cannot break the quoting.
+        var sb = new System.Text.StringBuilder();
+        sb.Append("set -e; cd /workspace; ");
+        sb.Append("echo \"[auto-patch] Doctor escalation auto-fix:\"; ");
+
+        // Common file scope: every IaC / config file we expect to hold
+        // model references.
+        const string scope =
+            "--include=\"*.bicep\" --include=\"*.bicepparam\" " +
             "--include=\"*.json\" --include=\"*.yaml\" --include=\"*.yml\" " +
-            "--include=\"*.env\" --include=\"*.parameters.json\" " +
-            $"-e \"{deprecated}\" . 2>/dev/null || true); " +
-            "if [ -z \"$files\" ]; then " +
-            $"  echo \"[auto-patch] no files reference {deprecated} — nothing to do\"; " +
-            "else " +
-            "  echo \"[auto-patch] patching:\"; echo \"$files\"; " +
-            $"  echo \"$files\" | xargs sed -i \"s|{sedPattern}|{replacement}|g\"; " +
-            "  echo \"[auto-patch] done\"; " +
-            "fi";
+            "--include=\"*.env\" --include=\"*.parameters.json\"";
+
+        var description = new System.Text.StringBuilder("[Auto-patch] ");
+
+        if (willSwapModel)
+        {
+            var oldModel = modelName!;
+            var newModel = modelReplacement!;
+            sb.Append($"echo \" - model {oldModel} -> {newModel}\"; ");
+            sb.Append("files=$(grep -rl ").Append(scope)
+              .Append($" -e \"{oldModel}\" . 2>/dev/null || true); ");
+            sb.Append("if [ -n \"$files\" ]; then echo \"$files\" | xargs sed -i ")
+              .Append($"\"s|{System.Text.RegularExpressions.Regex.Escape(oldModel).Replace("|", "\\|")}|{newModel}|g\"; fi; ");
+            description.Append($"replace OpenAI model '{oldModel}' with '{newModel}'");
+        }
+
+        if (willSwapVersion)
+        {
+            var oldV = badVersion!;
+            var newV = versionReplacement!;
+            sb.Append($"echo \" - version {oldV} -> {newV} (only on lines mentioning 'version')\"; ");
+            // Restrict the sed to lines containing 'version' (case-insensitive)
+            // to avoid clobbering unrelated dates in the repo.
+            sb.Append("vfiles=$(grep -rl ").Append(scope)
+              .Append($" -e \"{oldV}\" . 2>/dev/null || true); ");
+            sb.Append("if [ -n \"$vfiles\" ]; then echo \"$vfiles\" | xargs sed -i -E ")
+              .Append($"\"/version/I s|{oldV}|{newV}|g\"; fi; ");
+            if (description.Length > "[Auto-patch] ".Length) description.Append(" + ");
+            description.Append($"replace OpenAI model version '{oldV}' with '{newV}'");
+        }
+
+        sb.Append("echo \"[auto-patch] done\"");
 
         var newStep = new AgentStationHub.Models.DeploymentStep(
             Id: 0,
-            Description:
-                $"[Auto-patch] replace deprecated OpenAI model '{deprecated}' with '{replacement}' " +
-                "in repo IaC files (synthesised after Doctor escalation)",
-            Command: $"bash -lc '{sed}'",
+            Description: description.ToString() + " (synthesised after Doctor escalation)",
+            Command: $"bash -lc '{sb}'",
             WorkingDirectory: "/workspace");
+
+        var reasoningSummary = new System.Text.StringBuilder("[auto-patched escalation] ");
+        if (willSwapModel)
+            reasoningSummary.Append($"model '{modelName}' -> '{modelReplacement}'");
+        if (willSwapVersion)
+        {
+            if (willSwapModel) reasoningSummary.Append(", ");
+            reasoningSummary.Append($"version '{badVersion}' -> '{versionReplacement}'");
+        }
+        reasoningSummary.Append(". Synthesised sed across IaC files so the deploy can proceed without a source-repo PR.");
 
         return new AgentStationHub.Models.Remediation(
             Kind: "insert_before",
             StepId: failingStepId,
             NewSteps: new[] { newStep },
-            Reasoning:
-                $"[auto-patched escalation] Doctor escalated about deprecated model " +
-                $"'{deprecated}'; orchestrator synthesised a sed replacement to '{replacement}' " +
-                "across IaC files so the deploy can proceed without a source-repo PR.");
+            Reasoning: reasoningSummary.ToString());
     }
 
     /// <summary>
