@@ -2787,35 +2787,63 @@ public sealed class DeploymentOrchestrator
                 System.Text.RegularExpressions.RegexOptions.IgnoreCase))
             return null;
 
-        // Extract model name (quoted in the Doctor's reasoning + Azure
-        // REST errors, e.g. "'gpt-4o-realtime-preview'" or "'gpt-realtime'").
-        // Sanity-check the captured token looks like an OpenAI model id.
+        // Extract model name. Two surfaces:
+        //  (a) ARM error envelope: 'Format:OpenAI,Name:gpt-realtime,Version:2024-12-17'
+        //      emitted by DeploymentModelNotSupported / ServiceModelDeprecated.
+        //      The whole quoted token contains colons and commas so the
+        //      generic [A-Za-z0-9\-_.] regex below cannot capture it.
+        //  (b) Doctor reasoning + plain ARM text: 'gpt-realtime' alone.
+        //
+        // We probe (a) first because when both surfaces are present in
+        // the same blob (typical: the ARM error is included in the log
+        // tail and the Doctor reasoning quotes the bare model name) we
+        // want the ARM authoritative pair, not the bare token.
         string? modelName = null;
-        foreach (System.Text.RegularExpressions.Match mm in
-                 System.Text.RegularExpressions.Regex.Matches(
-                     blob,
-                     @"['""]([A-Za-z0-9][A-Za-z0-9\-_.]{2,80})['""]"))
+        string? badVersion = null;
+
+        var armMatch = System.Text.RegularExpressions.Regex.Match(
+            blob,
+            @"Name:\s*([A-Za-z0-9][A-Za-z0-9\-_.]{2,80})\s*,\s*Version:\s*(\d{4}-\d{2}-\d{2})",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (armMatch.Success)
         {
-            var cand = mm.Groups[1].Value;
-            if (System.Text.RegularExpressions.Regex.IsMatch(
-                    cand,
-                    @"^(gpt-|text-|whisper|tts|dall-e|o\d|chatgpt-)",
-                    System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            modelName = armMatch.Groups[1].Value;
+            badVersion = armMatch.Groups[2].Value;
+        }
+
+        // (b) Quoted token fallback. Sanity-check it looks like an OpenAI
+        // model id so we don't accidentally rewrite a sample app name.
+        if (modelName is null)
+        {
+            foreach (System.Text.RegularExpressions.Match mm in
+                     System.Text.RegularExpressions.Regex.Matches(
+                         blob,
+                         @"['""]([A-Za-z0-9][A-Za-z0-9\-_.]{2,80})['""]"))
             {
-                modelName = cand;
-                break;
+                var cand = mm.Groups[1].Value;
+                if (System.Text.RegularExpressions.Regex.IsMatch(
+                        cand,
+                        @"^(gpt-|text-|whisper|tts|dall-e|o\d|chatgpt-)",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                {
+                    modelName = cand;
+                    break;
+                }
             }
         }
         if (modelName is null) return null;
 
         // Extract version (YYYY-MM-DD) when the Doctor mentions one.
+        // Skipped if (a) already populated badVersion from the ARM pair.
         // Pattern: "version '2024-12-17'", "version 2024-12-17", "v 2024-12-17".
-        string? badVersion = null;
-        var vm = System.Text.RegularExpressions.Regex.Match(
-            blob,
-            @"version\s+['""]?(\d{4}-\d{2}-\d{2})['""]?",
-            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        if (vm.Success) badVersion = vm.Groups[1].Value;
+        if (badVersion is null)
+        {
+            var vm = System.Text.RegularExpressions.Regex.Match(
+                blob,
+                @"version\s+['""]?(\d{4}-\d{2}-\d{2})['""]?",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (vm.Success) badVersion = vm.Groups[1].Value;
+        }
 
         // Model-name replacement table (Apr 2026): conservative set
         // observed working in eastus2 / swedencentral / westeurope.
@@ -2844,11 +2872,23 @@ public sealed class DeploymentOrchestrator
         {
             versionReplacement = (modelName.ToLowerInvariant(), badVersion) switch
             {
-                ("gpt-realtime",   "2024-12-17") => "2025-08-28",
-                ("gpt-realtime",   "2024-10-01") => "2025-08-28",
-                ("gpt-4o",         "2024-05-13") => "2024-11-20",
-                ("gpt-4o",         "2024-08-06") => "2024-11-20",
-                ("gpt-4o-mini",    "2024-07-18") => "2024-07-18", // still GA
+                ("gpt-realtime",                 "2024-12-17") => "2025-08-28",
+                ("gpt-realtime",                 "2024-10-01") => "2025-08-28",
+                // The deprecated gpt-4o-realtime-preview never existed at
+                // 2025-08-28; but when our own auto-patch swaps the name
+                // to gpt-realtime the version must move too. We also
+                // pre-emptively handle the case where the Doctor's first
+                // escalation already mentions both the deprecated name
+                // and the unsupported version: applying both swaps in a
+                // single pass avoids the ping-pong loop where the
+                // Doctor reverts the name and the version gets stuck.
+                ("gpt-4o-realtime-preview",      "2024-12-17") => "2025-08-28",
+                ("gpt-4o-realtime-preview",      "2024-10-01") => "2025-08-28",
+                ("gpt-4o-mini-realtime-preview", "2024-12-17") => "2025-08-28",
+                ("gpt-4o-mini-realtime-preview", "2024-10-01") => "2025-08-28",
+                ("gpt-4o",                       "2024-05-13") => "2024-11-20",
+                ("gpt-4o",                       "2024-08-06") => "2024-11-20",
+                ("gpt-4o-mini",                  "2024-07-18") => "2024-07-18", // still GA
                 _ => null
             };
             if (string.Equals(versionReplacement, badVersion, StringComparison.Ordinal))
