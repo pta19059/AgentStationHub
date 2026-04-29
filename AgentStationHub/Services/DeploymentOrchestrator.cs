@@ -1731,6 +1731,35 @@ public sealed class DeploymentOrchestrator
                             && fix.Reasoning!.TrimStart().StartsWith("[Escalate]",
                                 StringComparison.OrdinalIgnoreCase);
 
+                        // ----------------------------------------------------------
+                        // Auto-patch override: when the Doctor escalates because the
+                        // repo's Bicep/parameters/azure.yaml references a deprecated
+                        // OpenAI model name, the fix is mechanical (sed + retry) and
+                        // we should NOT bounce the user out to "open a PR on the
+                        // upstream sample". Synthesise an insert_before remediation
+                        // here, apply it inline, and continue the loop. The Doctor's
+                        // job is to produce a remediation; when its hosted backend
+                        // refuses, the orchestrator fills the gap deterministically.
+                        // ----------------------------------------------------------
+                        var autoPatch = TryAutoPatchEscalation(
+                            fix.Reasoning ?? string.Empty, stepTail, step.Id);
+                        if (autoPatch is not null && autoPatch.NewSteps is { Count: > 0 })
+                        {
+                            await Log(s, "status",
+                                $"🩺 Doctor escalated, but the orchestrator recognised the " +
+                                $"failure signature as auto-patchable. Applying synthesised " +
+                                $"insert_before: {autoPatch.NewSteps[0].Description}",
+                                step.Id);
+                            previousAttempts.Add(
+                                $"step {step.Id} [{SummariseErrorSignature(stepTail)}] " +
+                                $"AUTO_PATCH: {Truncate(autoPatch.NewSteps[0].Command, 100)}");
+                            for (int k = 0; k < autoPatch.NewSteps.Count; k++)
+                                steps.Insert(i + k, autoPatch.NewSteps[k]);
+                            await PublishUpdatedPlanAsync(s, plan, steps, ct);
+                            i--; // step at position i is now the first auto-patch step
+                            continue;
+                        }
+
                         await Log(s, isEscalate ? "info" : "err",
                             $"Doctor gave up: {fix.Reasoning ?? "(no reason provided)"}",
                             step.Id);
@@ -2491,6 +2520,118 @@ public sealed class DeploymentOrchestrator
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// When the Doctor returns a 'give_up' (typically with `[Escalate]`)
+    /// for a failure class that has a deterministic in-sandbox fix, the
+    /// orchestrator can synthesise the remediation itself rather than
+    /// bouncing the user out to "open a PR on the upstream repo". The
+    /// guarded patterns are conservative — only fire when the error
+    /// reasoning + step tail clearly identify the issue and a known-good
+    /// substitution exists.
+    ///
+    /// Currently handled:
+    ///   • Deprecated OpenAI model names in Bicep / parameters / yaml.
+    ///     The hosted Doctor escalates with messages like
+    ///     "deploying the deprecated OpenAI model 'gpt-4o-realtime-preview'".
+    ///     The fix is mechanical: sed -i across .bicep / .json / .yaml
+    ///     files in the workspace, then re-run the failing step.
+    /// </summary>
+    private static AgentStationHub.Models.Remediation?
+        TryAutoPatchEscalation(string reasoning, string stepTail, int failingStepId)
+    {
+        var blob = (reasoning ?? string.Empty) + "\n" + (stepTail ?? string.Empty);
+        if (blob.Length == 0) return null;
+
+        // Match: deprecated ... model ... 'name'  OR  model 'name' ... deprecated
+        // Names are quoted in the Doctor's reasoning + Azure REST errors
+        // ("'gpt-4o-realtime-preview'"). Don't match unquoted free text.
+        var rxDepWithName = new System.Text.RegularExpressions.Regex(
+            @"deprecat\w*[\s\S]{0,80}?['""]([A-Za-z0-9][A-Za-z0-9\-_.]{2,80})['""]",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var rxNameThenDep = new System.Text.RegularExpressions.Regex(
+            @"['""]([A-Za-z0-9][A-Za-z0-9\-_.]{2,80})['""][\s\S]{0,80}?deprecat\w*",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        var m = rxDepWithName.Match(blob);
+        if (!m.Success) m = rxNameThenDep.Match(blob);
+        if (!m.Success) return null;
+
+        var deprecated = m.Groups[1].Value;
+        // Sanity: the captured token must look like a real OpenAI model
+        // name (must contain at least one digit OR start with 'gpt'/'text-'/'whisper'/'tts').
+        if (!System.Text.RegularExpressions.Regex.IsMatch(
+                deprecated,
+                @"^(gpt-|text-|whisper|tts|dall-e|o\d|chatgpt-)",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            return null;
+
+        // Map deprecated -> replacement. Conservative: only families we
+        // have observed working in eastus2 / swedencentral / westeurope
+        // as of Apr 2026.
+        string? replacement = deprecated.ToLowerInvariant() switch
+        {
+            "gpt-4o-realtime-preview"      => "gpt-realtime",
+            "gpt-4o-mini-realtime-preview" => "gpt-realtime",
+            "gpt-4-turbo-preview"          => "gpt-4o-mini",
+            "gpt-4-turbo"                  => "gpt-4o-mini",
+            "gpt-4-32k"                    => "gpt-4o-mini",
+            "gpt-4"                        => "gpt-4o-mini",
+            "gpt-35-turbo"                 => "gpt-4o-mini",
+            "gpt-35-turbo-16k"             => "gpt-4o-mini",
+            "gpt-3.5-turbo"                => "gpt-4o-mini",
+            "gpt-3.5-turbo-16k"            => "gpt-4o-mini",
+            "text-davinci-003"             => "gpt-4o-mini",
+            "text-davinci-002"             => "gpt-4o-mini",
+            _ => null
+        };
+        if (replacement is null) return null;
+        if (string.Equals(deprecated, replacement, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        // Build a single bash command that finds every infra/config file
+        // referencing the deprecated name and rewrites it in place. Scope
+        // to common IaC + config extensions to avoid mangling unrelated
+        // text. The whole script is wrapped in `bash -lc '...'` (single
+        // quotes) so we don't have to escape `$files` / `"..."` echos.
+        // The deprecated/replacement names are validated above to be
+        // OpenAI-style identifiers ([A-Za-z0-9._-]+) so they cannot break
+        // out of the single-quoted context.
+        var sedPattern = System.Text.RegularExpressions.Regex
+            .Escape(deprecated)
+            .Replace("|", "\\|");
+        var sed =
+            "set -e; cd /workspace; " +
+            $"echo \"[auto-patch] replacing deprecated OpenAI model {deprecated} -> {replacement}\"; " +
+            "files=$(grep -rl --include=\"*.bicep\" --include=\"*.bicepparam\" " +
+            "--include=\"*.json\" --include=\"*.yaml\" --include=\"*.yml\" " +
+            "--include=\"*.env\" --include=\"*.parameters.json\" " +
+            $"-e \"{deprecated}\" . 2>/dev/null || true); " +
+            "if [ -z \"$files\" ]; then " +
+            $"  echo \"[auto-patch] no files reference {deprecated} — nothing to do\"; " +
+            "else " +
+            "  echo \"[auto-patch] patching:\"; echo \"$files\"; " +
+            $"  echo \"$files\" | xargs sed -i \"s|{sedPattern}|{replacement}|g\"; " +
+            "  echo \"[auto-patch] done\"; " +
+            "fi";
+
+        var newStep = new AgentStationHub.Models.DeploymentStep(
+            Id: 0,
+            Description:
+                $"[Auto-patch] replace deprecated OpenAI model '{deprecated}' with '{replacement}' " +
+                "in repo IaC files (synthesised after Doctor escalation)",
+            Command: $"bash -lc '{sed}'",
+            WorkingDirectory: "/workspace");
+
+        return new AgentStationHub.Models.Remediation(
+            Kind: "insert_before",
+            StepId: failingStepId,
+            NewSteps: new[] { newStep },
+            Reasoning:
+                $"[auto-patched escalation] Doctor escalated about deprecated model " +
+                $"'{deprecated}'; orchestrator synthesised a sed replacement to '{replacement}' " +
+                "across IaC files so the deploy can proceed without a source-repo PR.");
     }
 
     /// <summary>
