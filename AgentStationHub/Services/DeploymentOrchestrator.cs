@@ -780,6 +780,32 @@ public sealed class DeploymentOrchestrator
                     }
                 }
 
+                // Pre-execution normalisation #3: harden any 'azd init -t
+                // <template>' against its two interactive prompts
+                // ("Continue initializing an app in '/workspace'? (y/N)"
+                // and "Enter a unique environment name"). Without this
+                // we let the step fail once, fire the silence cap, and
+                // burn a Doctor invocation � whereas the safe form is
+                // a deterministic regex rewrite that any operator would
+                // type by hand. Adds `-e <azdEnvName>` (using the env
+                // name the orchestrator already resolved deterministically
+                // from the plan) AND `--no-prompt`, then pipes `yes`
+                // for older azd builds whose --no-prompt still asks for
+                // env name. Idempotent: no-ops when the flags / yes
+                // pipeline are already present.
+                if (HardenAzdInit(step.Command, azdEnvName, out var hardened))
+                {
+                    await Log(s, "warn",
+                        "Step uses 'azd init -t' � auto-hardening with " +
+                        $"'-e {azdEnvName ?? "<envname>"} --no-prompt' and a " +
+                        "'yes |' prefix to skip the directory-not-empty + " +
+                        "env-name prompts that loop on stdin in headless mode. " +
+                        $"rewritten=`{Truncate(hardened, 200)}`",
+                        step.Id);
+                    step = step with { Command = hardened };
+                    steps[i] = step;
+                }
+
                 await Log(s, "status", $"▶ Step {step.Id}: {step.Description}", step.Id);
 
                 // Long-running azd commands can go silent for several minutes
@@ -1461,25 +1487,29 @@ public sealed class DeploymentOrchestrator
                         // <template>' refuses to overwrite a non-empty
                         // working dir and aborts with exit 1 + the prompt
                         // "Continue initializing an app in '/workspace'?
-                        // (y/N)". Our step runs without a TTY so the
-                        // prompt always defaults to N. The fix is a
-                        // deterministic one-character edit (wrap with
-                        // `yes |`) � invoking the LLM Doctor here is
-                        // pure overhead and risks a buggy "echo skipping"
-                        // remediation that defeats the bootstrap and
-                        // re-introduces the very ARM-empty-template
-                        // failure the bootstrap step exists to prevent.
+                        // (y/N)". Even after wrapping with `yes` so that
+                        // first prompt auto-confirms, azd init then
+                        // prompts for "Enter a unique environment name"
+                        // which reads from stdin again and on some
+                        // pipelines we observed reading empty strings in
+                        // a tight loop until the silence cap fires. The
+                        // robust fix is to pass `-e <envname>` and
+                        // `--no-prompt` to azd init so it never asks for
+                        // the env name AND it accepts the existing dir
+                        // without confirmation. We keep `yes |` as a
+                        // belt-and-braces measure for older azd builds
+                        // that still prompt despite --no-prompt.
                         // Match: command contains 'azd init' AND tail
-                        // contains the canonical prompt string. The
-                        // patched command pipes 'y\n' lines into the
-                        // command via `yes` so the confirmation auto-
-                        // accepts. We only auto-patch ONCE per step
-                        // (guard via previousAttempts) so a follow-up
-                        // failure still reaches the Doctor.
+                        // contains either prompt signature. The patched
+                        // command pipes 'y' lines AND adds -e + --no-prompt.
+                        // We only auto-patch ONCE per step (guard via
+                        // previousAttempts).
                         var azdInitContinue =
                             (step.Command ?? "").Contains("azd init", StringComparison.OrdinalIgnoreCase)
-                            && (stepTail ?? "").Contains("Continue initializing an app",
+                            && ((stepTail ?? "").Contains("Continue initializing an app",
                                                  StringComparison.OrdinalIgnoreCase)
+                                || (stepTail ?? "").Contains("Enter a unique environment name",
+                                                 StringComparison.OrdinalIgnoreCase))
                             && !previousAttempts.Any(a =>
                                 a.Contains("[AutoPatch:azd-init-yes]"));
                         if (azdInitContinue)
@@ -1493,7 +1523,38 @@ public sealed class DeploymentOrchestrator
                                 System.Text.RegularExpressions.RegexOptions.Singleline);
                             if (bashLc.Success)
                                 inner = bashLc.Groups[1].Value.Replace("\\\"", "\"");
-                            // Avoid double-wrapping if the planner already used `yes |`.
+
+                            // Inject -e <envname> if missing. azd init reads
+                            // the env name from -e / --environment first
+                            // before prompting, so this skips the prompt
+                            // entirely. Without this, even with --no-prompt
+                            // some azd builds still bail with "environment
+                            // name '' is invalid".
+                            var hasEnvFlag = System.Text.RegularExpressions.Regex.IsMatch(
+                                inner, @"\b(-e|--environment)\s+\S+");
+                            if (!hasEnvFlag && !string.IsNullOrWhiteSpace(azdEnvName))
+                            {
+                                // Insert right after 'azd init' so the flag
+                                // applies to the right subcommand.
+                                inner = System.Text.RegularExpressions.Regex.Replace(
+                                    inner,
+                                    @"\bazd\s+init\b",
+                                    $"azd init -e {azdEnvName}",
+                                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                            }
+
+                            // Inject --no-prompt if missing.
+                            if (!inner.Contains("--no-prompt", StringComparison.Ordinal))
+                            {
+                                inner = System.Text.RegularExpressions.Regex.Replace(
+                                    inner,
+                                    @"\bazd\s+init\b",
+                                    "azd init --no-prompt",
+                                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                            }
+
+                            // Belt-and-braces: pipe `yes` so any residual
+                            // confirmation prompt auto-confirms.
                             if (!inner.TrimStart().StartsWith("yes ", StringComparison.Ordinal)
                                 && !inner.Contains("yes |", StringComparison.Ordinal))
                             {
@@ -1503,12 +1564,13 @@ public sealed class DeploymentOrchestrator
 
                             previousAttempts.Add(
                                 $"[AutoPatch:azd-init-yes] step {step.Id} azd-init prompted " +
-                                "for confirmation in non-empty dir; wrapped with 'yes |' so " +
-                                "the (y/N) prompt auto-confirms.");
+                                "in non-empty dir / for env name; injected -e + --no-prompt + " +
+                                "wrapped with 'yes |'.");
                             await Log(s, "status",
-                                $"Auto-patch: 'azd init' aborted on the directory-not-empty " +
-                                $"prompt. Wrapping the command with 'yes |' to auto-confirm, " +
-                                $"replacing step {step.Id} and re-running (skipping LLM Doctor).",
+                                $"Auto-patch: 'azd init' looped on interactive prompt. " +
+                                $"Injecting '-e {azdEnvName ?? "<envname>"} --no-prompt' and " +
+                                $"piping 'yes' so prompts auto-resolve. Replacing step " +
+                                $"{step.Id} and re-running (skipping LLM Doctor).",
                                 step.Id);
                             steps[i] = step with { Command = patched };
                             i--; // re-execute the patched step at the same index
@@ -2508,15 +2570,88 @@ public sealed class DeploymentOrchestrator
     }
 
     /// <summary>
+    /// Pre-execution hardening for `azd init -t <template>` steps. The
+    /// command has TWO interactive prompts that wedge in headless
+    /// pipelines: (a) "Continue initializing an app in '/workspace'?
+    /// (y/N)" when the working dir already contains the cloned repo
+    /// (always, in our flow), and (b) "Enter a unique environment
+    /// name". On some `yes`-piped pipelines we observed the second
+    /// prompt reading EMPTY strings in a tight loop � only the silence
+    /// cap rescued the session. The deterministic fix is to inject
+    /// `-e &lt;envname&gt;` (using the env name the orchestrator already
+    /// resolved from the plan) and `--no-prompt`, then prefix with
+    /// `yes |` for older azd builds whose --no-prompt still asks for
+    /// confirmation. Idempotent: returns false (no rewrite needed)
+    /// when all three are already present.
+    /// </summary>
+    private static bool HardenAzdInit(string? cmd, string? azdEnvName, out string hardened)
+    {
+        hardened = cmd ?? "";
+        if (string.IsNullOrWhiteSpace(cmd)) return false;
+        if (!System.Text.RegularExpressions.Regex.IsMatch(
+                cmd, @"\bazd\s+init\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            return false;
+
+        // Strip an existing 'bash -lc "..."' wrapper if present so we don't
+        // end up with nested quotes when we re-wrap at the end.
+        var inner = cmd.Trim();
+        var bashLc = System.Text.RegularExpressions.Regex.Match(
+            inner,
+            @"^bash\s+-l?c\s+""(.+)""\s*$",
+            System.Text.RegularExpressions.RegexOptions.Singleline);
+        var hadBashWrap = bashLc.Success;
+        if (hadBashWrap)
+            inner = bashLc.Groups[1].Value.Replace("\\\"", "\"");
+
+        var changed = false;
+
+        // Inject -e <envname> if missing.
+        var hasEnvFlag = System.Text.RegularExpressions.Regex.IsMatch(
+            inner, @"\b(-e|--environment)\s+\S+");
+        if (!hasEnvFlag && !string.IsNullOrWhiteSpace(azdEnvName))
+        {
+            inner = System.Text.RegularExpressions.Regex.Replace(
+                inner,
+                @"\bazd\s+init\b",
+                $"azd init -e {azdEnvName}",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            changed = true;
+        }
+
+        // Inject --no-prompt if missing.
+        if (!inner.Contains("--no-prompt", StringComparison.Ordinal))
+        {
+            inner = System.Text.RegularExpressions.Regex.Replace(
+                inner,
+                @"\bazd\s+init\b",
+                "azd init --no-prompt",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            changed = true;
+        }
+
+        // Prefix with `yes |` if missing.
+        var trimmed = inner.TrimStart();
+        if (!trimmed.StartsWith("yes ", StringComparison.Ordinal)
+            && !trimmed.StartsWith("yes\t", StringComparison.Ordinal)
+            && !inner.Contains("yes |", StringComparison.Ordinal))
+        {
+            inner = "yes | " + inner;
+            changed = true;
+        }
+
+        if (!changed) return false;
+
+        hardened = hadBashWrap
+            ? $"bash -lc \"{inner.Replace("\"", "\\\"")}\""
+            : (cmd.StartsWith("bash ", StringComparison.Ordinal) ? inner : $"bash -lc \"{inner.Replace("\"", "\\\"")}\"");
+        return true;
+    }
+
+    /// <summary>
     /// Best-effort rewrite of a pwsh-based command to its bash equivalent.
     /// Handles the patterns the Strategist actually emits:
     ///   pwsh -c "..."             -> bash -lc "..."
     ///   powershell -Command "..." -> bash -lc "..."
-    /// For the azd-setup commands we see in practice
-    /// ('azd env set VAR $(az account show --query id -o tsv)') bash and
-    /// pwsh share enough syntax that a direct swap produces a working
-    /// command. Genuinely PowerShell-specific bodies will still fail,
-    /// which is fine — they hit the Doctor as a real bug, not as noise.
     /// </summary>
     private static string RewritePwshToBash(string cmd)
     {
