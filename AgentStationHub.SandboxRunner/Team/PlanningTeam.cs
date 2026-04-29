@@ -47,7 +47,7 @@ public sealed class PlanningTeam
 
         // ---- Scout (deterministic, runs inside the sandbox on /workspace) ----
         _trace(new AgentTraceDto("Scout", "start", $"Scanning workspace {workspace}"));
-        var manifest = RepoInspector.Inspect(workspace);
+        var manifest = GetOrInspectManifest(workspace);
         _trace(new AgentTraceDto("Scout", "done",
             "Detected: " + (string.Join(", ", manifest.Summary()) is { Length: > 0 } s ? s : "none")));
         foreach (var r in manifest.Rationale)
@@ -298,7 +298,7 @@ public sealed class PlanningTeam
         IReadOnlyList<PriorInsightDto>? priorInsights = null)
     {
         _trace(new AgentTraceDto("Scout", "start", $"Rescanning {workspace} for remediation"));
-        var manifest = RepoInspector.Inspect(workspace);
+        var manifest = GetOrInspectManifest(workspace);
 
         if (priorInsights is { Count: > 0 })
             _trace(new AgentTraceDto("Memory", "loaded",
@@ -2466,5 +2466,98 @@ public sealed class PlanningTeam
             IsDeployable = true,
             RepoKind = "app"
         };
+    }
+
+    // -------------------------------------------------------------------
+    // 8.10: ToolchainManifest cache.
+    //
+    // Both RunAsync (planning) and RemediateAsync (Doctor) call
+    // RepoInspector.Inspect(workspace), which walks the repo and can take
+    // 100�500 ms on large samples. The two paths frequently run within
+    // the same logical session and against the same workspace.
+    //
+    // Today the SandboxRunner is short-lived (one `docker run --rm` per
+    // command) so this static cache is mostly inert across calls; within
+    // a single process invocation it ensures a SECOND call to Inspect on
+    // the same workspace is free. When the runner is later refactored to
+    // a long-lived daemon (or the planner moves in-process for plan +
+    // remediate sequencing), the cache pays off automatically without
+    // further code changes.
+    //
+    // The fingerprint is intentionally cheap: max LastWriteTimeUtc across
+    // a curated set of toolchain manifest files at the repo root, plus
+    // the count of those files. Walking the whole tree (node_modules,
+    // .venv, dist, .azd) would defeat the purpose. A real file mutation
+    // anywhere on those probed paths invalidates the cache.
+    // -------------------------------------------------------------------
+    private static readonly object _manifestCacheLock = new();
+    private static (string Workspace, string Fingerprint, RepoInspector.ToolchainManifest Manifest)? _manifestCache;
+
+    private static RepoInspector.ToolchainManifest GetOrInspectManifest(string workspace)
+    {
+        var fingerprint = ComputeWorkspaceFingerprint(workspace);
+        lock (_manifestCacheLock)
+        {
+            if (_manifestCache is { } c
+                && string.Equals(c.Workspace, workspace, StringComparison.Ordinal)
+                && string.Equals(c.Fingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                return c.Manifest;
+            }
+        }
+        var fresh = RepoInspector.Inspect(workspace);
+        lock (_manifestCacheLock)
+        {
+            _manifestCache = (workspace, fingerprint, fresh);
+        }
+        return fresh;
+    }
+
+    private static string ComputeWorkspaceFingerprint(string workspace)
+    {
+        long maxTicks = 0;
+        int count = 0;
+        try
+        {
+            string[] probes =
+            {
+                "Dockerfile",
+                "docker-compose.yml", "docker-compose.yaml",
+                "package.json", "pnpm-lock.yaml", "yarn.lock",
+                "pyproject.toml", "requirements.txt", "Pipfile",
+                "azure.yaml", "azd.yaml",
+                "global.json", "Cargo.toml", "go.mod",
+            };
+            foreach (var name in probes)
+            {
+                var p = Path.Combine(workspace, name);
+                if (File.Exists(p))
+                {
+                    var t = File.GetLastWriteTimeUtc(p).Ticks;
+                    if (t > maxTicks) maxTicks = t;
+                    count++;
+                }
+            }
+            if (Directory.Exists(workspace))
+            {
+                foreach (var ext in new[] { "*.csproj", "*.fsproj", "*.tf", "*.bicep" })
+                {
+                    foreach (var f in Directory.EnumerateFiles(
+                        workspace, ext, SearchOption.TopDirectoryOnly))
+                    {
+                        var t = File.GetLastWriteTimeUtc(f).Ticks;
+                        if (t > maxTicks) maxTicks = t;
+                        count++;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Best-effort: any IO error invalidates the cache by emitting
+            // a unique fingerprint so we fall through to a fresh Inspect.
+            return $"err:{Guid.NewGuid():N}";
+        }
+        return $"{count}:{maxTicks}";
     }
 }
