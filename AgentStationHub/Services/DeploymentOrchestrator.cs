@@ -695,6 +695,22 @@ public sealed class DeploymentOrchestrator
             //   3. a fallback derived from the session id.
             var azdEnvName = ResolveAzdEnvName(env, plan);
 
+            // CRITICAL: export AZURE_ENV_NAME to the sandbox env so that
+            // EVERY 'azd' subcommand (azd init, azd ai agent init, azd
+            // env set, azd up, ...) sees a pre-resolved env name and
+            // never falls back to the interactive "Enter a unique
+            // environment name" prompt � which, in our headless DooD
+            // pipeline, reads empty strings in a tight loop until the
+            // silence cap fires (~200 reps observed). Setting this once
+            // at the env-dictionary level is strictly more robust than
+            // patching individual command lines because azd reads the
+            // var across ALL its subcommands, not just `init`.
+            if (!string.IsNullOrWhiteSpace(azdEnvName)
+                && !env.ContainsKey("AZURE_ENV_NAME"))
+            {
+                env["AZURE_ENV_NAME"] = azdEnvName!;
+            }
+
             // Mutable list so the Doctor can insert/replace steps at runtime.
             var steps = plan.Steps.ToList();
             var previousAttempts = new List<string>();
