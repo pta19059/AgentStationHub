@@ -1494,13 +1494,36 @@ public sealed class DeploymentOrchestrator
                                     (s.Command ?? "").Contains("az containerapp update",
                                         StringComparison.OrdinalIgnoreCase));
 
+                            // Rule 1 is only meaningful when the step being
+                            // REPLACED is itself an 'azd up' / 'azd deploy'
+                            // step. If the failing step is a prerequisite
+                            // (e.g. 'az acr create', 'az group create'),
+                            // the Doctor is allowed to fold an 'azd provision'
+                            // into the new step to materialise the RG / env
+                            // BEFORE re-creating that prerequisite. Without
+                            // this exception we wedge legitimate fixes like
+                            // "RG var was empty because azd hadn't provisioned
+                            // yet — run azd provision, query the real RG, then
+                            // create ACR" (seen on Investment-Analysis-Sample
+                            // Step 17, Apr 2026).
+                            var failingCmdLc = (step.Command ?? string.Empty).ToLowerInvariant();
+                            bool failingStepIsAzdDeploy =
+                                System.Text.RegularExpressions.Regex.IsMatch(
+                                    failingCmdLc, @"\bazd\s+(up|deploy)\b");
+
                             foreach (var ns in newSteps)
                             {
                                 var c = (ns.Command ?? string.Empty);
                                 var lc = c.ToLowerInvariant();
-                                // 1) Replacing 'azd up' with 'azd provision'
-                                //    (standalone, not 'azd provision && azd deploy').
-                                if (System.Text.RegularExpressions.Regex.IsMatch(
+                                // 1) Replacing 'azd up'/'azd deploy' with
+                                //    'azd provision' alone (no 'azd deploy'
+                                //    follow-up) IS a degradation. When the
+                                //    failing step isn't an azd-deploy step,
+                                //    'azd provision' is a legitimate prereq
+                                //    setup (see comment above) and we let
+                                //    it through.
+                                if (failingStepIsAzdDeploy
+                                    && System.Text.RegularExpressions.Regex.IsMatch(
                                         lc, @"\bazd\s+provision\b")
                                     && !System.Text.RegularExpressions.Regex.IsMatch(
                                         lc, @"\bazd\s+deploy\b"))
