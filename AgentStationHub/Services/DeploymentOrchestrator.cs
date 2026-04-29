@@ -248,7 +248,12 @@ public sealed class DeploymentOrchestrator
     }
 
 
-    public string Start(string repoUrl, string? azureLocation = null, string? samplePath = null)
+    public string Start(
+        string repoUrl,
+        string? azureLocation = null,
+        string? samplePath = null,
+        string? tenantId = null,
+        string? subscriptionId = null)
     {
         var root = string.IsNullOrWhiteSpace(_opt.WorkRootDir)
             ? Path.Combine(Path.GetTempPath(), "agentichub")
@@ -283,7 +288,9 @@ public sealed class DeploymentOrchestrator
             RepoUrl = repoUrl,
             WorkDir = Path.Combine(root, Guid.NewGuid().ToString("N")[..8]),
             AzureLocation = location,
-            SamplePath = cleanSubPath
+            SamplePath = cleanSubPath,
+            TenantId = NormalizeGuid(tenantId),
+            SubscriptionId = NormalizeGuid(subscriptionId)
         };
         _sessions[s.Id] = s;
         _store.SaveLater(s);
@@ -572,10 +579,23 @@ public sealed class DeploymentOrchestrator
             // Ensure the sandbox has its own (Linux-native) Azure login cached
             // in a persistent Docker volume. First deploy triggers a device
             // code flow; subsequent deploys reuse the cached tokens.
-            var hostTenantId = ReadHostTenantId();
+            //
+            // Tenant / subscription resolution priority:
+            //   1. Explicit user choice from the Hub UI (s.TenantId /
+            //      s.SubscriptionId) � pins the device-code login from
+            //      the very first deploy, eliminates the "wrong default
+            //      tenant" loop where a user with multiple tenants ends
+            //      up authenticated against one that has no subscription
+            //      and has to manually 'az logout' inside the sandbox.
+            //   2. Host's azureProfile.json default subscription (only
+            //      meaningful when the app is running on a developer
+            //      laptop with az CLI installed).
+            //   3. null � let device-code login pick the user's default.
+            var hostTenantId = s.TenantId ?? ReadHostTenantId();
             await SandboxAzureAuth.EnsureAsync(
                 imageToUse,
                 hostTenantId,
+                s.SubscriptionId,
                 (lvl, line) => _ = Log(s, lvl, line),
                 ct);
 
@@ -2262,6 +2282,21 @@ public sealed class DeploymentOrchestrator
     }
 
     private static string? ReadHostTenantId() => ReadHostDefaultSubscription().TenantId;
+
+    /// <summary>
+    /// Light validation for user-supplied tenant / subscription ids. We
+    /// accept a GUID (with or without surrounding whitespace / braces)
+    /// and reject anything else by returning null, so a stray paste of
+    /// a domain name or display name doesn't get propagated to
+    /// 'az login --tenant ...' where it would cause a confusing
+    /// "tenant 'foo' not found" loop.
+    /// </summary>
+    private static string? NormalizeGuid(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var t = raw.Trim().Trim('{', '}');
+        return Guid.TryParse(t, out var g) ? g.ToString() : null;
+    }
 
     /// <summary>
     /// Runs 'docker version --format "{{.Server.Version}}"' to verify the

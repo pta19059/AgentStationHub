@@ -59,6 +59,34 @@
     </select>
 </div>
 
+@* Optional Azure identity pre-selection. Eliminates the "wrong default
+   tenant" loop on the first deploy: when these are filled the sandbox
+   'az login --use-device-code' is pinned to this tenant from the very
+   first attempt, and after login 'az account set' targets this
+   subscription. Both are persisted in the browser's localStorage so
+   the user types them once, not per-deploy. Leave blank to keep
+   the legacy behaviour (let device-code pick the user's default). *@
+<div class="filters auth-row">
+    <input class="form-control"
+           placeholder="Azure tenant id (optional, GUID)"
+           title="Pin 'az login' to this tenant. Avoids landing on a default tenant that has no subscription. Leave blank to use the user's default."
+           @bind="_tenantId" @bind:event="oninput" @bind:after="PersistAuthAsync" />
+
+    <input class="form-control"
+           placeholder="Azure subscription id (optional, GUID)"
+           title="Run 'az account set --subscription' after login so every step targets this subscription. Leave blank to use the default."
+           @bind="_subscriptionId" @bind:event="oninput" @bind:after="PersistAuthAsync" />
+
+    @if (!string.IsNullOrWhiteSpace(_tenantId) || !string.IsNullOrWhiteSpace(_subscriptionId))
+    {
+        <button class="btn btn-outline-secondary"
+                title="Clear the saved tenant / subscription. The next deploy will let device-code login pick the user's default tenant."
+                @onclick="ClearAuthAsync">
+            <i class="bi bi-x-circle"></i> Clear
+        </button>
+    }
+</div>
+
 <div class="cards-grid">
     @foreach (var agent in Filtered)
     {
@@ -243,6 +271,8 @@
     private string _category = "";
     private string _target = "";
     private string _region = "";
+    private string? _tenantId;
+    private string? _subscriptionId;
     private ToastMessage? _deployStatus;
     private bool _scanning;
     private DeploymentModal? _deploymentModal;
@@ -258,6 +288,22 @@
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (!firstRender) return;
+
+        // Hydrate the optional tenant / subscription pre-selection from
+        // localStorage. Done in OnAfterRender (not OnInitialized) because
+        // JS interop is only available after the circuit is up.
+        try
+        {
+            var t = await JS.InvokeAsync<string?>(
+                "localStorage.getItem", "agentichub.auth.tenantId");
+            var sub = await JS.InvokeAsync<string?>(
+                "localStorage.getItem", "agentichub.auth.subscriptionId");
+            var changed = false;
+            if (!string.IsNullOrWhiteSpace(t)) { _tenantId = t; changed = true; }
+            if (!string.IsNullOrWhiteSpace(sub)) { _subscriptionId = sub; changed = true; }
+            if (changed) StateHasChanged();
+        }
+        catch { /* non-fatal */ }
 
         // After a laptop standby / page reload, try to rehydrate the
         // last active deployment modal so the user lands back on the
@@ -293,7 +339,40 @@
     private async Task AgenticDeployAsync(AgentSample agent)
     {
         if (_deploymentModal is null) return;
-        await _deploymentModal.OpenAsync(agent.GitHubUrl, _region, agent.SamplePath);
+        await _deploymentModal.OpenAsync(
+            agent.GitHubUrl, _region, agent.SamplePath,
+            _tenantId, _subscriptionId);
+    }
+
+    /// <summary>
+    /// Persist tenant / subscription in localStorage so the user types
+    /// them once. We deliberately do NOT keep them server-side: the
+    /// server is multi-user (a small team can share one AgentStationHub
+    /// instance) and the host process should not become a credential
+    /// directory. Each browser keeps its own pre-selection.
+    /// </summary>
+    private async Task PersistAuthAsync()
+    {
+        try
+        {
+            await JS.InvokeVoidAsync("localStorage.setItem",
+                "agentichub.auth.tenantId", _tenantId ?? "");
+            await JS.InvokeVoidAsync("localStorage.setItem",
+                "agentichub.auth.subscriptionId", _subscriptionId ?? "");
+        }
+        catch { /* non-fatal */ }
+    }
+
+    private async Task ClearAuthAsync()
+    {
+        _tenantId = null;
+        _subscriptionId = null;
+        try
+        {
+            await JS.InvokeVoidAsync("localStorage.removeItem", "agentichub.auth.tenantId");
+            await JS.InvokeVoidAsync("localStorage.removeItem", "agentichub.auth.subscriptionId");
+        }
+        catch { /* non-fatal */ }
     }
 
     private IEnumerable<AgentSample> Filtered =>

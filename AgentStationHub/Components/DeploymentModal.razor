@@ -336,7 +336,12 @@
     private readonly string[] _stages =
         ["Cloning","Inspecting","Planning","AwaitingApproval","Executing","Verifying","Succeeded"];
 
-    public async Task OpenAsync(string repoUrl, string? azureLocation = null, string? samplePath = null)
+    public async Task OpenAsync(
+        string repoUrl,
+        string? azureLocation = null,
+        string? samplePath = null,
+        string? tenantId = null,
+        string? subscriptionId = null)
     {
         try
         {
@@ -346,7 +351,7 @@
                 _repoShort += " / " + samplePath;
 
             // 1) Start orchestration (synchronous session creation + background pipeline)
-            _sessionId = Orchestrator.Start(repoUrl, azureLocation, samplePath);
+            _sessionId = Orchestrator.Start(repoUrl, azureLocation, samplePath, tenantId, subscriptionId);
 
             // Persist the active session in the browser so that if the
             // PC goes to standby long enough to blow past the Blazor
