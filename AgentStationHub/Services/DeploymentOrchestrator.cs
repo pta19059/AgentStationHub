@@ -1760,20 +1760,42 @@ public sealed class DeploymentOrchestrator
                         {
                             try
                             {
-                                var resolver = _sp.GetService<AgentStationHub.Services.Agents.EscalationResolverAgent>();
-                                if (resolver is not null)
+                                // Prefer the Foundry-hosted EscalationResolver
+                                // when registered (feature flag
+                                // Foundry:UseFoundryEscalationResolver=true).
+                                // Falls back to the in-process agent otherwise.
+                                var hosted = _sp.GetService<AgentStationHub.Services.Tools.FoundryEscalationResolverClient>();
+                                if (hosted is not null)
                                 {
                                     await Log(s, "info",
                                         "Doctor escalated and no deterministic auto-patch matched — " +
-                                        "consulting EscalationResolver agent…",
+                                        "consulting Foundry-hosted EscalationResolver agent…",
                                         step.Id);
-                                    autoPatch = await resolver.ResolveAsync(
+                                    autoPatch = await hosted.ResolveAsync(
                                         failingStep: step,
                                         failingCommand: step.Command ?? string.Empty,
                                         stepTail: stepTail,
                                         doctorReasoning: fix.Reasoning ?? string.Empty,
                                         previousAttempts: previousAttempts.ToList(),
                                         ct: ct);
+                                }
+                                else
+                                {
+                                    var resolver = _sp.GetService<AgentStationHub.Services.Agents.EscalationResolverAgent>();
+                                    if (resolver is not null)
+                                    {
+                                        await Log(s, "info",
+                                            "Doctor escalated and no deterministic auto-patch matched — " +
+                                            "consulting in-process EscalationResolver agent…",
+                                            step.Id);
+                                        autoPatch = await resolver.ResolveAsync(
+                                            failingStep: step,
+                                            failingCommand: step.Command ?? string.Empty,
+                                            stepTail: stepTail,
+                                            doctorReasoning: fix.Reasoning ?? string.Empty,
+                                            previousAttempts: previousAttempts.ToList(),
+                                            ct: ct);
+                                    }
                                 }
                             }
                             catch (Exception ex)
