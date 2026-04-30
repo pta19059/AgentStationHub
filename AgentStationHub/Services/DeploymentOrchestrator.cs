@@ -846,6 +846,33 @@ public sealed class DeploymentOrchestrator
                     steps[i] = step;
                 }
 
+                // Pre-execution normalisation #5: replace `azd auth login`
+                // with `az account show` because SandboxAzureAuth.EnsureAsync
+                // ran BEFORE step 1 and already performed `az login
+                // --use-device-code`. The sandbox image also runs
+                // `azd config set auth.useAzCliAuth true` at build time,
+                // which means `azd auth login` will hard-fail with:
+                //   "current auth mode is 'az cli': 'azd auth login' is
+                //    disabled when the auth mode is delegated"
+                // Doctor then pivots to `az login --service-principal $X`
+                // with empty env vars and burns a retry budget. The
+                // deterministic fix is to recognise that the cached
+                // identity is already authenticated and replace the
+                // step with a cheap verification.
+                if (IsAzdAuthLogin(step.Command))
+                {
+                    var verify = "bash -lc \"az account show -o table\"";
+                    await Log(s, "info",
+                        "Replacing 'azd auth login' with 'az account show' " +
+                        "because SandboxAzureAuth already authenticated the " +
+                        "sandbox via 'az login --use-device-code', and the " +
+                        "image is configured for az-cli delegated auth (azd " +
+                        "auth login would hard-fail in this mode).",
+                        step.Id);
+                    step = step with { Command = verify };
+                    steps[i] = step;
+                }
+
                 await Log(s, "status", $"▶ Step {step.Id}: {step.Description}", step.Id);
 
                 // Long-running azd commands can go silent for several minutes
@@ -2654,8 +2681,18 @@ public sealed class DeploymentOrchestrator
     }
 
     /// <summary>
-    /// True if the command already exports / sets AZURE_ENV_NAME.
+    /// True if the command is an `azd auth login` invocation. We detect
+    /// these specifically to replace them with a cheap `az account show`
+    /// because the sandbox image is configured for az-cli delegated
+    /// auth, where `azd auth login` is hard-disabled.
     /// </summary>
+    private static bool IsAzdAuthLogin(string? cmd)
+    {
+        if (string.IsNullOrWhiteSpace(cmd)) return false;
+        return System.Text.RegularExpressions.Regex.IsMatch(
+            cmd, @"(^|[\s""'|&;])azd\s+auth\s+login\b",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    }
     private static bool ContainsAzureEnvNameExport(string? cmd)
     {
         if (string.IsNullOrEmpty(cmd)) return false;
