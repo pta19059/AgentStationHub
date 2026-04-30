@@ -2550,6 +2550,41 @@ public sealed class DeploymentOrchestrator
         if (t.Contains("unable to find image") && t.Contains("locally"))
             return "the required sandbox image is missing from the Docker host.";
 
+        // Azure RBAC: the signed-in identity lacks permissions to
+        // create role assignments / validate the deployment. Bicep
+        // templates that include `Microsoft.Authorization/roleAssignments`
+        // resources require the caller to have Owner / RBAC Admin /
+        // User Access Administrator on the target scope. The Doctor
+        // cannot fix this � it requires a human with elevated rights
+        // on the subscription / resource group to grant the role.
+        if (t.Contains("authorizationfailed")
+            || (t.Contains("does not have authorization to perform action")
+                && t.Contains("microsoft."))
+            || t.Contains("do not have sufficient permissions for this deployment")
+            || (t.Contains("microsoft.authorization/roleassignments/write")
+                && t.Contains("does not have permission")))
+        {
+            return "the signed-in Azure identity lacks the RBAC role required by this " +
+                   "deployment (typically 'Owner', 'User Access Administrator', or 'Role " +
+                   "Based Access Control Administrator' on the target subscription / " +
+                   "resource group, because the template creates role assignments). " +
+                   "Ask a subscription Owner to assign one of those roles to your " +
+                   "account, then retry the deploy. Cached credentials are unaffected; " +
+                   "no re-login required after the role is granted.";
+        }
+
+        // Azure subscription disabled / past due / over quota at the
+        // subscription level � also un-fixable from inside the sandbox.
+        if (t.Contains("subscriptionnotregistered")
+            || t.Contains("subscription is disabled")
+            || t.Contains("subscriptionnotfound"))
+        {
+            return "the target Azure subscription is disabled, not registered for the " +
+                   "required resource provider, or not found. Re-check the subscription " +
+                   "id in the Hub UI and confirm with your Azure admin that the sub is " +
+                   "active and registered for the providers used by this template.";
+        }
+
         return null;
     }
 
