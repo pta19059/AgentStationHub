@@ -822,6 +822,30 @@ public sealed class DeploymentOrchestrator
                     steps[i] = step;
                 }
 
+                // Pre-execution normalisation #4: belt-and-braces inline
+                // export of AZURE_ENV_NAME for ANY step that invokes azd.
+                // We already export it via -e on `docker exec`, but we
+                // observed it not propagating in some paths (and azd
+                // reportedly clears it for some subcommands like
+                // 'azd extension install' which then re-prompt
+                // interactively for the env name in a tight stdin loop).
+                // Inlining `export AZURE_ENV_NAME=<name>;` directly into
+                // the bash one-liner is the most robust workaround:
+                // it survives any shell-init quirks and is idempotent.
+                if (!string.IsNullOrWhiteSpace(azdEnvName)
+                    && IsAzdInvocation(step.Command)
+                    && !ContainsAzureEnvNameExport(step.Command))
+                {
+                    var prefixed = PrefixAzureEnvNameExport(step.Command, azdEnvName!);
+                    await Log(s, "info",
+                        $"Inlining 'export AZURE_ENV_NAME={azdEnvName}' into " +
+                        $"step {step.Id} so subcommands like 'azd extension " +
+                        "install' don't re-prompt for env name.",
+                        step.Id);
+                    step = step with { Command = prefixed };
+                    steps[i] = step;
+                }
+
                 await Log(s, "status", $"▶ Step {step.Id}: {step.Description}", step.Id);
 
                 // Long-running azd commands can go silent for several minutes
@@ -2581,6 +2605,49 @@ public sealed class DeploymentOrchestrator
             @"\bazd\s+up(\s+[^""'&;|]*)?",
             System.Text.RegularExpressions.RegexOptions.IgnoreCase);
         return rx.Replace(cmd, "agentic-azd-up", 1);
+    }
+
+    /// <summary>
+    /// True if the command actually invokes 'azd' (not just mentions it).
+    /// </summary>
+    private static bool IsAzdInvocation(string? cmd)
+    {
+        if (string.IsNullOrWhiteSpace(cmd)) return false;
+        return System.Text.RegularExpressions.Regex.IsMatch(
+            cmd, @"(^|[\s""'|&;])azd(\s|$|"")",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    }
+
+    /// <summary>
+    /// True if the command already exports / sets AZURE_ENV_NAME.
+    /// </summary>
+    private static bool ContainsAzureEnvNameExport(string? cmd)
+    {
+        if (string.IsNullOrEmpty(cmd)) return false;
+        return cmd.Contains("AZURE_ENV_NAME=", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Inject `export AZURE_ENV_NAME=&lt;name&gt;;` so every azd subcommand
+    /// inside the bash one-liner sees the pre-resolved env name and never
+    /// falls back to the interactive "Enter a unique environment name"
+    /// prompt loop. Handles `bash -lc "..."` wrappers and bare commands.
+    /// </summary>
+    private static string PrefixAzureEnvNameExport(string cmd, string azdEnvName)
+    {
+        var exportClause = $"export AZURE_ENV_NAME={azdEnvName}; ";
+        var trimmed = (cmd ?? "").Trim();
+        var bashLc = System.Text.RegularExpressions.Regex.Match(
+            trimmed,
+            @"^bash\s+-l?c\s+""(.+)""\s*$",
+            System.Text.RegularExpressions.RegexOptions.Singleline);
+        if (bashLc.Success)
+        {
+            var inner = bashLc.Groups[1].Value.Replace("\\\"", "\"");
+            inner = exportClause + inner;
+            return $"bash -lc \"{inner.Replace("\"", "\\\"")}\"";
+        }
+        return $"bash -lc \"{exportClause}{(cmd ?? "").Replace("\"", "\\\"")}\"";
     }
 
     /// <summary>
