@@ -236,92 +236,216 @@ public static class SandboxAzureAuth
         Action<string, string> log,
         CancellationToken ct)
     {
+        // Probe outline:
+        //   1. Resolve principal objectId (Graph /me first; fall back to
+        //      'az account show' which also covers tokens that lack the
+        //      Graph User.Read scope).
+        //   2. List role assignments at /subscriptions/<id>.
+        //   3. List role assignments anywhere under that subscription
+        //      (resource-group / resource scope) so we can detect the
+        //      "narrow guest" case (only Cognitive Services User on a
+        //      single account, etc.) and produce a precise message.
+        //   4. If a role-assignment-capable role exists at sub scope =>
+        //      OK. Otherwise attempt self-grant of UAA (works only when
+        //      the principal already is sub Owner). On failure, surface
+        //      the *correct* remediation depending on what we observed.
         var script =
             "set +e; " +
             "OBJ=$(az ad signed-in-user show --query id -o tsv 2>/dev/null); " +
             "if [ -z \"$OBJ\" ]; then " +
             "  OBJ=$(az account show --query user.name -o tsv 2>/dev/null); " +
             "fi; " +
+            "UPN=$(az account show --query user.name -o tsv 2>/dev/null); " +
             "if [ -z \"$OBJ\" ]; then " +
             "  echo 'PREFLIGHT_RBAC: could not resolve current principal'; exit 0; " +
             "fi; " +
             "echo \"PREFLIGHT_RBAC: principal=$OBJ\"; " +
+            "echo \"PREFLIGHT_RBAC: upn=$UPN\"; " +
             $"ROLES=$(az role assignment list --assignee \"$OBJ\" " +
             $"  --scope /subscriptions/{subscriptionId} " +
             "  --include-inherited --include-groups " +
             "  --query \"[].roleDefinitionName\" -o tsv 2>/dev/null); " +
             "echo \"PREFLIGHT_RBAC: roles=$(echo $ROLES | tr '\\n' ',' | sed 's/,$//')\"; " +
+            // Count narrow assignments anywhere under the sub so we can
+            // tell "you are a guest with 2 narrow roles on Foundry" from
+            // "you have absolutely nothing on this tenant".
+            $"NARROW=$(az role assignment list --assignee \"$OBJ\" --all " +
+            "  --include-inherited --include-groups " +
+            $"  --query \"[?contains(scope, '/subscriptions/{subscriptionId}')].roleDefinitionName\" " +
+            "  -o tsv 2>/dev/null | wc -l); " +
+            "echo \"PREFLIGHT_RBAC: narrow_role_count=$NARROW\"; " +
             "if echo \"$ROLES\" | grep -qiE '^(Owner|User Access Administrator|Role Based Access Control Administrator)$'; then " +
             "  echo 'PREFLIGHT_RBAC: OK_HAS_RBAC_WRITE'; exit 0; " +
             "fi; " +
             "echo 'PREFLIGHT_RBAC: missing roleAssignments/write capable role; attempting self-grant'; " +
-            $"az role assignment create --assignee \"$OBJ\" " +
+            $"GRANT_ERR=$(az role assignment create --assignee \"$OBJ\" " +
             "  --role 'User Access Administrator' " +
             $"  --scope /subscriptions/{subscriptionId} " +
-            "  --only-show-errors 2>&1 | tail -5; " +
-            "if [ $? -eq 0 ]; then echo 'PREFLIGHT_RBAC: SELF_GRANT_OK'; else echo 'PREFLIGHT_RBAC: SELF_GRANT_FAILED'; fi; " +
+            "  --only-show-errors 2>&1); " +
+            "GRANT_RC=$?; " +
+            "if [ $GRANT_RC -eq 0 ]; then " +
+            "  echo 'PREFLIGHT_RBAC: SELF_GRANT_OK'; " +
+            "else " +
+            "  echo 'PREFLIGHT_RBAC: SELF_GRANT_FAILED'; " +
+            "  echo \"PREFLIGHT_RBAC: grant_err=$(echo $GRANT_ERR | tr '\\n' ' ' | head -c 400)\"; " +
+            "fi; " +
             "exit 0";
 
         var hadOk = false;
         var hadSelfGrant = false;
         var hadFailure = false;
         string? principal = null;
+        string? upn = null;
         string? rolesLine = null;
+        int narrowCount = 0;
+        string? grantErr = null;
 
         await RunInContainerAsync(sandboxImage, script, line =>
         {
             if (line.Contains("PREFLIGHT_RBAC: principal="))
                 principal = line.Split('=', 2)[1].Trim();
+            else if (line.Contains("PREFLIGHT_RBAC: upn="))
+                upn = line.Split('=', 2)[1].Trim();
             else if (line.Contains("PREFLIGHT_RBAC: roles="))
                 rolesLine = line.Split('=', 2)[1].Trim();
+            else if (line.Contains("PREFLIGHT_RBAC: narrow_role_count="))
+                int.TryParse(line.Split('=', 2)[1].Trim(), out narrowCount);
             else if (line.Contains("PREFLIGHT_RBAC: OK_HAS_RBAC_WRITE"))
                 hadOk = true;
             else if (line.Contains("PREFLIGHT_RBAC: SELF_GRANT_OK"))
                 hadSelfGrant = true;
             else if (line.Contains("PREFLIGHT_RBAC: SELF_GRANT_FAILED"))
                 hadFailure = true;
+            else if (line.Contains("PREFLIGHT_RBAC: grant_err="))
+                grantErr = line.Split('=', 2)[1].Trim();
         }, ct);
+
+        var who = string.IsNullOrEmpty(upn) ? principal ?? "(unknown)" : $"{upn} ({principal})";
 
         if (hadOk)
         {
             log("info",
-                $"RBAC preflight: identity '{principal}' has a role-assignment-capable " +
-                $"role on subscription {subscriptionId} (roles: {rolesLine ?? "n/a"}). " +
-                "Templates that create role assignments will validate.");
+                $"RBAC preflight OK: {who} has a role-assignment-capable role on " +
+                $"subscription {subscriptionId} (roles: {rolesLine}). Templates " +
+                "that create role assignments will validate.");
             return;
         }
 
         if (hadSelfGrant)
         {
             log("info",
-                $"RBAC preflight: identity '{principal}' lacked a role-assignment-capable " +
-                $"role; auto-granted 'User Access Administrator' on /subscriptions/" +
-                $"{subscriptionId}. NOTE: Azure RBAC propagation can take 1-3 minutes; " +
-                "if azd provision still reports AuthorizationFailed on this run, just " +
-                "retry the deploy in ~2 min and the new role will be visible.");
+                $"RBAC preflight: {who} lacked a role-assignment-capable role; " +
+                $"auto-granted 'User Access Administrator' on subscription " +
+                $"{subscriptionId}. Azure RBAC propagation takes 1-3 minutes: " +
+                "if azd provision still reports AuthorizationFailed on this run, " +
+                "wait ~2 min and retry the deploy.");
             return;
         }
 
         if (hadFailure)
         {
-            log("warn",
-                $"RBAC preflight: identity '{principal ?? "(unknown)"}' lacks " +
-                "'Owner' / 'User Access Administrator' / 'Role Based Access " +
-                $"Control Administrator' on subscription {subscriptionId}, AND " +
-                "self-grant failed (which means you are not even the sub Owner). " +
-                "Templates that create role assignments via Bicep will fail. " +
-                "Ask a subscription Owner to run:" +
-                $"\n  az role assignment create --assignee {principal ?? "<your-objectId>"}" +
-                $"\n    --role 'User Access Administrator'" +
-                $"\n    --scope /subscriptions/{subscriptionId}" +
-                "\nThen retry the deploy. Cached credentials are unaffected; no re-login required.");
+            // Tailor the message to what we actually observed.
+            // Three sub-cases:
+            //  (a) zero roles at sub scope AND zero narrow roles under
+            //      the sub => identity is a complete outsider on this
+            //      sub (guest invited to the directory but nothing
+            //      assigned). Cannot deploy ANYTHING here.
+            //  (b) zero roles at sub scope but >0 narrow roles under
+            //      the sub => "guest with limited resource-level
+            //      access" (the user's actual case: Cognitive Services
+            //      User on Foundry). Cannot deploy a template that
+            //      creates RGs / role assignments. azd provision will
+            //      fail at validate because Microsoft.Resources/
+            //      deployments/validate/action requires *Contributor*
+            //      at sub scope, not just UAA.
+            //  (c) some role at sub scope (e.g. Reader/Contributor) but
+            //      not a UAA-capable one => user can deploy *most*
+            //      stuff but not templates that create role
+            //      assignments. Just needs UAA on top.
+            var hasSubScopeRole = !string.IsNullOrWhiteSpace(rolesLine);
+            string headline;
+            string remediation;
+
+            if (!hasSubScopeRole && narrowCount == 0)
+            {
+                headline =
+                    $"RBAC preflight FAILED: {who} has NO role assignments " +
+                    $"anywhere on subscription {subscriptionId}. You are signed in " +
+                    "to the right tenant, but this subscription has not been " +
+                    "shared with your identity. azd provision cannot deploy here.";
+                remediation =
+                    "Fix options (in order of preference):\n" +
+                    "  1) [RECOMMENDED] Switch to a subscription where you ARE Owner " +
+                    "(personal MSDN/Visual Studio sub, Azure for Students, your own " +
+                    "pay-as-you-go) -- change Subscription ID in the Hub UI and retry.\n" +
+                    "  2) Ask a subscription Owner of this sub to grant you BOTH:\n" +
+                    $"       az role assignment create --assignee {principal} \\\n" +
+                    "         --role 'Contributor' \\\n" +
+                    $"         --scope /subscriptions/{subscriptionId}\n" +
+                    $"       az role assignment create --assignee {principal} \\\n" +
+                    "         --role 'User Access Administrator' \\\n" +
+                    $"         --scope /subscriptions/{subscriptionId}\n" +
+                    "     Both are required: Contributor for the deploy itself, UAA " +
+                    "for the role assignments the template creates.";
+            }
+            else if (!hasSubScopeRole && narrowCount > 0)
+            {
+                headline =
+                    $"RBAC preflight FAILED: {who} has {narrowCount} narrow role " +
+                    $"assignment(s) on individual resources under subscription " +
+                    $"{subscriptionId}, but ZERO roles at the subscription scope " +
+                    "itself. This is the typical 'guest user invited to a single " +
+                    "Foundry/Cognitive Services account' setup -- it lets you USE " +
+                    "those resources but NOT deploy new ones. azd provision needs " +
+                    "Microsoft.Resources/deployments/validate/action (Contributor " +
+                    "at sub scope) which you don't have.";
+                remediation =
+                    "Fix options (in order of preference):\n" +
+                    "  1) [RECOMMENDED] Switch to a subscription where you ARE Owner " +
+                    "and retry -- in the Hub UI, change Subscription ID. Most azd " +
+                    "templates need full sub-scope rights that a managed/shared sub " +
+                    "almost never grants to guests.\n" +
+                    "  2) Ask a sub Owner of this sub to grant you BOTH " +
+                    "Contributor + User Access Administrator at sub scope:\n" +
+                    $"       az role assignment create --assignee {principal} \\\n" +
+                    "         --role 'Contributor' \\\n" +
+                    $"         --scope /subscriptions/{subscriptionId}\n" +
+                    $"       az role assignment create --assignee {principal} \\\n" +
+                    "         --role 'User Access Administrator' \\\n" +
+                    $"         --scope /subscriptions/{subscriptionId}";
+            }
+            else
+            {
+                // (c) has some role but not UAA/Owner.
+                headline =
+                    $"RBAC preflight FAILED: {who} has roles [{rolesLine}] at sub " +
+                    $"scope on {subscriptionId}, but none of them grant " +
+                    "Microsoft.Authorization/roleAssignments/write. The deploy can " +
+                    "provision resources but will fail when the template creates " +
+                    "role assignments (managed identity binding, etc.). Self-grant " +
+                    "of UAA was rejected, so you are not Owner here.";
+                remediation =
+                    "Fix: ask a sub Owner to add User Access Administrator on top " +
+                    "of your existing role:\n" +
+                    $"   az role assignment create --assignee {principal} \\\n" +
+                    "     --role 'User Access Administrator' \\\n" +
+                    $"     --scope /subscriptions/{subscriptionId}\n" +
+                    "Then retry the deploy (cached credentials still valid; no " +
+                    "re-login needed).";
+            }
+
+            var msg = headline + "\n" + remediation;
+            if (!string.IsNullOrWhiteSpace(grantErr))
+                msg += $"\nSelf-grant attempt error (truncated): {grantErr}";
+            log("warn", msg);
             return;
         }
 
         log("warn",
-            "RBAC preflight: probe was inconclusive (could not enumerate roles). " +
-            "Continuing � if azd provision later fails with AuthorizationFailed, " +
-            "the orchestrator will surface a clear remediation message.");
+            "RBAC preflight: probe was inconclusive (could not enumerate roles or " +
+            "resolve principal). Continuing -- if azd provision later fails with " +
+            "AuthorizationFailed, the orchestrator will surface a remediation " +
+            "message at that point.");
     }
 
     /// <summary>
