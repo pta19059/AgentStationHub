@@ -193,6 +193,135 @@ public static class SandboxAzureAuth
         {
             _sem.Release();
         }
+
+        // Pre-flight RBAC diagnostic: check whether the signed-in
+        // identity has permission to create role assignments on the
+        // pinned subscription. Most azd templates create role
+        // assignments via Bicep, so without this permission `azd
+        // provision` fails 5-10 minutes into the deploy with an opaque
+        // AuthorizationFailed. Surfacing this NOW saves the user a
+        // long round-trip.
+        //
+        // Three-step probe:
+        //   1. Resolve the current principal's objectId (via 'az ad
+        //      signed-in-user show' or 'az account show').
+        //   2. Enumerate role assignments scoped at /subscriptions/<id>.
+        //   3. If any of {Owner, User Access Administrator, Role Based
+        //      Access Control Administrator} is present, all good.
+        //      Otherwise, attempt a SELF-GRANT of 'User Access
+        //      Administrator' (only succeeds when the principal is
+        //      already Owner) -- this is the single most common gap on
+        //      personal MCAPS subs where the user IS the Owner but the
+        //      cached token predates a recent grant. If that also fails,
+        //      log a clear actionable warning naming the missing role
+        //      and the EXACT az command an admin must run.
+        if (!string.IsNullOrWhiteSpace(subscriptionId))
+        {
+            await PreflightRbacCheckAsync(
+                sandboxImage, subscriptionId!, log, ct);
+        }
+    }
+
+    /// <summary>
+    /// Probe RBAC on the pinned subscription and, when possible, self-
+    /// grant 'User Access Administrator' so role-assignment-creating
+    /// templates can validate. Best-effort: failures are logged as
+    /// warnings � the actual `azd provision` will surface the real
+    /// error if the gap remains, but at least the user already has the
+    /// fix instructions in their log by then.
+    /// </summary>
+    private static async Task PreflightRbacCheckAsync(
+        string sandboxImage,
+        string subscriptionId,
+        Action<string, string> log,
+        CancellationToken ct)
+    {
+        var script =
+            "set +e; " +
+            "OBJ=$(az ad signed-in-user show --query id -o tsv 2>/dev/null); " +
+            "if [ -z \"$OBJ\" ]; then " +
+            "  OBJ=$(az account show --query user.name -o tsv 2>/dev/null); " +
+            "fi; " +
+            "if [ -z \"$OBJ\" ]; then " +
+            "  echo 'PREFLIGHT_RBAC: could not resolve current principal'; exit 0; " +
+            "fi; " +
+            "echo \"PREFLIGHT_RBAC: principal=$OBJ\"; " +
+            $"ROLES=$(az role assignment list --assignee \"$OBJ\" " +
+            $"  --scope /subscriptions/{subscriptionId} " +
+            "  --include-inherited --include-groups " +
+            "  --query \"[].roleDefinitionName\" -o tsv 2>/dev/null); " +
+            "echo \"PREFLIGHT_RBAC: roles=$(echo $ROLES | tr '\\n' ',' | sed 's/,$//')\"; " +
+            "if echo \"$ROLES\" | grep -qiE '^(Owner|User Access Administrator|Role Based Access Control Administrator)$'; then " +
+            "  echo 'PREFLIGHT_RBAC: OK_HAS_RBAC_WRITE'; exit 0; " +
+            "fi; " +
+            "echo 'PREFLIGHT_RBAC: missing roleAssignments/write capable role; attempting self-grant'; " +
+            $"az role assignment create --assignee \"$OBJ\" " +
+            "  --role 'User Access Administrator' " +
+            $"  --scope /subscriptions/{subscriptionId} " +
+            "  --only-show-errors 2>&1 | tail -5; " +
+            "if [ $? -eq 0 ]; then echo 'PREFLIGHT_RBAC: SELF_GRANT_OK'; else echo 'PREFLIGHT_RBAC: SELF_GRANT_FAILED'; fi; " +
+            "exit 0";
+
+        var hadOk = false;
+        var hadSelfGrant = false;
+        var hadFailure = false;
+        string? principal = null;
+        string? rolesLine = null;
+
+        await RunInContainerAsync(sandboxImage, script, line =>
+        {
+            if (line.Contains("PREFLIGHT_RBAC: principal="))
+                principal = line.Split('=', 2)[1].Trim();
+            else if (line.Contains("PREFLIGHT_RBAC: roles="))
+                rolesLine = line.Split('=', 2)[1].Trim();
+            else if (line.Contains("PREFLIGHT_RBAC: OK_HAS_RBAC_WRITE"))
+                hadOk = true;
+            else if (line.Contains("PREFLIGHT_RBAC: SELF_GRANT_OK"))
+                hadSelfGrant = true;
+            else if (line.Contains("PREFLIGHT_RBAC: SELF_GRANT_FAILED"))
+                hadFailure = true;
+        }, ct);
+
+        if (hadOk)
+        {
+            log("info",
+                $"RBAC preflight: identity '{principal}' has a role-assignment-capable " +
+                $"role on subscription {subscriptionId} (roles: {rolesLine ?? "n/a"}). " +
+                "Templates that create role assignments will validate.");
+            return;
+        }
+
+        if (hadSelfGrant)
+        {
+            log("info",
+                $"RBAC preflight: identity '{principal}' lacked a role-assignment-capable " +
+                $"role; auto-granted 'User Access Administrator' on /subscriptions/" +
+                $"{subscriptionId}. NOTE: Azure RBAC propagation can take 1-3 minutes; " +
+                "if azd provision still reports AuthorizationFailed on this run, just " +
+                "retry the deploy in ~2 min and the new role will be visible.");
+            return;
+        }
+
+        if (hadFailure)
+        {
+            log("warn",
+                $"RBAC preflight: identity '{principal ?? "(unknown)"}' lacks " +
+                "'Owner' / 'User Access Administrator' / 'Role Based Access " +
+                $"Control Administrator' on subscription {subscriptionId}, AND " +
+                "self-grant failed (which means you are not even the sub Owner). " +
+                "Templates that create role assignments via Bicep will fail. " +
+                "Ask a subscription Owner to run:" +
+                $"\n  az role assignment create --assignee {principal ?? "<your-objectId>"}" +
+                $"\n    --role 'User Access Administrator'" +
+                $"\n    --scope /subscriptions/{subscriptionId}" +
+                "\nThen retry the deploy. Cached credentials are unaffected; no re-login required.");
+            return;
+        }
+
+        log("warn",
+            "RBAC preflight: probe was inconclusive (could not enumerate roles). " +
+            "Continuing � if azd provision later fails with AuthorizationFailed, " +
+            "the orchestrator will surface a clear remediation message.");
     }
 
     /// <summary>
