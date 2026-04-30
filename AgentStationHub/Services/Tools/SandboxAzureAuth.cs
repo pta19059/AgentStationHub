@@ -96,6 +96,8 @@ public static class SandboxAzureAuth
 
             string? cachedTenant = null;
             string? cachedSub = null;
+            string? cachedUserName = null;
+            string? cachedUserType = null;
             if (probeOk)
             {
                 try
@@ -105,6 +107,13 @@ public static class SandboxAzureAuth
                         cachedTenant = t.GetString();
                     if (doc.RootElement.TryGetProperty("id", out var i))
                         cachedSub = i.GetString();
+                    if (doc.RootElement.TryGetProperty("user", out var u))
+                    {
+                        if (u.TryGetProperty("name", out var un))
+                            cachedUserName = un.GetString();
+                        if (u.TryGetProperty("type", out var ut))
+                            cachedUserType = ut.GetString();
+                    }
                 }
                 catch { /* malformed json -> treat as not authenticated */ }
             }
@@ -113,15 +122,47 @@ public static class SandboxAzureAuth
                 && !string.IsNullOrWhiteSpace(cachedTenant)
                 && !string.Equals(tenantId, cachedTenant, StringComparison.OrdinalIgnoreCase);
 
-            if (probeOk && !tenantMismatch)
+            // Detect a managed-identity-shaped cached profile: that
+            // happens when something previously ran `az login --identity`
+            // in the same volume. The host VM's MSI then becomes the
+            // "logged in user" for every deploy, with quasi-random
+            // resource-level roles assigned to the MSI -- never the
+            // human user's roles. The classic giveaway is
+            // user.type=="servicePrincipal" AND user.name=="systemAssignedIdentity".
+            // Treat this exactly like a tenant mismatch: wipe + re-login.
+            var isMsiProfile = string.Equals(cachedUserType, "servicePrincipal",
+                                   StringComparison.OrdinalIgnoreCase)
+                && (string.Equals(cachedUserName, "systemAssignedIdentity",
+                        StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(cachedUserName, "userAssignedIdentity",
+                        StringComparison.OrdinalIgnoreCase));
+
+            if (probeOk && !tenantMismatch && !isMsiProfile)
             {
                 log("info",
                     $"Sandbox Azure profile already authenticated " +
-                    $"(tenant={cachedTenant ?? "?"}); reusing cached credentials.");
+                    $"(tenant={cachedTenant ?? "?"}, user={cachedUserName ?? "?"}); " +
+                    "reusing cached credentials.");
             }
             else
             {
-                if (tenantMismatch)
+                if (isMsiProfile)
+                {
+                    log("status",
+                        $"Cached Azure profile is a Managed Identity " +
+                        $"(user.name='{cachedUserName}', user.type='{cachedUserType}') " +
+                        "-- this is the host VM's MSI, not your user. Wiping and " +
+                        "starting a fresh interactive device-code login so the deploy " +
+                        "uses YOUR roles instead of the VM's.");
+                    await RunInContainerAsync(
+                        sandboxImage,
+                        "az logout --only-show-errors 2>/dev/null; " +
+                        "rm -rf /root/.azure/msal_token_cache.* /root/.azure/azureProfile.json " +
+                        "/root/.azure/accessTokens.json /root/.azure/service_principal_entries.json " +
+                        "2>/dev/null; true",
+                        _ => { }, ct);
+                }
+                else if (tenantMismatch)
                 {
                     log("status",
                         $"Cached Azure login is for tenant '{cachedTenant}' but the " +
@@ -256,6 +297,18 @@ public static class SandboxAzureAuth
             "  OBJ=$(az account show --query user.name -o tsv 2>/dev/null); " +
             "fi; " +
             "UPN=$(az account show --query user.name -o tsv 2>/dev/null); " +
+            // Refuse to proceed when the resolved principal is a sentinel
+            // value: 'systemAssignedIdentity' / 'userAssignedIdentity' /
+            // empty. EnsureAsync already wipes those profiles on detection,
+            // so reaching here means the user is truly anonymous or the
+            // token cache is broken in some other way; in either case
+            // role-listing would be meaningless and self-grant against a
+            // literal string would produce an even more confusing error.
+            "case \"$OBJ\" in " +
+            "  systemAssignedIdentity|userAssignedIdentity|servicePrincipal|\"\") " +
+            "    echo \"PREFLIGHT_RBAC: principal=$OBJ\"; " +
+            "    echo 'PREFLIGHT_RBAC: SKIP_NON_USER_PRINCIPAL'; exit 0;; " +
+            "esac; " +
             "if [ -z \"$OBJ\" ]; then " +
             "  echo 'PREFLIGHT_RBAC: could not resolve current principal'; exit 0; " +
             "fi; " +
@@ -299,6 +352,7 @@ public static class SandboxAzureAuth
         string? rolesLine = null;
         int narrowCount = 0;
         string? grantErr = null;
+        var skipNonUser = false;
 
         await RunInContainerAsync(sandboxImage, script, line =>
         {
@@ -316,9 +370,22 @@ public static class SandboxAzureAuth
                 hadSelfGrant = true;
             else if (line.Contains("PREFLIGHT_RBAC: SELF_GRANT_FAILED"))
                 hadFailure = true;
+            else if (line.Contains("PREFLIGHT_RBAC: SKIP_NON_USER_PRINCIPAL"))
+                skipNonUser = true;
             else if (line.Contains("PREFLIGHT_RBAC: grant_err="))
                 grantErr = line.Split('=', 2)[1].Trim();
         }, ct);
+
+        if (skipNonUser)
+        {
+            log("warn",
+                $"RBAC preflight skipped: cached profile resolves to a non-user " +
+                $"principal ('{principal}'). This usually means the host VM's " +
+                "managed identity leaked into the sandbox profile. EnsureAsync " +
+                "should have wiped it -- if you see this message, please report " +
+                "it. Continuing without RBAC diagnostics.");
+            return;
+        }
 
         var who = string.IsNullOrEmpty(upn) ? principal ?? "(unknown)" : $"{upn} ({principal})";
 
