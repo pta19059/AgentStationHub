@@ -126,6 +126,52 @@ public sealed class DockerShellTool
         var effectiveTailSize = tailSize ?? 40;
         var tail = new Queue<string>(effectiveTailSize);
 
+        // Prompt-loop detector: certain interactive prompts (notably
+        // azd's "Enter a unique environment name: environment name ''
+        // is invalid") fire 1000+ times per second on a closed stdin
+        // and would otherwise burn the entire 60-min silence budget
+        // before we abort. We bail out the moment we see the same
+        // promptish line >= 8 times within a short window. The Doctor
+        // (or the orchestrator's deterministic auto-patches) can then
+        // pivot to a different command without paying a full timeout.
+        var promptLoopHits = 0;
+        string? lastPromptLine = null;
+        var promptLoopTriggered = false;
+        bool IsLoopProbe(string line)
+        {
+            // Heuristic: any line containing one of the well-known
+            // headless-fatal prompt fragments. Conservative on purpose
+            // � a real interactive use of azd in our pipeline would
+            // never pipe to a terminal that re-emits the same prompt
+            // tens of times.
+            if (string.IsNullOrWhiteSpace(line)) return false;
+            return line.Contains("Enter a unique environment name", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("environment name '' is invalid", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("Continue initializing an app", StringComparison.OrdinalIgnoreCase);
+        }
+        void NotePromptLine(string line)
+        {
+            if (!IsLoopProbe(line))
+            {
+                lastPromptLine = null;
+                promptLoopHits = 0;
+                return;
+            }
+            if (lastPromptLine == line) promptLoopHits++;
+            else { lastPromptLine = line; promptLoopHits = 1; }
+
+            if (promptLoopHits >= 8 && !promptLoopTriggered)
+            {
+                promptLoopTriggered = true;
+                _onLog("warn",
+                    "Detected interactive-prompt loop (>=8 reps of " +
+                    $"'{Truncate(line, 80)}'). Aborting step early so " +
+                    "the orchestrator/Doctor can pivot instead of " +
+                    "burning the full silence budget.");
+                try { stepCts.Cancel(); } catch { /* already cancelled */ }
+            }
+        }
+
         int exitCode;
         try
         {
@@ -139,6 +185,7 @@ public sealed class DockerShellTool
                     var line = Sanitize(o);
                     _onLog("info", line);
                     AppendTail(tail, line, effectiveTailSize);
+                    NotePromptLine(line);
                 },
                 onStderr: e =>
                 {
@@ -146,12 +193,13 @@ public sealed class DockerShellTool
                     var line = Sanitize(e);
                     _onLog("err", line);
                     AppendTail(tail, line, effectiveTailSize);
+                    NotePromptLine(line);
                 },
                 stepCts.Token);
         }
         catch (OperationCanceledException)
         {
-            if (!silenceTriggered) throw;
+            if (!silenceTriggered && !promptLoopTriggered) throw;
             exitCode = -1;
         }
 
@@ -160,9 +208,12 @@ public sealed class DockerShellTool
 
         return new DockerShellResult(exitCode, string.Join('\n', tail))
         {
-            TimedOutBySilence = silenceTriggered
+            TimedOutBySilence = silenceTriggered || promptLoopTriggered
         };
     }
+
+    private static string Truncate(string s, int max) =>
+        string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "...");
 
     private static string Sanitize(string line)
     {
