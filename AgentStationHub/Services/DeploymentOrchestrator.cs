@@ -1642,6 +1642,77 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // Pre-Doctor deterministic patch: FoundryIQ-style
+                        // bug where a postprovision shell script greps the
+                        // resource list for `kind=='AIServices'` (Azure AI
+                        // Foundry Hub) but the same template's Bicep
+                        // creates the Cognitive Services account with
+                        // `kind: 'OpenAI'` (classic Azure OpenAI). The
+                        // typical failure signature is one of:
+                        //   - "Azure AI Foundry Hub not found in resource group"
+                        //   - "FOUNDRY_HUB_NAME" empty
+                        //   - postprovision hook exit code 1 right after
+                        //     setup_openai_deployments.sh
+                        // The robust fix is a 1-line `sed -i` in /workspace
+                        // that loosens the JMESPath filter so the existing
+                        // OpenAI account is accepted. The model deployments
+                        // are already created by the Bicep itself, so the
+                        // script just needs to find the account by name.
+                        // Marker prevents looping; we only patch once per
+                        // step.
+                        var foundryHubMissing =
+                            !string.IsNullOrEmpty(stepTail)
+                            && (stepTail.Contains("Azure AI Foundry Hub not found",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || stepTail.Contains("FOUNDRY_HUB_NAME",
+                                                      StringComparison.OrdinalIgnoreCase))
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:foundry-hub-kind]"));
+                        if (foundryHubMissing)
+                        {
+                            // Sandbox-side patch: scan every *.sh under
+                            // /workspace for the offending JMESPath and
+                            // broaden it to accept `OpenAI` too. We use
+                            // `find ... -exec sed -i ...` so the fix
+                            // applies regardless of which script in the
+                            // repo holds the bug. The substitution is
+                            // idempotent (a second run finds nothing to
+                            // change).
+                            var patchCmd =
+                                "bash -lc \"" +
+                                "set -e; " +
+                                "cd /workspace; " +
+                                "find . -type f -name '*.sh' -print0 | " +
+                                "xargs -0 -r sed -i " +
+                                "  \\\"s/\\[?kind=='AIServices'\\]/[?kind=='AIServices' || kind=='OpenAI']/g\\\"; " +
+                                "echo 'AutoPatch: relaxed kind=='\\''AIServices'\\'' filter to also accept '\\''OpenAI'\\'' in /workspace/**/*.sh'" +
+                                "\"";
+                            previousAttempts.Add(
+                                "[AutoPatch:foundry-hub-kind] postprovision script " +
+                                "filtered Cognitive Services accounts by kind=='AIServices' " +
+                                "but template provisions kind='OpenAI'; broadened filter " +
+                                "with sed in /workspace/**/*.sh.");
+                            await Log(s, "status",
+                                "Auto-patch: postprovision hook can't find an Azure AI " +
+                                "Foundry Hub because the template creates a kind='OpenAI' " +
+                                "account, not kind='AIServices'. Inserting a sandbox sed " +
+                                "step to broaden the filter in /workspace/**/*.sh and " +
+                                "retrying the failed step.",
+                                step.Id);
+                            // insert_before: keep the failing step, prepend
+                            // the patch step so it runs first, then retry.
+                            var patchStep = new DeploymentStep(
+                                step.Id, // re-use id; we re-execute the same index
+                                "AutoPatch: relax kind=='AIServices' filter in /workspace shell scripts",
+                                patchCmd,
+                                step.WorkingDirectory);
+                            steps.Insert(i, patchStep);
+                            // Do NOT decrement i: index now points at the
+                            // newly-inserted patch step; the failing step
+                            // is at i+1 and runs next.
+                            continue;
+                        }
+
                         // 8.8: prefill previousAttempts with cross-session
                         // failed attempts for the same error signature on
                         // the same repo so the Doctor pivots instead of
