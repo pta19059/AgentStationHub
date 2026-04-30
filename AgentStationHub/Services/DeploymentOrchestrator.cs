@@ -1713,6 +1713,108 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // Pre-Doctor deterministic patch: shell scripts in
+                        // the cloned repo lack the executable bit. Common
+                        // signature: stepTail contains 'Permission denied'
+                        // AND references a '.sh' path. azd postprovision
+                        // hooks copy themselves to /tmp and shell-out to
+                        // ./scripts/*.sh which then fails because the
+                        // checked-in scripts were committed without +x
+                        // (typical when authored on Windows). Doctor in
+                        // earlier sessions had to "learn" this fix three
+                        // times in a row -- making it deterministic saves
+                        // 3 LLM round-trips. Apply chmod +x to every *.sh
+                        // under /workspace; idempotent and cheap.
+                        var permDeniedSh =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("Permission denied",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && System.Text.RegularExpressions.Regex.IsMatch(
+                                stepTail, @"\.sh\b",
+                                System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:chmod-sh]"));
+                        if (permDeniedSh)
+                        {
+                            var chmodCmd =
+                                "bash -lc \"" +
+                                "set -e; cd /workspace; " +
+                                "find . -type f -name '*.sh' -exec chmod +x {} +; " +
+                                "echo 'AutoPatch: chmod +x applied to all .sh under /workspace'" +
+                                "\"";
+                            previousAttempts.Add(
+                                "[AutoPatch:chmod-sh] shell script(s) under /workspace " +
+                                "lacked +x bit causing 'Permission denied'; ran chmod +x " +
+                                "on every *.sh.");
+                            await Log(s, "status",
+                                "Auto-patch: 'Permission denied' on a .sh path -- " +
+                                "checked-in scripts lack the executable bit. Inserting " +
+                                "a chmod +x step over /workspace/**/*.sh and retrying " +
+                                "the failed step.",
+                                step.Id);
+                            var chmodStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: chmod +x for all *.sh under /workspace",
+                                chmodCmd,
+                                step.WorkingDirectory);
+                            steps.Insert(i, chmodStep);
+                            continue;
+                        }
+
+                        // Pre-Doctor deterministic patch: Doctor proposed
+                        // `az extension add --name X` but the extension
+                        // does not exist in the index. Stops the Doctor
+                        // from looping over candidate extension names
+                        // (we observed it try 'ai-foundry' then
+                        // 'azure-ai-foundry' then 'az upgrade --yes' then
+                        // 'azure-ai-foundry' again). When the FAILING
+                        // step is itself an `az extension add`, force a
+                        // give_up so the orchestrator escalates to the
+                        // resolver and ultimately to a source-repo fix.
+                        var azExtAddFailed =
+                            (step.Command ?? "").Contains("az extension add",
+                                                          StringComparison.OrdinalIgnoreCase)
+                            && !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("No extension found with name",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:az-ext-not-found]"));
+                        if (azExtAddFailed)
+                        {
+                            previousAttempts.Add(
+                                "[AutoPatch:az-ext-not-found] 'az extension add' " +
+                                "for a non-existent extension; suppressing further " +
+                                "Doctor extension-name guessing.");
+                            await Log(s, "warn",
+                                "Auto-patch: 'az extension add' targeted an extension " +
+                                "that does not exist in the index. This typically " +
+                                "means the Doctor mis-named the extension or the " +
+                                "deploy plan references a hallucinated CLI plugin. " +
+                                "Marking the step as a dead-end so the Doctor pivots " +
+                                "instead of trying more extension names.",
+                                step.Id);
+                            // Replace the failing step with a no-op so
+                            // the orchestrator can move on, while still
+                            // logging a clear breadcrumb in the plan.
+                            // We do NOT skip the step entirely (which
+                            // would mask real errors) -- the no-op
+                            // succeeds and we let the next step decide
+                            // whether the missing extension actually
+                            // matters.
+                            var noopCmd =
+                                "bash -lc \"echo 'skipped: az extension add (extension " +
+                                "not in index); subsequent steps will surface any real " +
+                                "missing-feature errors'\"";
+                            steps[i] = step with
+                            {
+                                Command = noopCmd,
+                                Description = step.Description +
+                                    " [autopatched -> no-op: extension not in CLI index]"
+                            };
+                            i--; // re-execute (now-noop) step
+                            continue;
+                        }
+
                         // 8.8: prefill previousAttempts with cross-session
                         // failed attempts for the same error signature on
                         // the same repo so the Doctor pivots instead of
