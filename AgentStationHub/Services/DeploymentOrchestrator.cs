@@ -1543,9 +1543,7 @@ public sealed class DeploymentOrchestrator
                             // Inject -e <envname> if missing. azd init reads
                             // the env name from -e / --environment first
                             // before prompting, so this skips the prompt
-                            // entirely. Without this, even with --no-prompt
-                            // some azd builds still bail with "environment
-                            // name '' is invalid".
+                            // entirely.
                             var hasEnvFlag = System.Text.RegularExpressions.Regex.IsMatch(
                                 inner, @"\b(-e|--environment)\s+\S+");
                             if (!hasEnvFlag && !string.IsNullOrWhiteSpace(azdEnvName))
@@ -1559,18 +1557,18 @@ public sealed class DeploymentOrchestrator
                                     System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                             }
 
-                            // Inject --no-prompt if missing.
-                            if (!inner.Contains("--no-prompt", StringComparison.Ordinal))
+                            // Strip --no-prompt if present: in a non-empty
+                            // dir azd auto-DECLINES the "Continue?" prompt
+                            // and exits 1 with "confirmation declined".
+                            // We need the prompt to actually fire so our
+                            // 'yes |' pipe can answer 'y'.
+                            if (System.Text.RegularExpressions.Regex.IsMatch(inner, @"\s--no-prompt\b"))
                             {
                                 inner = System.Text.RegularExpressions.Regex.Replace(
-                                    inner,
-                                    @"\bazd\s+init\b",
-                                    "azd init --no-prompt",
-                                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                                    inner, @"\s+--no-prompt\b", "");
                             }
 
-                            // Belt-and-braces: pipe `yes` so any residual
-                            // confirmation prompt auto-confirms.
+                            // Pipe `yes` so the (y/N) confirmation auto-confirms.
                             if (!inner.TrimStart().StartsWith("yes ", StringComparison.Ordinal)
                                 && !inner.Contains("yes |", StringComparison.Ordinal))
                             {
@@ -1580,13 +1578,13 @@ public sealed class DeploymentOrchestrator
 
                             previousAttempts.Add(
                                 $"[AutoPatch:azd-init-yes] step {step.Id} azd-init prompted " +
-                                "in non-empty dir / for env name; injected -e + --no-prompt + " +
-                                "wrapped with 'yes |'.");
+                                "in non-empty dir / for env name; injected -e + stripped " +
+                                "--no-prompt + wrapped with 'yes |'.");
                             await Log(s, "status",
                                 $"Auto-patch: 'azd init' looped on interactive prompt. " +
-                                $"Injecting '-e {azdEnvName ?? "<envname>"} --no-prompt' and " +
-                                $"piping 'yes' so prompts auto-resolve. Replacing step " +
-                                $"{step.Id} and re-running (skipping LLM Doctor).",
+                                $"Injecting '-e {azdEnvName ?? "<envname>"}', stripping " +
+                                $"--no-prompt, and piping 'yes' so prompts auto-resolve. " +
+                                $"Replacing step {step.Id} and re-running (skipping LLM Doctor).",
                                 step.Id);
                             steps[i] = step with { Command = patched };
                             i--; // re-execute the patched step at the same index
@@ -2634,14 +2632,18 @@ public sealed class DeploymentOrchestrator
             changed = true;
         }
 
-        // Inject --no-prompt if missing.
-        if (!inner.Contains("--no-prompt", StringComparison.Ordinal))
+        // IMPORTANT: do NOT inject --no-prompt on `azd init -t`. When the
+        // working dir is non-empty (always, in our flow: we clone the
+        // user repo first, then `azd init -t <template>` scaffolds the
+        // sample template ON TOP), --no-prompt makes azd AUTO-DECLINE
+        // the "Continue? (y/N)" prompt with "confirmation declined; app
+        // was not initialized" and exit 1. We need azd to ASK the
+        // prompt so that our `yes |` pipe can answer 'y'. Strip any
+        // pre-existing --no-prompt flag the planner may have added.
+        if (System.Text.RegularExpressions.Regex.IsMatch(inner, @"\s--no-prompt\b"))
         {
             inner = System.Text.RegularExpressions.Regex.Replace(
-                inner,
-                @"\bazd\s+init\b",
-                "azd init --no-prompt",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                inner, @"\s+--no-prompt\b", "");
             changed = true;
         }
 
