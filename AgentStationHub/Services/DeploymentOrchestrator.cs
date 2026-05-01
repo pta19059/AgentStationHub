@@ -1815,6 +1815,99 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // Pre-Doctor deterministic patch: Cosmos DB stuck
+                        // in "failed provisioning state" + recurring
+                        // "Please delete the previous instance" errors,
+                        // optionally combined with the East US zonal-
+                        // redundancy ServiceUnavailable signature. We
+                        // observed Doctor loop 5+ attempts trying to:
+                        //   1. azd env set USE_ZONE_REDUNDANCY false
+                        //   2. az cosmosdb delete (succeeds but next
+                        //      provision still races against a half-
+                        //      deleted account)
+                        //   3. azd env set AZURE_COSMOS_LOCATION eastus2
+                        //      (Bicep ignores it on stuck deployment)
+                        //   4. az cosmosdb wait (does NOT exist - the
+                        //      cosmosdb command group has no 'wait')
+                        //   5. az resource wait with hardcoded short
+                        //      name (rejected by validator)
+                        // Make this deterministic: list ALL cosmos
+                        // accounts in the RG, delete each with --no-wait,
+                        // then wait for actual deletion via
+                        // `az resource wait --deleted` using the names
+                        // resolved at runtime. Also force USE_ZONE_REDUNDANCY
+                        // to false to dodge the eastus capacity issue.
+                        var cosmosFailedState =
+                            !string.IsNullOrEmpty(stepTail)
+                            && (stepTail.Contains("failed provisioning state",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || stepTail.Contains("Please delete the previous instance",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || (stepTail.Contains("zonal redundant",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                    && stepTail.Contains("Database account",
+                                                  StringComparison.OrdinalIgnoreCase)))
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:cosmos-failed-state]"));
+                        if (cosmosFailedState)
+                        {
+                            // Resolve RG at runtime via azd, falling back
+                            // to az group list. List cosmos accounts,
+                            // fire delete --no-wait for each, then wait
+                            // for each to be gone via az resource wait.
+                            // Finally toggle USE_ZONE_REDUNDANCY=false so
+                            // the next provision picks single-zone SKU.
+                            var cosmosCleanupCmd =
+                                "bash -lc \"" +
+                                "set +e; " +
+                                "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null); " +
+                                "if [ -z \\\"$RG\\\" ]; then " +
+                                "RG=$(az group list --query \\\"[?starts_with(name,'rg-')].name | [0]\\\" -o tsv); " +
+                                "fi; " +
+                                "echo \\\"AutoPatch:cosmos-failed-state RG=$RG\\\"; " +
+                                "if [ -z \\\"$RG\\\" ]; then echo 'no RG resolved; aborting cleanup'; exit 0; fi; " +
+                                "NAMES=$(az cosmosdb list -g \\\"$RG\\\" --query \\\"[].name\\\" -o tsv 2>/dev/null); " +
+                                "echo \\\"cosmos accounts in $RG: $NAMES\\\"; " +
+                                "for n in $NAMES; do " +
+                                "echo \\\"deleting $n (no-wait)\\\"; " +
+                                "az cosmosdb delete -g \\\"$RG\\\" -n \\\"$n\\\" --yes --no-wait || true; " +
+                                "done; " +
+                                "for n in $NAMES; do " +
+                                "echo \\\"waiting for $n to be fully deleted\\\"; " +
+                                "az resource wait --resource-group \\\"$RG\\\" " +
+                                "--namespace Microsoft.DocumentDB " +
+                                "--resource-type databaseAccounts " +
+                                "--name \\\"$n\\\" --deleted " +
+                                "--interval 20 --timeout 900 || true; " +
+                                "done; " +
+                                "azd env set USE_ZONE_REDUNDANCY false || true; " +
+                                "echo 'AutoPatch:cosmos-failed-state done'" +
+                                "\"";
+                            previousAttempts.Add(
+                                "[AutoPatch:cosmos-failed-state] Cosmos DB account(s) " +
+                                "in failed provisioning state and/or zonal-redundancy " +
+                                "capacity error; listed cosmos accounts in RG, deleted " +
+                                "each via az cosmosdb delete --no-wait, awaited full " +
+                                "deletion via az resource wait --deleted, and forced " +
+                                "USE_ZONE_REDUNDANCY=false.");
+                            await Log(s, "status",
+                                "Auto-patch: detected Cosmos DB 'failed provisioning " +
+                                "state' / zonal-redundancy capacity error. Inserting " +
+                                "a deterministic cleanup step (list+delete+wait on " +
+                                "all cosmos accounts in RG; disable zone redundancy) " +
+                                "ahead of the failing step instead of letting the " +
+                                "Doctor loop on invalid 'az cosmosdb wait' commands.",
+                                step.Id);
+                            var cosmosStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: delete failed Cosmos DB accounts and wait for full deletion",
+                                cosmosCleanupCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(20));
+                            steps.Insert(i, cosmosStep);
+                            continue;
+                        }
+
                         // 8.8: prefill previousAttempts with cross-session
                         // failed attempts for the same error signature on
                         // the same repo so the Doctor pivots instead of
