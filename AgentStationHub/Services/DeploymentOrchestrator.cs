@@ -2463,16 +2463,20 @@ public sealed class DeploymentOrchestrator
                         // ----------------------------------------------------------
                         // Long-tail fallback: if the deterministic auto-patch table
                         // didn't match, ask the EscalationResolverAgent (Meta-Doctor)
-                        // for an LLM-synthesised fix BEFORE we surface the
-                        // BlockedNeedsHumanOrSourceFix verdict to the user. The agent
-                        // sees the failing command, log tail, Doctor's reasoning, and
-                        // the list of previous attempts in this session; it can return
-                        // either a `replace_step` or `insert_before` Remediation, or
-                        // give_up (in which case we proceed to the original escalate
-                        // path). Every emitted step is validated by PlanValidator
-                        // inside the agent itself.
+                        // for an LLM-synthesised fix BEFORE we surface either the
+                        // BlockedNeedsHumanOrSourceFix verdict OR a regular
+                        // 'Deployment error'. The Resolver sees the failing
+                        // command, log tail, Doctor's reasoning, and the list of
+                        // previous attempts; it can return a `replace_step` or
+                        // `insert_before` Remediation, or give_up (in which case
+                        // we proceed to the original failure path). This makes
+                        // every Doctor give_up — escalate or otherwise — a chance
+                        // for the orchestrator to self-heal: e.g. when Doctor
+                        // reasons "switch to remote build approach" but emits
+                        // newSteps=[], the Resolver turns that hint into an
+                        // executable bash step.
                         // ----------------------------------------------------------
-                        if (autoPatch is null && isEscalate)
+                        if (autoPatch is null)
                         {
                             try
                             {
@@ -2484,8 +2488,11 @@ public sealed class DeploymentOrchestrator
                                 if (hosted is not null)
                                 {
                                     await Log(s, "info",
-                                        "Doctor escalated and no deterministic auto-patch matched — " +
-                                        "consulting Foundry-hosted EscalationResolver agent…",
+                                        (isEscalate
+                                            ? "Doctor escalated"
+                                            : "Doctor gave up")
+                                        + " and no deterministic auto-patch matched — "
+                                        + "consulting Foundry-hosted EscalationResolver agent…",
                                         step.Id);
                                     autoPatch = await hosted.ResolveAsync(
                                         failingStep: step,
@@ -2502,8 +2509,11 @@ public sealed class DeploymentOrchestrator
                                     if (resolver is not null)
                                     {
                                         await Log(s, "info",
-                                            "Doctor escalated and no deterministic auto-patch matched — " +
-                                            "consulting in-process EscalationResolver agent…",
+                                            (isEscalate
+                                                ? "Doctor escalated"
+                                                : "Doctor gave up")
+                                            + " and no deterministic auto-patch matched — "
+                                            + "consulting in-process EscalationResolver agent…",
                                             step.Id);
                                         autoPatch = await resolver.ResolveAsync(
                                             failingStep: step,
@@ -2529,9 +2539,10 @@ public sealed class DeploymentOrchestrator
                                 ? "replace_step" : "insert_before";
 
                             await Log(s, "status",
-                                $"🩺 Doctor escalated, but the orchestrator recognised the " +
-                                $"failure signature as auto-patchable. Applying synthesised " +
-                                $"{applyKind}: {autoPatch.NewSteps[0].Description}",
+                                $"🩺 " + (isEscalate ? "Doctor escalated" : "Doctor gave up")
+                                + ", but the orchestrator recognised the "
+                                + $"failure signature as auto-patchable. Applying synthesised "
+                                + $"{applyKind}: {autoPatch.NewSteps[0].Description}",
                                 step.Id);
                             previousAttempts.Add(
                                 $"step {step.Id} [{SummariseErrorSignature(stepTail)}] " +
