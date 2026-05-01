@@ -1967,6 +1967,93 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // 8.7.x: [AutoPatch:azd-remote-build] — when azd
+                        // deploy fails because the buildpacks `pack` CLI
+                        // bundled in the sandbox image is too old to
+                        // talk to the host docker daemon ("client
+                        // version 1.38 is too old. Minimum supported
+                        // API version is 1.40"), download and install
+                        // the latest `pack` binary from GitHub releases
+                        // into /usr/local/bin (which precedes the
+                        // bundled location on PATH) and also set
+                        // DOCKER_API_VERSION=1.40 in azd's env so any
+                        // legacy docker client still in use negotiates
+                        // a compatible API version.
+                        //
+                        // Note: azd's `docker: { remoteBuild: true }`
+                        // is NOT a fix here because GPT-RAG's failing
+                        // service has no Dockerfile (the build is via
+                        // Oryx buildpacks — "Building Docker image
+                        // from source"), and remoteBuild only kicks
+                        // in when a Dockerfile is present.
+                        var dockerApiTooOld =
+                            !string.IsNullOrEmpty(stepTail)
+                            && (stepTail.Contains("Minimum supported API version",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || (stepTail.Contains("client version",
+                                                      StringComparison.OrdinalIgnoreCase)
+                                    && stepTail.Contains("is too old",
+                                                          StringComparison.OrdinalIgnoreCase)))
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:azd-remote-build]"));
+                        if (dockerApiTooOld)
+                        {
+                            // Upgrade pack to a recent release
+                            // (>= 0.34 negotiates docker API correctly)
+                            // and set DOCKER_API_VERSION in azd env.
+                            // Base64-wrap for the same nested-bash
+                            // quoting reasons as the cosmos cleanup.
+                            var upgradeScript = string.Join("\n", new[]
+                            {
+                                "set -e",
+                                "PACK_VERSION=v0.36.4",
+                                "ARCH=$(uname -m)",
+                                "case \"$ARCH\" in",
+                                "  x86_64) PACK_TGZ=pack-${PACK_VERSION}-linux.tgz ;;",
+                                "  aarch64) PACK_TGZ=pack-${PACK_VERSION}-linux-arm64.tgz ;;",
+                                "  *) echo \"unknown arch $ARCH; defaulting to linux\"; PACK_TGZ=pack-${PACK_VERSION}-linux.tgz ;;",
+                                "esac",
+                                "URL=\"https://github.com/buildpacks/pack/releases/download/${PACK_VERSION}/${PACK_TGZ}\"",
+                                "echo \"AutoPatch:azd-remote-build downloading $URL\"",
+                                "curl -fsSL -o /tmp/pack.tgz \"$URL\"",
+                                "tar -xzf /tmp/pack.tgz -C /tmp",
+                                "install -m 0755 /tmp/pack /usr/local/bin/pack",
+                                "rm -f /tmp/pack /tmp/pack.tgz",
+                                "echo \"new pack:\"; pack version || true",
+                                "azd env set DOCKER_API_VERSION 1.40 || true",
+                                "echo 'AutoPatch:azd-remote-build done'",
+                                ""
+                            });
+                            var upgradeB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(upgradeScript));
+                            var upgradeCmd =
+                                "bash -lc 'echo " + upgradeB64 + " | base64 -d | bash'";
+                            previousAttempts.Add(
+                                "[AutoPatch:azd-remote-build] azd deploy failed " +
+                                "because the bundled `pack` CLI in the sandbox " +
+                                "speaks only Docker API 1.38 while the host " +
+                                "daemon requires >= 1.40. Installed pack v0.36.4 " +
+                                "to /usr/local/bin and set DOCKER_API_VERSION=1.40 " +
+                                "in the azd env so the next `azd deploy` uses a " +
+                                "modern client that negotiates a supported API.");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:azd-remote-build]: bundled " +
+                                "pack CLI too old (Docker API 1.38). Installing " +
+                                "latest pack to /usr/local/bin and setting " +
+                                "DOCKER_API_VERSION=1.40 in azd env before " +
+                                "retrying the failing step.",
+                                step.Id);
+                            var upgradeStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: upgrade pack CLI for Docker API >= 1.40",
+                                upgradeCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(3));
+                            steps.Insert(i, upgradeStep);
+                            i--;
+                            continue;
+                        }
+
                         // 8.8: prefill previousAttempts with cross-session
                         // failed attempts for the same error signature on
                         // the same repo so the Doctor pivots instead of
