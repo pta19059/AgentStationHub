@@ -1758,6 +1758,7 @@ public sealed class DeploymentOrchestrator
                                 chmodCmd,
                                 step.WorkingDirectory);
                             steps.Insert(i, chmodStep);
+                            i--; // outer loop is for(...i++); land on inserted patch
                             continue;
                         }
 
@@ -1857,32 +1858,49 @@ public sealed class DeploymentOrchestrator
                             // for each to be gone via az resource wait.
                             // Finally toggle USE_ZONE_REDUNDANCY=false so
                             // the next provision picks single-zone SKU.
+                            //
+                            // The sandbox already wraps every step in
+                            // `bash -lc "<az auth bootstrap>; <ourCmd>"`,
+                            // so any literal `bash -lc "<inner>"` we emit
+                            // here goes through TWO levels of quoting.
+                            // Nested $(...) and escaped \"...\" survive
+                            // the first pass but the outer shell sees
+                            // unbalanced quotes and breaks at the first
+                            // `(`. To make the cleanup robust regardless
+                            // of how many layers the runner adds, we
+                            // base64-encode the actual script and pipe
+                            // it through `base64 -d | bash` so the
+                            // outer shells only ever see a single quoted
+                            // string with NO special chars inside.
+                            var cleanupScript = string.Join("\n", new[]
+                            {
+                                "set +e",
+                                "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
+                                "if [ -z \"$RG\" ]; then",
+                                "  RG=$(az group list --query \"[?starts_with(name,'rg-')].name | [0]\" -o tsv)",
+                                "fi",
+                                "echo \"AutoPatch:cosmos-failed-state RG=$RG\"",
+                                "if [ -z \"$RG\" ]; then echo 'no RG resolved; aborting cleanup'; exit 0; fi",
+                                "NAMES=$(az cosmosdb list -g \"$RG\" --query \"[].name\" -o tsv 2>/dev/null)",
+                                "echo \"cosmos accounts in $RG: $NAMES\"",
+                                "for n in $NAMES; do",
+                                "  echo \"deleting $n (no-wait)\"",
+                                "  az cosmosdb delete -g \"$RG\" -n \"$n\" --yes --no-wait || true",
+                                "done",
+                                "for n in $NAMES; do",
+                                "  echo \"waiting for $n to be fully deleted\"",
+                                "  az resource wait --resource-group \"$RG\" --namespace Microsoft.DocumentDB --resource-type databaseAccounts --name \"$n\" --deleted --interval 20 --timeout 900 || true",
+                                "done",
+                                "azd env set USE_ZONE_REDUNDANCY false || true",
+                                "echo 'AutoPatch:cosmos-failed-state done'",
+                                ""
+                            });
+                            var cleanupB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(cleanupScript));
+                            // Single-quoted base64 string is opaque to
+                            // every layer of bash -lc wrapping above us.
                             var cosmosCleanupCmd =
-                                "bash -lc \"" +
-                                "set +e; " +
-                                "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null); " +
-                                "if [ -z \\\"$RG\\\" ]; then " +
-                                "RG=$(az group list --query \\\"[?starts_with(name,'rg-')].name | [0]\\\" -o tsv); " +
-                                "fi; " +
-                                "echo \\\"AutoPatch:cosmos-failed-state RG=$RG\\\"; " +
-                                "if [ -z \\\"$RG\\\" ]; then echo 'no RG resolved; aborting cleanup'; exit 0; fi; " +
-                                "NAMES=$(az cosmosdb list -g \\\"$RG\\\" --query \\\"[].name\\\" -o tsv 2>/dev/null); " +
-                                "echo \\\"cosmos accounts in $RG: $NAMES\\\"; " +
-                                "for n in $NAMES; do " +
-                                "echo \\\"deleting $n (no-wait)\\\"; " +
-                                "az cosmosdb delete -g \\\"$RG\\\" -n \\\"$n\\\" --yes --no-wait || true; " +
-                                "done; " +
-                                "for n in $NAMES; do " +
-                                "echo \\\"waiting for $n to be fully deleted\\\"; " +
-                                "az resource wait --resource-group \\\"$RG\\\" " +
-                                "--namespace Microsoft.DocumentDB " +
-                                "--resource-type databaseAccounts " +
-                                "--name \\\"$n\\\" --deleted " +
-                                "--interval 20 --timeout 900 || true; " +
-                                "done; " +
-                                "azd env set USE_ZONE_REDUNDANCY false || true; " +
-                                "echo 'AutoPatch:cosmos-failed-state done'" +
-                                "\"";
+                                "bash -lc 'echo " + cleanupB64 + " | base64 -d | bash'";
                             previousAttempts.Add(
                                 "[AutoPatch:cosmos-failed-state] Cosmos DB account(s) " +
                                 "in failed provisioning state and/or zonal-redundancy " +
@@ -1905,6 +1923,12 @@ public sealed class DeploymentOrchestrator
                                 step.WorkingDirectory,
                                 TimeSpan.FromMinutes(20));
                             steps.Insert(i, cosmosStep);
+                            // The outer loop is `for(...i++)`. After
+                            // continue;, i advances to the original
+                            // failing step (now at i+1) and skips our
+                            // cleanup. Decrement so the next iteration
+                            // lands on the inserted cleanup step.
+                            i--;
                             continue;
                         }
 
