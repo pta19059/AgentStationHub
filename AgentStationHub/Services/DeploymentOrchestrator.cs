@@ -1838,18 +1838,45 @@ public sealed class DeploymentOrchestrator
                         // `az resource wait --deleted` using the names
                         // resolved at runtime. Also force USE_ZONE_REDUNDANCY
                         // to false to dodge the eastus capacity issue.
-                        var cosmosFailedState =
+                        // Distinguish two distinct Cosmos failure modes so
+                        // each patch can fire ONCE independently:
+                        //   - cosmos-zonal: ServiceUnavailable / zonal
+                        //     redundant capacity error in eastus. Cosmos
+                        //     accounts may not even exist yet (failed
+                        //     during creation). Cleanup typically lists
+                        //     0 accounts; we just set
+                        //     USE_ZONE_REDUNDANCY=false and retry.
+                        //   - cosmos-stuck: "DatabaseAccount X is in a
+                        //     failed provisioning state. Please delete
+                        //     the previous instance" — accounts now
+                        //     exist as ARM resources stuck in failed
+                        //     state. Real delete+wait needed.
+                        // Without this split, the first signature
+                        // consumed the single guard token and the
+                        // patch refused to re-fire on the SECOND
+                        // (different) signature, forcing the Doctor
+                        // back into a loop.
+                        var cosmosStuck =
                             !string.IsNullOrEmpty(stepTail)
                             && (stepTail.Contains("failed provisioning state",
                                                   StringComparison.OrdinalIgnoreCase)
                                 || stepTail.Contains("Please delete the previous instance",
+                                                  StringComparison.OrdinalIgnoreCase));
+                        var cosmosZonal =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("zonal redundant",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && (stepTail.Contains("Database account",
                                                   StringComparison.OrdinalIgnoreCase)
-                                || (stepTail.Contains("zonal redundant",
-                                                  StringComparison.OrdinalIgnoreCase)
-                                    && stepTail.Contains("Database account",
-                                                  StringComparison.OrdinalIgnoreCase)))
-                            && !previousAttempts.Any(a =>
-                                a.Contains("[AutoPatch:cosmos-failed-state]"));
+                                || stepTail.Contains("Cosmos",
+                                                  StringComparison.OrdinalIgnoreCase));
+                        var cosmosStuckAlready = previousAttempts.Any(a =>
+                            a.Contains("[AutoPatch:cosmos-stuck]"));
+                        var cosmosZonalAlready = previousAttempts.Any(a =>
+                            a.Contains("[AutoPatch:cosmos-zonal]"));
+                        var cosmosFailedState =
+                            (cosmosStuck && !cosmosStuckAlready)
+                            || (cosmosZonal && !cosmosZonalAlready);
                         if (cosmosFailedState)
                         {
                             // Resolve RG at runtime via azd, falling back
@@ -1901,20 +1928,28 @@ public sealed class DeploymentOrchestrator
                             // every layer of bash -lc wrapping above us.
                             var cosmosCleanupCmd =
                                 "bash -lc 'echo " + cleanupB64 + " | base64 -d | bash'";
+                            // Tag THIS specific signature so the OTHER
+                            // signature can still re-fire its own pass.
+                            // cosmos-stuck takes precedence (it implies
+                            // accounts already exist and need delete);
+                            // cosmos-zonal alone needs only the env-set.
+                            var firedMarker = cosmosStuck
+                                ? "[AutoPatch:cosmos-stuck]"
+                                : "[AutoPatch:cosmos-zonal]";
                             previousAttempts.Add(
-                                "[AutoPatch:cosmos-failed-state] Cosmos DB account(s) " +
-                                "in failed provisioning state and/or zonal-redundancy " +
-                                "capacity error; listed cosmos accounts in RG, deleted " +
-                                "each via az cosmosdb delete --no-wait, awaited full " +
+                                firedMarker + " Cosmos DB account(s) in failed " +
+                                "provisioning state and/or zonal-redundancy capacity " +
+                                "error; listed cosmos accounts in RG, deleted each " +
+                                "via az cosmosdb delete --no-wait, awaited full " +
                                 "deletion via az resource wait --deleted, and forced " +
                                 "USE_ZONE_REDUNDANCY=false.");
                             await Log(s, "status",
-                                "Auto-patch: detected Cosmos DB 'failed provisioning " +
-                                "state' / zonal-redundancy capacity error. Inserting " +
-                                "a deterministic cleanup step (list+delete+wait on " +
-                                "all cosmos accounts in RG; disable zone redundancy) " +
-                                "ahead of the failing step instead of letting the " +
-                                "Doctor loop on invalid 'az cosmosdb wait' commands.",
+                                "Auto-patch " + firedMarker + ": detected Cosmos DB " +
+                                "failure. Inserting a deterministic cleanup step " +
+                                "(list+delete+wait on all cosmos accounts in RG; " +
+                                "disable zone redundancy) ahead of the failing step " +
+                                "instead of letting the Doctor loop on invalid " +
+                                "'az cosmosdb wait' commands.",
                                 step.Id);
                             var cosmosStep = new DeploymentStep(
                                 step.Id,
