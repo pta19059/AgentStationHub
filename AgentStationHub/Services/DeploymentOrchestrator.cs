@@ -2667,16 +2667,23 @@ public sealed class DeploymentOrchestrator
             s.FinalEndpoint = v.Endpoint;
             if (!string.IsNullOrEmpty(v.Notes)) await Log(s, "info", $"Verifier: {v.Notes}");
 
-            // If our probe spotted placeholder images, overrule the
-            // Verifier if it optimistically said 'success'. This is a
-            // deterministic signal that cannot be argued away by
-            // interpretation of the log tail.
+            // If our probe spotted placeholder images OR zero Container
+            // Apps at all, take recovery into our own hands regardless
+            // of what the Verifier concluded. This is a deterministic
+            // signal that cannot be argued away by interpretation of
+            // the log tail. We previously gated on `v.Success` only,
+            // but that left the "0 CAs" case stuck on a Failed verdict
+            // even though the recovery (re-run azd up) can usually
+            // unstick it.
             var hasHollowSignal = probeHints.Any(h =>
                 h.StartsWith("hollow_deploy:", StringComparison.Ordinal));
-            if (hasHollowSignal && v.Success)
+            if (hasHollowSignal)
             {
                 var hollowDetail = string.Join("; ",
                     probeHints.Where(h => h.StartsWith("hollow_deploy:")));
+                var noCasCase = probeHints.Any(h =>
+                    h.StartsWith("hollow_deploy:no_cas",
+                                 StringComparison.Ordinal));
 
                 // Autonomous recovery: instead of immediately failing the
                 // whole deploy, try an 'azd deploy --no-prompt' pass. The
@@ -2697,12 +2704,16 @@ public sealed class DeploymentOrchestrator
                 // loop — the loop responsibility lives in step-level
                 // auto-retry + Doctor remediation ABOVE, not here.
                 await Log(s, "warn",
-                    $"Verifier said Succeeded but the real Azure state disagrees: {hollowDetail}. " +
-                    "Triggering an autonomous 'azd deploy' recovery pass before failing the deploy. " +
-                    "Infrastructure is intact; only the image build+push is missing.");
+                    (v.Success
+                        ? "Verifier said Succeeded but the real Azure state disagrees"
+                        : "Verifier reported failure")
+                    + $": {hollowDetail}. " +
+                    "Triggering an autonomous "
+                    + (noCasCase ? "'azd up'" : "'azd deploy'")
+                    + " recovery pass before failing the deploy.");
 
                 var recovered = await TryAutoRecoverHollowDeployAsync(
-                    s, docker, plan.Environment, ct);
+                    s, docker, plan.Environment, ct, runFullAzdUp: noCasCase);
 
                 if (recovered)
                 {
@@ -3358,23 +3369,29 @@ public sealed class DeploymentOrchestrator
         DeploymentSession s,
         Tools.DockerShellTool docker,
         IReadOnlyDictionary<string, string> planEnv,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool runFullAzdUp = false)
     {
         try
         {
             await Log(s, "status",
-                "Autonomous recovery: running 'azd deploy --no-prompt' inside the live " +
-                "sandbox session to build + push application images. This is a one-shot " +
-                "pass — if it doesn't clear the hollow state, the deploy will be marked Failed.");
+                "Autonomous recovery: running '"
+                + (runFullAzdUp ? "azd up" : "azd deploy")
+                + " --no-prompt' inside the live "
+                + "sandbox session to "
+                + (runFullAzdUp ? "provision + " : "")
+                + "build + push application images. This is a one-shot "
+                + "pass — if it doesn't clear the hollow state, the deploy will be marked Failed.");
 
             var env = planEnv.ToDictionary(kv => kv.Key, kv => kv.Value);
 
+            var azdSubcmd = runFullAzdUp ? "azd up" : "azd deploy";
             var recoveryCmd =
                 "set -e; " +
                 "cd /workspace; " +
                 "echo '[recovery] azd env list:'; azd env list --output table 2>&1 || true; " +
-                "echo '[recovery] launching azd deploy --no-prompt'; " +
-                "azd deploy --no-prompt";
+                $"echo '[recovery] launching {azdSubcmd} --no-prompt'; " +
+                $"{azdSubcmd} --no-prompt";
 
             var result = await docker.RunAsync(
                 recoveryCmd, ".",
@@ -3470,6 +3487,24 @@ public sealed class DeploymentOrchestrator
                 await Log(s, "info",
                     $"Post-deploy probe: {placeholder}/{total} Container Apps in '{rg}' are on " +
                     "the Microsoft placeholder image (real app images never built/pushed).",
+                    null);
+            }
+            else if (total == 0)
+            {
+                // No Container Apps at all — provision either never ran
+                // or rolled back. azd deploy on its own is useless here:
+                // there are no CAs to push images to. Recovery must
+                // re-run provision (azd up). We emit a distinct
+                // ':no_cas' suffix so the recovery path can pick the
+                // right command.
+                hints.Add(
+                    $"hollow_deploy:no_cas:0 Container Apps in '{rg}'. Infrastructure " +
+                    "provisioning never produced any Container Apps; 'azd deploy' on its " +
+                    "own cannot recover. Recovery must re-run 'azd up' to provision + " +
+                    "deploy from scratch.");
+                await Log(s, "info",
+                    $"Post-deploy probe: 0 Container Apps in '{rg}'. Provision did not " +
+                    "materialise any CAs; flagging for autonomous 'azd up' recovery pass.",
                     null);
             }
             else if (total > 0)
