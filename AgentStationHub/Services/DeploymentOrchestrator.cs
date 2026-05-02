@@ -1870,12 +1870,22 @@ public sealed class DeploymentOrchestrator
                                                   StringComparison.OrdinalIgnoreCase)
                                 || stepTail.Contains("Cosmos",
                                                   StringComparison.OrdinalIgnoreCase));
-                        var cosmosStuckAlready = previousAttempts.Any(a =>
+                        var cosmosStuckCount = previousAttempts.Count(a =>
                             a.Contains("[AutoPatch:cosmos-stuck]"));
                         var cosmosZonalAlready = previousAttempts.Any(a =>
                             a.Contains("[AutoPatch:cosmos-zonal]"));
+                        // cosmos-stuck cleanup is IDEMPOTENT (delete +
+                        // wait + no-op when nothing matches) and we have
+                        // observed cases where Bicep re-creates accounts
+                        // in failed state on the next provision because
+                        // the previous deletion didn't fully complete
+                        // before the next attempt started. Allow it to
+                        // refire up to 3 times before giving up to the
+                        // Doctor (which is likely to suggest the same
+                        // cleanup but with broken syntax like
+                        // `azd env get --key`).
                         var cosmosFailedState =
-                            (cosmosStuck && !cosmosStuckAlready)
+                            (cosmosStuck && cosmosStuckCount < 3)
                             || (cosmosZonal && !cosmosZonalAlready);
                         if (cosmosFailedState)
                         {
@@ -1964,10 +1974,32 @@ public sealed class DeploymentOrchestrator
                                 "  echo \"deleting $n via az resource delete (works on failed-state too)\"",
                                 "  az resource delete -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" --verbose 2>&1 | tail -n 5 || true",
                                 "done",
+                                "# Poll for actual deletion via az cosmosdb show + az resource show.",
+                                "# `az resource wait --deleted` against Microsoft.DocumentDB hits a",
+                                "# 'locations/operationsStatus' subresource whose api-version we",
+                                "# don't have registered for this provider, surfacing a",
+                                "# NoRegisteredProviderFound error and bailing out of the wait",
+                                "# without actually waiting. Polling explicitly is reliable.",
                                 "for n in $ALL_NAMES; do",
-                                "  echo \"waiting for $n to be fully deleted\"",
-                                "  az resource wait --resource-group \"$RG\" --namespace Microsoft.DocumentDB --resource-type databaseAccounts --name \"$n\" --deleted --interval 15 --timeout 900 || true",
+                                "  echo \"waiting for $n to be fully deleted (poll up to 15min)\"",
+                                "  for try in $(seq 1 60); do",
+                                "    if ! az cosmosdb show -g \"$RG\" -n \"$n\" >/dev/null 2>&1 \\",
+                                "       && ! az resource show -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" >/dev/null 2>&1; then",
+                                "      echo \"  $n deletion confirmed (try=$try)\"",
+                                "      break",
+                                "    fi",
+                                "    sleep 15",
+                                "  done",
                                 "done",
+                                "# Final verification: list any cosmos accounts STILL present",
+                                "# in the RG so the next provision attempt sees a clean slate",
+                                "# (or so we know the cleanup is incomplete).",
+                                "REMAINING=$(az resource list -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --query \"[].name\" -o tsv 2>/dev/null)",
+                                "if [ -n \"$REMAINING\" ]; then",
+                                "  echo \"WARNING: cosmos accounts still present after cleanup: $REMAINING\"",
+                                "else",
+                                "  echo \"verified: no cosmos accounts remain in $RG\"",
+                                "fi",
                                 "echo 'AutoPatch:cosmos-failed-state done'",
                                 ""
                             });
