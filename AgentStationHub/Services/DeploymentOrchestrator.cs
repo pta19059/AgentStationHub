@@ -1874,6 +1874,28 @@ public sealed class DeploymentOrchestrator
                             a.Contains("[AutoPatch:cosmos-stuck]"));
                         var cosmosZonalAlready = previousAttempts.Any(a =>
                             a.Contains("[AutoPatch:cosmos-zonal]"));
+                        // Yield priority to [AutoPatch:cosmos-region]
+                        // (defined further below at 8.7.z) on the FIRST
+                        // observation of the zonal-redundancy signature
+                        // in eastus: the region pivot rewrites
+                        // main.parameters.json + flips
+                        // useZoneRedundancy=false at the source, so
+                        // running the cleanup-only zonal/stuck patch
+                        // here would only delete accounts that the
+                        // region patch is about to delete itself, and
+                        // would burn the single-fire token of the
+                        // zonal/stuck patch on a palliative cleanup
+                        // before the real fix has had a chance to run.
+                        var cosmosRegionWillFireFirst =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("zonal redundant",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && (stepTail.Contains("East US",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || stepTail.Contains("eastus",
+                                                  StringComparison.OrdinalIgnoreCase))
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:cosmos-region]"));
                         // cosmos-stuck cleanup is IDEMPOTENT (delete +
                         // wait + no-op when nothing matches) and we have
                         // observed cases where Bicep re-creates accounts
@@ -1885,8 +1907,9 @@ public sealed class DeploymentOrchestrator
                         // cleanup but with broken syntax like
                         // `azd env get --key`).
                         var cosmosFailedState =
-                            (cosmosStuck && cosmosStuckCount < 3)
-                            || (cosmosZonal && !cosmosZonalAlready);
+                            !cosmosRegionWillFireFirst
+                            && ((cosmosStuck && cosmosStuckCount < 3)
+                                || (cosmosZonal && !cosmosZonalAlready));
                         if (cosmosFailedState)
                         {
                             // Resolve RG at runtime via azd, falling back
