@@ -2227,6 +2227,113 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // 8.7.z: [AutoPatch:cosmos-region] — when a cosmos
+                        // creation fails repeatedly with
+                        //   ServiceUnavailable: ... high demand in East US
+                        //   region for the zonal redundant (Availability
+                        //   Zones) accounts
+                        // simply pinning AZURE_COSMOS_LOCATION=eastus2 via
+                        // azd env set is unreliable: the loader sometimes
+                        // re-reads stale azd .env, and main.parameters.json
+                        // hardcodes "useZoneRedundancy" as a STRING ("false")
+                        // which Bicep coerces inconsistently. The robust
+                        // fix is to rewrite main.parameters.json directly:
+                        //   - set cosmosLocation literal to "eastus2"
+                        //   - convert useZoneRedundancy "false" string to
+                        //     boolean false (Bicep param is bool)
+                        // and to set the azd env var as well so the rest
+                        // of the deploy stays consistent. Then run the
+                        // standard cosmos-stuck cleanup so the previously-
+                        // failed accounts in eastus get deleted before the
+                        // next provision (which will land in eastus2).
+                        var cosmosRegion =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("zonal redundant",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && (stepTail.Contains("East US",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || stepTail.Contains("eastus",
+                                                  StringComparison.OrdinalIgnoreCase))
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:cosmos-region]"));
+                        if (cosmosRegion)
+                        {
+                            var regionScript = string.Join("\n", new[]
+                            {
+                                "set +e",
+                                "echo 'AutoPatch:cosmos-region starting'",
+                                "cd /workspace 2>/dev/null || true",
+                                "PARAMS=infra/main.parameters.json",
+                                "if [ ! -f \"$PARAMS\" ] && [ -f main.parameters.json ]; then PARAMS=main.parameters.json; fi",
+                                "echo \"params file: $PARAMS\"",
+                                "if [ -f \"$PARAMS\" ]; then",
+                                "  # 1. Hard-code cosmosLocation to eastus2 (drop the ${AZURE_COSMOS_LOCATION} indirection that azd may not refresh).",
+                                "  sed -i 's|\"cosmosLocation\":[[:space:]]*{[[:space:]]*\"value\":[[:space:]]*\"\\${AZURE_COSMOS_LOCATION}\"[[:space:]]*}|\"cosmosLocation\": { \"value\": \"eastus2\" }|' \"$PARAMS\"",
+                                "  sed -i 's|\"cosmosLocation\":[[:space:]]*{[[:space:]]*\"value\":[[:space:]]*\"eastus\"[[:space:]]*}|\"cosmosLocation\": { \"value\": \"eastus2\" }|' \"$PARAMS\"",
+                                "  # 2. useZoneRedundancy: convert string \"false\" / \"true\" to boolean false (Bicep param is bool).",
+                                "  sed -i 's|\"useZoneRedundancy\":[[:space:]]*{[[:space:]]*\"value\":[[:space:]]*\"\\(true\\|false\\)\"[[:space:]]*}|\"useZoneRedundancy\": { \"value\": false }|' \"$PARAMS\"",
+                                "  echo 'after patch:'",
+                                "  grep -E 'cosmosLocation|useZoneRedundancy' \"$PARAMS\" || true",
+                                "fi",
+                                "# 3. Belt-and-suspenders: also set the azd env var.",
+                                "azd env set AZURE_COSMOS_LOCATION eastus2 || true",
+                                "azd env set USE_ZONE_REDUNDANCY false || true",
+                                "echo 'azd env after set:'",
+                                "azd env get-values 2>/dev/null | grep -E 'COSMOS_LOCATION|ZONE_REDUNDANCY' || true",
+                                "# 4. Delete any cosmos accounts already in failed state in the current RG so the next provision starts clean.",
+                                "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
+                                "if [ -z \"$RG\" ]; then RG=$(az group list --query \"[?starts_with(name,'rg-')].name | [0]\" -o tsv); fi",
+                                "echo \"RG=$RG\"",
+                                "if [ -n \"$RG\" ]; then",
+                                "  NAMES=$(az resource list -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --query \"[].name\" -o tsv 2>/dev/null)",
+                                "  for n in $NAMES; do",
+                                "    echo \"deleting cosmos $n in $RG\"",
+                                "    az resource delete -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" 2>&1 | tail -n 3 || true",
+                                "  done",
+                                "  for n in $NAMES; do",
+                                "    for try in $(seq 1 60); do",
+                                "      if ! az resource show -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" >/dev/null 2>&1; then",
+                                "        echo \"  $n deletion confirmed (try=$try)\"; break",
+                                "      fi",
+                                "      sleep 15",
+                                "    done",
+                                "  done",
+                                "fi",
+                                "echo 'AutoPatch:cosmos-region done'",
+                                ""
+                            });
+                            var regionB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(regionScript));
+                            var regionCmd =
+                                "bash -lc 'echo " + regionB64 + " | base64 -d | bash'";
+                            previousAttempts.Add(
+                                "[AutoPatch:cosmos-region] Cosmos creation kept " +
+                                "failing with ServiceUnavailable for zonal redundant " +
+                                "accounts in East US. Rewrote main.parameters.json " +
+                                "to hardcode cosmosLocation='eastus2' and convert " +
+                                "useZoneRedundancy from string 'false' to bool false; " +
+                                "also set the azd env vars (belt-and-suspenders) and " +
+                                "deleted any pre-existing failed cosmos accounts in " +
+                                "the RG so the next provision starts clean.");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:cosmos-region]: persistent " +
+                                "Cosmos zonal-redundancy ServiceUnavailable in " +
+                                "eastus. Hardcoding cosmosLocation=eastus2 and " +
+                                "useZoneRedundancy=false in main.parameters.json, " +
+                                "setting matching azd env vars, and deleting any " +
+                                "stale cosmos accounts in the RG before retrying.",
+                                step.Id);
+                            var regionStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: pin Cosmos to eastus2 + disable zone redundancy + cleanup stale accounts",
+                                regionCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(20));
+                            steps.Insert(i, regionStep);
+                            i--;
+                            continue;
+                        }
+
                         // 8.8: prefill previousAttempts with cross-session
                         // failed attempts for the same error signature on
                         // the same repo so the Doctor pivots instead of
