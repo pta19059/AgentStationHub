@@ -86,13 +86,23 @@ public static class AzdEnvLoader
             // and rely on the marker-based extraction afterwards.
             // (Pragmatic compromise: a few extra info lines in the live
             // log; the orchestrator filters them out at the UI layer.)
+            // Silence budget must comfortably exceed the cold-start cost of
+            // the `az account get-access-token` prewarm shim that
+            // DockerShellTool injects when the script mentions `azd `.
+            // That shim writes ONLY to /dev/null; on a freshly-started
+            // sandbox container Python+azure-cli+MSAL fetch can sit
+            // genuinely silent for 10-20s while the watcher would
+            // mis-classify it as a hang and kill the loader at "0 min"
+            // (see https://github.com/pta19059/AgentStationHub commit
+            // history). 60s is generous enough to absorb any plausible
+            // cold-start while still bounding a real wedge.
             result = await docker.RunAsync(
                 script,
                 ".",
                 envVars: null,
-                timeout: TimeSpan.FromSeconds(20),
+                timeout: TimeSpan.FromSeconds(90),
                 ct: ct,
-                silenceBudget: TimeSpan.FromSeconds(15),
+                silenceBudget: TimeSpan.FromSeconds(60),
                 // Big enough to retain ALL of `azd env get-values`
                 // output (typical templates emit 30-50 keys) plus the
                 // BEGIN/END markers, even when azd interleaves its
