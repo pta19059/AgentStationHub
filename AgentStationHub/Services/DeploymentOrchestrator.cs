@@ -2421,25 +2421,7 @@ public sealed class DeploymentOrchestrator
                                 "                fh.write('\\n')",
                                 "            print(f'  {p}: aiFoundryCosmosDBAccountResourceId = {cosmos_id}')",
                                 "else:",
-                                "    # No main cosmos yet — patch Bicep to move AI Foundry module to cosmosLocation",
-                                "    print('No main cosmos found, patching Bicep location')",
-                                "    f = 'infra/main.bicep'",
-                                "    if os.path.exists(f):",
-                                "        with open(f, 'r') as fh:",
-                                "            content = fh.read()",
-                                "        idx = content.find(\"module aiFoundry 'modules/ai-foundry/main.bicep'\")",
-                                "        if idx >= 0:",
-                                "            params_idx = content.find('params:', idx)",
-                                "            if params_idx >= 0:",
-                                "                loc_pat = re.compile(r'(\\s+)location:\\s*location\\b')",
-                                "                loc_m = loc_pat.search(content, params_idx, params_idx + 300)",
-                                "                if loc_m:",
-                                "                    content = content[:loc_m.start()] + loc_m.group(1) + 'location: cosmosLocation' + content[loc_m.end():]",
-                                "                    with open(f, 'w') as fh:",
-                                "                        fh.write(content)",
-                                "                    print('  patched aiFoundry module: location -> cosmosLocation')",
-                                "                else:",
-                                "                    print('  location: location not found near aiFoundry params')",
+                                "    print('No main cosmos found yet — cosmos-aif fix will run on next attempt')",
                                 "PYCOSMOS_AIF",
                                 "# 3. Belt-and-suspenders: also set the azd env vars.",
                                 "azd env set AZURE_COSMOS_LOCATION eastus2 || true",
@@ -2498,6 +2480,116 @@ public sealed class DeploymentOrchestrator
                                 step.WorkingDirectory,
                                 TimeSpan.FromMinutes(20));
                             steps.Insert(i, regionStep);
+                            i--;
+                            continue;
+                        }
+
+                        // ── AutoPatch:cosmos-aif-reuse ──
+                        // If cosmos-aif failed but a main cosmos (non-aif) already
+                        // exists in the RG, set aiFoundryCosmosDBAccountResourceId
+                        // so the AVM AI Foundry module reuses it instead of creating
+                        // a new cosmos-aif in eastus (which fails with zonal redundancy).
+                        // This fires independently of cosmos-region (which is single-fire).
+                        var cosmosAifReuse =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("cosmos-aif",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && (stepTail.Contains("ServiceUnavailable",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || stepTail.Contains("Failed",
+                                                     StringComparison.OrdinalIgnoreCase))
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:cosmos-aif-reuse]"));
+                        if (cosmosAifReuse)
+                        {
+                            var aifScript = string.Join("\n", new[]
+                            {
+                                "set +e",
+                                "echo 'AutoPatch:cosmos-aif-reuse starting'",
+                                "cd /workspace 2>/dev/null || true",
+                                "python3 - <<'PYAIF'",
+                                "import json, os, subprocess",
+                                "",
+                                "rg = subprocess.run(['azd', 'env', 'get-value', 'AZURE_RESOURCE_GROUP'],",
+                                "                    capture_output=True, text=True).stdout.strip()",
+                                "if not rg:",
+                                "    rg = subprocess.run(['az', 'group', 'list', '--query',",
+                                "                        \"[?starts_with(name,'rg-')].name | [0]\", '-o', 'tsv'],",
+                                "                       capture_output=True, text=True).stdout.strip()",
+                                "print(f'RG={rg}')",
+                                "",
+                                "cosmos_id = ''",
+                                "if rg:",
+                                "    out = subprocess.run(['az', 'cosmosdb', 'list', '-g', rg, '--query',",
+                                "                         \"[?!contains(name,'-aif-')].{name:name,id:id}\", '-o', 'json'],",
+                                "                        capture_output=True, text=True).stdout.strip()",
+                                "    try:",
+                                "        accounts = json.loads(out) if out else []",
+                                "    except Exception:",
+                                "        accounts = []",
+                                "    cosmos_id = accounts[0]['id'] if accounts else ''",
+                                "",
+                                "if cosmos_id:",
+                                "    print(f'Found main cosmos: {cosmos_id}')",
+                                "    for p in ['main.parameters.json', 'infra/main.parameters.json']:",
+                                "        if not os.path.exists(p): continue",
+                                "        with open(p, 'r') as fh:",
+                                "            j = json.loads(fh.read())",
+                                "        params = j.get('parameters', {})",
+                                "        old = params.get('aiFoundryCosmosDBAccountResourceId', {}).get('value')",
+                                "        if old != cosmos_id:",
+                                "            params.setdefault('aiFoundryCosmosDBAccountResourceId', {})['value'] = cosmos_id",
+                                "            with open(p, 'w') as fh:",
+                                "                json.dump(j, fh, indent=2, ensure_ascii=False)",
+                                "                fh.write('\\n')",
+                                "            print(f'  {p}: aiFoundryCosmosDBAccountResourceId = {cosmos_id}')",
+                                "else:",
+                                "    print('No main cosmos found yet — cannot reuse, cosmos-aif will retry normally')",
+                                "PYAIF",
+                                "# Also delete cosmos-aif if in failed state",
+                                "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
+                                "if [ -z \"$RG\" ]; then RG=$(az group list --query \"[?starts_with(name,'rg-')].name | [0]\" -o tsv); fi",
+                                "if [ -n \"$RG\" ]; then",
+                                "  AIF=$(az resource list -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --query \"[?contains(name,'-aif-')].name\" -o tsv 2>/dev/null)",
+                                "  for n in $AIF; do",
+                                "    echo \"deleting cosmos-aif $n\"",
+                                "    az resource delete -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" 2>&1 | tail -3 || true",
+                                "  done",
+                                "  for n in $AIF; do",
+                                "    for try in $(seq 1 40); do",
+                                "      if ! az resource show -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" >/dev/null 2>&1; then",
+                                "        echo \"  $n deletion confirmed (try=$try)\"; break",
+                                "      fi",
+                                "      sleep 15",
+                                "    done",
+                                "  done",
+                                "fi",
+                                "echo 'AutoPatch:cosmos-aif-reuse done'",
+                                ""
+                            });
+                            var aifB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(aifScript));
+                            var aifCmd =
+                                "bash -lc 'echo " + aifB64 + " | base64 -d | bash'";
+                            previousAttempts.Add(
+                                "[AutoPatch:cosmos-aif-reuse] cosmos-aif failed " +
+                                "(AI Foundry creates its own Cosmos in primary region " +
+                                "which fails with zonal redundancy). Set " +
+                                "aiFoundryCosmosDBAccountResourceId to reuse the " +
+                                "existing main cosmos account created in eastus2.");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:cosmos-aif-reuse]: cosmos-aif " +
+                                "failed. Setting aiFoundryCosmosDBAccountResourceId " +
+                                "to reuse the main cosmos account (eastus2) so AI " +
+                                "Foundry skips creating a new cosmos in eastus.",
+                                step.Id);
+                            var aifStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: reuse main cosmos for AI Foundry (skip cosmos-aif)",
+                                aifCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(15));
+                            steps.Insert(i, aifStep);
                             i--;
                             continue;
                         }
