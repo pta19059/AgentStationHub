@@ -1899,6 +1899,46 @@ public sealed class DeploymentOrchestrator
                             // it through `base64 -d | bash` so the
                             // outer shells only ever see a single quoted
                             // string with NO special chars inside.
+                            // Extract cosmos account name(s) from the
+                            // error tail. Bicep deployments fail with
+                            //   "DatabaseAccount cosmos-XYZ is in a
+                            //    failed provisioning state ..."
+                            // and `az cosmosdb list` does NOT return
+                            // accounts that never finished initial
+                            // provisioning — but `az resource list
+                            // --resource-type Microsoft.DocumentDB/
+                            // databaseAccounts` does. We collect names
+                            // from BOTH sources plus the regex match
+                            // on the error tail to be safe.
+                            var failedCosmosNames = new System.Collections.Generic.HashSet<string>(
+                                StringComparer.OrdinalIgnoreCase);
+                            try
+                            {
+                                var rxCosmos = new System.Text.RegularExpressions.Regex(
+                                    @"DatabaseAccount\s+([A-Za-z0-9][A-Za-z0-9-]{2,49})\s+is\s+in\s+a\s+failed",
+                                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                                foreach (System.Text.RegularExpressions.Match m in rxCosmos.Matches(stepTail ?? ""))
+                                    if (m.Success) failedCosmosNames.Add(m.Groups[1].Value);
+                            }
+                            catch { /* regex failure is non-fatal */ }
+                            // Also pick up names from earlier session
+                            // logs in case the current step's tail
+                            // doesn't include the original failure.
+                            try
+                            {
+                                var rxCosmos2 = new System.Text.RegularExpressions.Regex(
+                                    @"\b(cosmos-[a-z0-9]{6,30})\b",
+                                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                                foreach (var le in s.Logs.TakeLast(200))
+                                {
+                                    foreach (System.Text.RegularExpressions.Match m in rxCosmos2.Matches(le.Message ?? ""))
+                                        if (m.Success) failedCosmosNames.Add(m.Groups[1].Value);
+                                }
+                            }
+                            catch { /* non-fatal */ }
+                            var inlinedFailedNames = string.Join(" ",
+                                failedCosmosNames.Select(n => "'" + n.Replace("'", "") + "'"));
+
                             var cleanupScript = string.Join("\n", new[]
                             {
                                 "set +e",
@@ -1908,17 +1948,26 @@ public sealed class DeploymentOrchestrator
                                 "fi",
                                 "echo \"AutoPatch:cosmos-failed-state RG=$RG\"",
                                 "if [ -z \"$RG\" ]; then echo 'no RG resolved; aborting cleanup'; exit 0; fi",
-                                "NAMES=$(az cosmosdb list -g \"$RG\" --query \"[].name\" -o tsv 2>/dev/null)",
-                                "echo \"cosmos accounts in $RG: $NAMES\"",
-                                "for n in $NAMES; do",
-                                "  echo \"deleting $n (no-wait)\"",
-                                "  az cosmosdb delete -g \"$RG\" -n \"$n\" --yes --no-wait || true",
-                                "done",
-                                "for n in $NAMES; do",
-                                "  echo \"waiting for $n to be fully deleted\"",
-                                "  az resource wait --resource-group \"$RG\" --namespace Microsoft.DocumentDB --resource-type databaseAccounts --name \"$n\" --deleted --interval 20 --timeout 900 || true",
-                                "done",
+                                "# Disable zone redundancy upfront so the next provision picks a single-zone SKU.",
                                 "azd env set USE_ZONE_REDUNDANCY false || true",
+                                "# Collect candidate cosmos account names from THREE sources:",
+                                "#   (1) az cosmosdb list (succeeded accounts only)",
+                                "#   (2) az resource list (sees ALL Microsoft.DocumentDB resources, including failed-state)",
+                                "#   (3) names parsed from the error tail / log history (passed in via $FAILED_NAMES)",
+                                "NAMES_A=$(az cosmosdb list -g \"$RG\" --query \"[].name\" -o tsv 2>/dev/null)",
+                                "NAMES_B=$(az resource list -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --query \"[].name\" -o tsv 2>/dev/null)",
+                                "FAILED_NAMES=" + (string.IsNullOrWhiteSpace(inlinedFailedNames) ? "''" : "\"" + string.Join(" ", failedCosmosNames) + "\""),
+                                "ALL_NAMES=$(printf '%s\\n%s\\n%s\\n' \"$NAMES_A\" \"$NAMES_B\" \"$FAILED_NAMES\" | tr ' ' '\\n' | awk 'NF' | sort -u)",
+                                "echo \"cosmos candidates in $RG (cosmosdb-list | resource-list | parsed): A=[$NAMES_A] B=[$NAMES_B] F=[$FAILED_NAMES]\"",
+                                "if [ -z \"$ALL_NAMES\" ]; then echo 'no cosmos accounts found anywhere; AutoPatch is a no-op'; exit 0; fi",
+                                "for n in $ALL_NAMES; do",
+                                "  echo \"deleting $n via az resource delete (works on failed-state too)\"",
+                                "  az resource delete -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" --verbose 2>&1 | tail -n 5 || true",
+                                "done",
+                                "for n in $ALL_NAMES; do",
+                                "  echo \"waiting for $n to be fully deleted\"",
+                                "  az resource wait --resource-group \"$RG\" --namespace Microsoft.DocumentDB --resource-type databaseAccounts --name \"$n\" --deleted --interval 15 --timeout 900 || true",
+                                "done",
                                 "echo 'AutoPatch:cosmos-failed-state done'",
                                 ""
                             });
@@ -3437,7 +3486,17 @@ public sealed class DeploymentOrchestrator
         var hints = new List<string>();
         try        {
             var rg = ExtractResourceGroupFromLogs(s.Logs);
-            if (string.IsNullOrWhiteSpace(rg)) return hints;
+            if (string.IsNullOrWhiteSpace(rg))
+            {
+                await Log(s, "info",
+                    "Post-deploy probe: could not extract resource-group name from session " +
+                    "logs; skipping az containerapp probe (hollow-deploy detection disabled).",
+                    null);
+                return hints;
+            }
+            await Log(s, "info",
+                $"Post-deploy probe: scanning Container Apps in '{rg}' to detect hollow deploys.",
+                null);
 
             var stdout = new System.Text.StringBuilder();
             var result = await CliWrap.Cli.Wrap("az")
@@ -3454,7 +3513,15 @@ public sealed class DeploymentOrchestrator
                 .WithStandardErrorPipe(CliWrap.PipeTarget.Null)
                 .ExecuteAsync(ct);
 
-            if (result.ExitCode != 0 || stdout.Length < 2) return hints;
+            if (result.ExitCode != 0 || stdout.Length < 2)
+            {
+                await Log(s, "info",
+                    $"Post-deploy probe: 'az containerapp list -g {rg}' exited " +
+                    $"{result.ExitCode} with {stdout.Length}-byte stdout; treating as " +
+                    "indeterminate and skipping hollow-deploy detection.",
+                    null);
+                return hints;
+            }
 
             using var doc = System.Text.Json.JsonDocument.Parse(stdout.ToString());
             if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return hints;

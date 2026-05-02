@@ -235,9 +235,36 @@ public sealed class FoundryDoctorClient
             }
 
             var newSteps = (wire.Remediation.NewSteps ?? new List<WireStep>())
-                .Select(s => new DeploymentStep(s.Id, s.Description, s.Cmd, s.Cwd)
+                .Select(s =>
                 {
-                    ActionJson = s.ActionJson
+                    // Resolve action payload: prefer pre-serialised
+                    // ActionJson, otherwise serialise an inline `action`
+                    // object. When an action is present and Cmd is
+                    // empty, also project a Bash action's `script`
+                    // into Cmd so legacy code paths that only inspect
+                    // the string command still see something usable.
+                    string? actionJson = s.ActionJson;
+                    string cmd = s.Cmd ?? "";
+                    if (s.Action is JsonElement actEl
+                        && actEl.ValueKind == JsonValueKind.Object)
+                    {
+                        actionJson ??= actEl.GetRawText();
+                        if (string.IsNullOrWhiteSpace(cmd)
+                            && actEl.TryGetProperty("type", out var tEl)
+                            && tEl.ValueKind == JsonValueKind.String
+                            && string.Equals(tEl.GetString(), "Bash",
+                                             StringComparison.OrdinalIgnoreCase)
+                            && (actEl.TryGetProperty("script", out var scEl)
+                                || actEl.TryGetProperty("cmd", out scEl))
+                            && scEl.ValueKind == JsonValueKind.String)
+                        {
+                            cmd = scEl.GetString() ?? "";
+                        }
+                    }
+                    return new DeploymentStep(s.Id, s.Description, cmd, s.Cwd)
+                    {
+                        ActionJson = actionJson
+                    };
                 })
                 .ToList();
 
@@ -386,6 +413,13 @@ public sealed class FoundryDoctorClient
         [JsonPropertyName("cmd")]         public string Cmd { get; set; } = "";
         [JsonPropertyName("cwd")]         public string Cwd { get; set; } = ".";
         [JsonPropertyName("actionJson")]  public string? ActionJson { get; set; }
+        // The hosted Doctor sometimes emits a typed `action` object
+        // (e.g. {"type":"Bash","script":"..."}) instead of the legacy
+        // `cmd` string. Capture it here so the dispatcher can hand it
+        // to ActionRegistry. We also project a Bash action's `script`
+        // back into Cmd as a safety net for downstream code paths
+        // that only look at the string command.
+        [JsonPropertyName("action")]      public JsonElement? Action { get; set; }
     }
 
     private sealed class WireRemediation
