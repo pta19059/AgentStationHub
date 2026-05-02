@@ -2103,6 +2103,98 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // 8.7.y: [AutoPatch:embedding-quota] — when an
+                        // ARM template validation fails with
+                        //   InsufficientQuota: This operation require N
+                        //   new capacity in quota Tokens Per Minute
+                        //   (thousands) - text-embedding-3-large
+                        // the Doctor's `sed` patches on main.parameters.json
+                        // can only reduce capacity to 1; the sub already
+                        // has 350/350 TPM consumed by leftover model
+                        // deployments from previous failed deploys, so
+                        // even capacity=1 fails. The deterministic fix
+                        // is to free quota by deleting every
+                        // text-embedding-3-large model deployment that
+                        // lives OUTSIDE the current RG (i.e. orphans
+                        // from prior sessions), then retry. We never
+                        // touch deployments in the current RG: they
+                        // either don't exist yet (validation phase) or
+                        // belong to the in-flight deploy.
+                        var embeddingQuota =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("InsufficientQuota",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && stepTail.Contains("text-embedding",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:embedding-quota]"));
+                        if (embeddingQuota)
+                        {
+                            var quotaScript = string.Join("\n", new[]
+                            {
+                                "set +e",
+                                "echo 'AutoPatch:embedding-quota starting'",
+                                "RG_NOW=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
+                                "echo \"current RG=$RG_NOW\"",
+                                "# Enumerate all OpenAI / AIServices accounts in the sub.",
+                                "ACCS=$(az cognitiveservices account list -o tsv --query \"[?kind=='OpenAI' || kind=='AIServices'].[name,resourceGroup]\" 2>/dev/null)",
+                                "if [ -z \"$ACCS\" ]; then echo 'no AOAI/AIServices accounts in sub'; exit 0; fi",
+                                "FREED=0",
+                                "echo \"$ACCS\" | while IFS=$'\\t' read -r ACC RG; do",
+                                "  [ -z \"$ACC\" ] && continue",
+                                "  # Skip accounts in the in-flight RG to avoid touching the current deploy.",
+                                "  if [ -n \"$RG_NOW\" ] && [ \"$RG\" = \"$RG_NOW\" ]; then",
+                                "    echo \"skip $ACC ($RG) — current RG\"; continue;",
+                                "  fi",
+                                "  DEPS=$(az cognitiveservices account deployment list -g \"$RG\" -n \"$ACC\" -o tsv --query \"[?properties.model.name=='text-embedding-3-large'].[name,sku.capacity]\" 2>/dev/null)",
+                                "  [ -z \"$DEPS\" ] && continue",
+                                "  echo \"$ACC ($RG) has text-embedding-3-large deployments:\"",
+                                "  echo \"$DEPS\"",
+                                "  echo \"$DEPS\" | while IFS=$'\\t' read -r DEP CAP; do",
+                                "    [ -z \"$DEP\" ] && continue",
+                                "    echo \"  deleting $DEP from $ACC ($RG) — frees $CAP TPM\"",
+                                "    az cognitiveservices account deployment delete -g \"$RG\" -n \"$ACC\" --deployment-name \"$DEP\" 2>&1 | tail -n 3 || true",
+                                "  done",
+                                "done",
+                                "# Show remaining usage so we can see if we freed enough.",
+                                "LOC=$(azd env get-value AZURE_LOCATION 2>/dev/null)",
+                                "[ -z \"$LOC\" ] && LOC=eastus",
+                                "echo \"remaining usage in $LOC:\"",
+                                "az cognitiveservices usage list --location \"$LOC\" --query \"[?contains(name.value,'OpenAI.Standard.text-embedding-3-large')].{quota:limit,used:currentValue}\" -o table 2>/dev/null || true",
+                                "echo 'AutoPatch:embedding-quota done'",
+                                ""
+                            });
+                            var quotaB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(quotaScript));
+                            var quotaCmd =
+                                "bash -lc 'echo " + quotaB64 + " | base64 -d | bash'";
+                            previousAttempts.Add(
+                                "[AutoPatch:embedding-quota] ARM validation " +
+                                "failed with InsufficientQuota for text-embedding-3-large " +
+                                "(sub had 350/350 TPM consumed). Enumerated all " +
+                                "OpenAI/AIServices accounts in the sub and deleted " +
+                                "every text-embedding-3-large deployment outside " +
+                                "the current resource group to free quota for this " +
+                                "deploy. Did not touch the in-flight RG.");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:embedding-quota]: detected " +
+                                "InsufficientQuota for text-embedding-3-large. " +
+                                "Inserting a deterministic cleanup step that " +
+                                "deletes every text-embedding-3-large deployment " +
+                                "outside the current RG to free TPM quota, then " +
+                                "retrying the failing step.",
+                                step.Id);
+                            var quotaStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: free text-embedding-3-large TPM quota by deleting orphan deployments",
+                                quotaCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(10));
+                            steps.Insert(i, quotaStep);
+                            i--;
+                            continue;
+                        }
+
                         // 8.8: prefill previousAttempts with cross-session
                         // failed attempts for the same error signature on
                         // the same repo so the Doctor pivots instead of
