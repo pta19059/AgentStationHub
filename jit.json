@@ -1,1 +1,1 @@
-{"virtualMachines":[{"id":"/subscriptions/e5442d96-b962-4973-9cef-623903983c17/resourceGroups/RG-AGENTICHUB-HOST/providers/Microsoft.Compute/virtualMachines/agentichub-host","ports":[{"number":22,"allowedSourceAddressPrefix":"176.61.61.239","duration":"PT3H"}]}]}
+{"virtualMachines":[{"id":"/subscriptions/e5442d96-b962-4973-9cef-623903983c17/resourceGroups/RG-AGENTICHUB-HOST/providers/Microsoft.Compute/virtualMachines/agentichub-host","ports":[{"number":22,"duration":"PT3H","allowedSourceAddressPrefix":"176.61.61.239"}]}]}
