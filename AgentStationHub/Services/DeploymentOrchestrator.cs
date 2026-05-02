@@ -2362,12 +2362,7 @@ public sealed class DeploymentOrchestrator
                                 "        params['cosmosLocation']['value'] = 'eastus2'",
                                 "        if old != 'eastus2': changed = True",
                                 "        print(f'  cosmosLocation: {old} -> eastus2')",
-                                "    # 2. aiFoundryLocation → eastus2",
-                                "    if 'aiFoundryLocation' in params:",
-                                "        old = params['aiFoundryLocation'].get('value')",
-                                "        params['aiFoundryLocation']['value'] = 'eastus2'",
-                                "        if old != 'eastus2': changed = True",
-                                "        print(f'  aiFoundryLocation: {old} -> eastus2')",
+                                "    # 2. aiFoundryLocation — leave unchanged (srch-aif, kv-ai are already in primary region)",
                                 "    # 3. useZoneRedundancy → bool false (Bicep param is bool, not string)",
                                 "    if 'useZoneRedundancy' in params:",
                                 "        old = params['useZoneRedundancy'].get('value')",
@@ -2448,7 +2443,7 @@ public sealed class DeploymentOrchestrator
                                 "PYCOSMOS_AIF",
                                 "# 3. Belt-and-suspenders: also set the azd env vars.",
                                 "azd env set AZURE_COSMOS_LOCATION eastus2 || true",
-                                "azd env set AZURE_AI_FOUNDRY_LOCATION eastus2 || true",
+                                "# aiFoundryLocation left unchanged — sub-resources already exist in primary region",
                                 "azd env set USE_ZONE_REDUNDANCY false || true",
                                 "echo 'azd env after set:'",
                                 "azd env get-values 2>/dev/null | grep -E 'COSMOS_LOCATION|AI_FOUNDRY_LOCATION|ZONE_REDUNDANCY' || true",
@@ -2483,7 +2478,6 @@ public sealed class DeploymentOrchestrator
                                 "failing with ServiceUnavailable for zonal redundant " +
                                 "accounts in East US. Rewrote main.parameters.json " +
                                 "to hardcode cosmosLocation='eastus2' AND " +
-                                "aiFoundryLocation='eastus2', convert " +
                                 "useZoneRedundancy from string 'false' to bool false; " +
                                 "also set the azd env vars (belt-and-suspenders) and " +
                                 "deleted any pre-existing failed cosmos accounts in " +
@@ -2491,8 +2485,7 @@ public sealed class DeploymentOrchestrator
                             await Log(s, "status",
                                 "Auto-patch [AutoPatch:cosmos-region]: persistent " +
                                 "Cosmos zonal-redundancy ServiceUnavailable in " +
-                                "eastus. Hardcoding cosmosLocation=eastus2 AND " +
-                                "aiFoundryLocation=eastus2, " +
+                                "eastus. Hardcoding cosmosLocation=eastus2, " +
                                 "useZoneRedundancy=false in both root and infra " +
                                 "main.parameters.json, " +
                                 "setting matching azd env vars, and deleting any " +
