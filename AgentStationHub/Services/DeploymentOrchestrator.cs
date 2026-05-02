@@ -2197,13 +2197,15 @@ public sealed class DeploymentOrchestrator
                                 "#    GlobalStandard usually has 1000 TPM free. The change is safe for embedding",
                                 "#    workloads (no regional pinning required) and lets the deploy pass validation",
                                 "#    even when the orphan-cleanup below frees little or nothing.",
-                                "PARAMS=infra/main.parameters.json",
-                                "if [ ! -f \"$PARAMS\" ] && [ -f main.parameters.json ]; then PARAMS=main.parameters.json; fi",
-                                "if [ -f \"$PARAMS\" ]; then",
+                                "#    IMPORTANT: azd provision copies root main.parameters.json → infra/ each run,",
+                                "#    so we must patch the ROOT file (or both). Otherwise the infra/ patch is lost.",
+                                "for PARAMS in main.parameters.json infra/main.parameters.json; do",
+                                "  if [ ! -f \"$PARAMS\" ]; then continue; fi",
                                 "  echo \"params file: $PARAMS\"",
+                                "  export PARAMS",
                                 "  python3 - <<'PY' || true",
                                 "import json, os, re, sys",
-                                "p=os.environ.get('PARAMS') or 'infra/main.parameters.json'",
+                                "p=os.environ.get('PARAMS') or 'main.parameters.json'",
                                 "if not os.path.exists(p):",
                                 "    print('params not found, skipping sku switch'); sys.exit(0)",
                                 "with open(p,'r',encoding='utf-8') as f: data=f.read()",
@@ -2228,8 +2230,7 @@ public sealed class DeploymentOrchestrator
                                 "else:",
                                 "    print('no embedding sku change needed')",
                                 "PY",
-                                "  export PARAMS=\"$PARAMS\"",
-                                "fi",
+                                "done",
                                 "# 1. Free Standard TPM by deleting every text-embedding-3-large deployment",
                                 "#    that lives OUTSIDE the current RG. We never touch the in-flight deploy.",
                                 "ACCS=$(az cognitiveservices account list -o tsv --query \"[?kind=='OpenAI' || kind=='AIServices'].[name,resourceGroup]\" 2>/dev/null)",
@@ -2325,23 +2326,30 @@ public sealed class DeploymentOrchestrator
                                 "set +e",
                                 "echo 'AutoPatch:cosmos-region starting'",
                                 "cd /workspace 2>/dev/null || true",
-                                "PARAMS=infra/main.parameters.json",
-                                "if [ ! -f \"$PARAMS\" ] && [ -f main.parameters.json ]; then PARAMS=main.parameters.json; fi",
-                                "echo \"params file: $PARAMS\"",
-                                "if [ -f \"$PARAMS\" ]; then",
-                                "  # 1. Hard-code cosmosLocation to eastus2 (drop the ${AZURE_COSMOS_LOCATION} indirection that azd may not refresh).",
+                                "# Patch BOTH root and infra copies of main.parameters.json.",
+                                "# azd provision copies root→infra ('Applying project main.parameters.json to infra...')",
+                                "# so patching only infra/ gets overwritten. We patch root first (authoritative),",
+                                "# then infra/ as belt-and-suspenders.",
+                                "for PARAMS in main.parameters.json infra/main.parameters.json; do",
+                                "  if [ ! -f \"$PARAMS\" ]; then continue; fi",
+                                "  echo \"patching: $PARAMS\"",
+                                "  # 1. Hard-code cosmosLocation to eastus2.",
                                 "  sed -i 's|\"cosmosLocation\":[[:space:]]*{[[:space:]]*\"value\":[[:space:]]*\"\\${AZURE_COSMOS_LOCATION}\"[[:space:]]*}|\"cosmosLocation\": { \"value\": \"eastus2\" }|' \"$PARAMS\"",
                                 "  sed -i 's|\"cosmosLocation\":[[:space:]]*{[[:space:]]*\"value\":[[:space:]]*\"eastus\"[[:space:]]*}|\"cosmosLocation\": { \"value\": \"eastus2\" }|' \"$PARAMS\"",
+                                "  # 1b. Also pin aiFoundryLocation to eastus2 (AI Foundry Cosmos uses this param, same zonal-redundancy issue).",
+                                "  sed -i 's|\"aiFoundryLocation\":[[:space:]]*{[[:space:]]*\"value\":[[:space:]]*\"\\${AZURE_AI_FOUNDRY_LOCATION}\"[[:space:]]*}|\"aiFoundryLocation\": { \"value\": \"eastus2\" }|' \"$PARAMS\"",
+                                "  sed -i 's|\"aiFoundryLocation\":[[:space:]]*{[[:space:]]*\"value\":[[:space:]]*\"eastus\"[[:space:]]*}|\"aiFoundryLocation\": { \"value\": \"eastus2\" }|' \"$PARAMS\"",
                                 "  # 2. useZoneRedundancy: convert string \"false\" / \"true\" to boolean false (Bicep param is bool).",
                                 "  sed -i 's|\"useZoneRedundancy\":[[:space:]]*{[[:space:]]*\"value\":[[:space:]]*\"\\(true\\|false\\)\"[[:space:]]*}|\"useZoneRedundancy\": { \"value\": false }|' \"$PARAMS\"",
-                                "  echo 'after patch:'",
-                                "  grep -E 'cosmosLocation|useZoneRedundancy' \"$PARAMS\" || true",
-                                "fi",
-                                "# 3. Belt-and-suspenders: also set the azd env var.",
+                                "  echo \"after patch ($PARAMS):\"",
+                                "  grep -E 'cosmosLocation|aiFoundryLocation|useZoneRedundancy' \"$PARAMS\" || true",
+                                "done",
+                                "# 3. Belt-and-suspenders: also set the azd env vars.",
                                 "azd env set AZURE_COSMOS_LOCATION eastus2 || true",
+                                "azd env set AZURE_AI_FOUNDRY_LOCATION eastus2 || true",
                                 "azd env set USE_ZONE_REDUNDANCY false || true",
                                 "echo 'azd env after set:'",
-                                "azd env get-values 2>/dev/null | grep -E 'COSMOS_LOCATION|ZONE_REDUNDANCY' || true",
+                                "azd env get-values 2>/dev/null | grep -E 'COSMOS_LOCATION|AI_FOUNDRY_LOCATION|ZONE_REDUNDANCY' || true",
                                 "# 4. Delete any cosmos accounts already in failed state in the current RG so the next provision starts clean.",
                                 "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
                                 "if [ -z \"$RG\" ]; then RG=$(az group list --query \"[?starts_with(name,'rg-')].name | [0]\" -o tsv); fi",
@@ -2372,7 +2380,8 @@ public sealed class DeploymentOrchestrator
                                 "[AutoPatch:cosmos-region] Cosmos creation kept " +
                                 "failing with ServiceUnavailable for zonal redundant " +
                                 "accounts in East US. Rewrote main.parameters.json " +
-                                "to hardcode cosmosLocation='eastus2' and convert " +
+                                "to hardcode cosmosLocation='eastus2' AND " +
+                                "aiFoundryLocation='eastus2', convert " +
                                 "useZoneRedundancy from string 'false' to bool false; " +
                                 "also set the azd env vars (belt-and-suspenders) and " +
                                 "deleted any pre-existing failed cosmos accounts in " +
@@ -2380,8 +2389,10 @@ public sealed class DeploymentOrchestrator
                             await Log(s, "status",
                                 "Auto-patch [AutoPatch:cosmos-region]: persistent " +
                                 "Cosmos zonal-redundancy ServiceUnavailable in " +
-                                "eastus. Hardcoding cosmosLocation=eastus2 and " +
-                                "useZoneRedundancy=false in main.parameters.json, " +
+                                "eastus. Hardcoding cosmosLocation=eastus2 AND " +
+                                "aiFoundryLocation=eastus2, " +
+                                "useZoneRedundancy=false in both root and infra " +
+                                "main.parameters.json, " +
                                 "setting matching azd env vars, and deleting any " +
                                 "stale cosmos accounts in the RG before retrying.",
                                 step.Id);
