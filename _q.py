@@ -1,13 +1,10 @@
-import json
-d=json.load(open('_live2.json',encoding='utf-8'))
-plan=d.get('Plan') or {}
-steps=plan.get('Steps') or []
-print('=== ALL STEP 18 VARIANTS ===')
-for s in steps:
-    if s.get('Id')==18:
-        print('CWD:', s.get('WorkingDirectory'))
-        print('CMD:', s.get('Command'))
-        print('---')
+import json,sys
+d=json.load(sys.stdin)
+print(f"Status: {d['status']}")
+tail = d.get('logTail',[])
+print(f"LogTail entries: {len(tail)}")
+for l in tail[-30:]:
+    print(l.get('level',''), l.get('message','')[:220])
 logs=d.get('Logs') or []
 print('=== LOG context around step 18 errors ===')
 idx=[i for i,l in enumerate(logs) if 'Step 18' in (l.get('Message') or '') or 'Registry names may contain' in (l.get('Message') or '') or "containerapp 'ui-angular' does not exist" in (l.get('Message') or '')]

@@ -471,13 +471,13 @@ app.MapPost("/api/debug/deploy/start", (
 {
     var id = orch.Start(req.RepoUrl, req.AzureLocation);
     return Results.Ok(new { sessionId = id });
-}).AllowAnonymous();
+}).AllowAnonymous().DisableAntiforgery();
 app.MapPost("/api/debug/deploy/{id}/approve", (string id,
     DeploymentOrchestrator orch) =>
 {
     orch.Approve(id);
     return Results.Ok();
-}).AllowAnonymous();
+}).AllowAnonymous().DisableAntiforgery();
 app.MapGet("/api/debug/deploy/{id}", (string id,
     DeploymentOrchestrator orch) =>
 {
