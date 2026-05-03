@@ -2050,13 +2050,22 @@ public sealed class DeploymentOrchestrator
                             var firedMarker = cosmosStuck
                                 ? "[AutoPatch:cosmos-stuck]"
                                 : "[AutoPatch:cosmos-zonal]";
-                            previousAttempts.Add(
-                                firedMarker + " Cosmos DB account(s) in failed " +
+                            // Add BOTH markers so that firing one blocks
+                            // the other from re-triggering on the very
+                            // next attempt (the cleanup output itself
+                            // contains "state=Failed" which would match
+                            // cosmosStuck detection on the next tail).
+                            var guardMsg = " Cosmos DB account(s) in failed " +
                                 "provisioning state and/or zonal-redundancy capacity " +
                                 "error; listed cosmos accounts in RG, deleted each " +
                                 "via az cosmosdb delete --no-wait, awaited full " +
                                 "deletion via az resource wait --deleted, and forced " +
-                                "USE_ZONE_REDUNDANCY=false.");
+                                "USE_ZONE_REDUNDANCY=false.";
+                            previousAttempts.Add(firedMarker + guardMsg);
+                            if (cosmosStuck && !cosmosZonalAlready)
+                                previousAttempts.Add("[AutoPatch:cosmos-zonal]" + guardMsg);
+                            else if (cosmosZonal && cosmosStuckCount == 0)
+                                previousAttempts.Add("[AutoPatch:cosmos-stuck]" + guardMsg);
                             await Log(s, "status",
                                 "Auto-patch " + firedMarker + ": detected Cosmos DB " +
                                 "failure. Inserting a deterministic cleanup step " +
