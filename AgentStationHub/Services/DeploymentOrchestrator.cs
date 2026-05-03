@@ -2698,6 +2698,138 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // ── AutoPatch:stale-prefix ──
+                        // When a previous failed deployment left ARM
+                        // deployment records that reference resources with
+                        // a DIFFERENT resource token prefix (e.g.
+                        // cosmos-gysonauhrm2mq) than the current
+                        // deployment (e.g. cosmos-36dqthiidjxfq), the
+                        // next `azd provision` fails with ResourceNotFound
+                        // because Bicep's "Comparing deployment state"
+                        // phase reads outputs from those stale deployments
+                        // and tries to resolve the old resource names.
+                        // Fix: detect the stale prefix from the error,
+                        // delete the stale ARM deployment records AND any
+                        // orphaned resources (UAIs etc.) with that prefix,
+                        // then retry.
+                        var stalePrefix = false;
+                        string? stalePrefixValue = null;
+                        if (!string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("ResourceNotFound",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:stale-prefix]")))
+                        {
+                            // Extract resource name from error like:
+                            //   "The Resource 'Microsoft.DocumentDB/databaseAccounts/cosmos-gysonauhrm2mq' ... was not found"
+                            // or any resource with a token prefix that differs from current.
+                            var rxStale = new System.Text.RegularExpressions.Regex(
+                                @"'Microsoft\.[^/]+/[^/]+/[a-z]+-([a-z0-9]{10,20})'\s.*was\s+not\s+found",
+                                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                            var mStale = rxStale.Match(stepTail);
+                            if (mStale.Success)
+                                stalePrefixValue = mStale.Groups[1].Value;
+                        }
+                        if (!string.IsNullOrEmpty(stalePrefixValue))
+                        {
+                            stalePrefix = true;
+                        }
+                        if (stalePrefix && stalePrefixValue != null)
+                        {
+                            var staleScript = string.Join("\n", new[]
+                            {
+                                "set +e",
+                                "echo 'AutoPatch:stale-prefix starting'",
+                                "echo 'Stale prefix detected: " + stalePrefixValue + "'",
+                                "",
+                                "# Resolve RG",
+                                "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
+                                "if [ -z \"$RG\" ]; then",
+                                "  RG=$(az group list --query \"[?starts_with(name,'rg-')].name | [0]\" -o tsv)",
+                                "fi",
+                                "echo \"RG=$RG\"",
+                                "if [ -z \"$RG\" ]; then echo 'no RG resolved; aborting'; exit 0; fi",
+                                "",
+                                "# Get current resource token for comparison",
+                                "CURRENT_TOKEN=$(azd env get-value AZURE_RESOURCE_TOKEN 2>/dev/null || echo '')",
+                                "STALE_PREFIX='" + stalePrefixValue.Replace("'", "") + "'",
+                                "echo \"Current token: $CURRENT_TOKEN, Stale prefix: $STALE_PREFIX\"",
+                                "",
+                                "# If current token matches the stale prefix, this is NOT a stale-prefix issue",
+                                "if [ \"$CURRENT_TOKEN\" = \"$STALE_PREFIX\" ]; then",
+                                "  echo 'Stale prefix matches current token — not a prefix mismatch, aborting'",
+                                "  exit 0",
+                                "fi",
+                                "",
+                                "# 1. Delete stale ARM deployment records that reference the old prefix",
+                                "echo '--- Deleting stale ARM deployments referencing old prefix ---'",
+                                "STALE_DEPS=$(az deployment group list -g \"$RG\" --query \"[].name\" -o tsv 2>/dev/null | grep \"$STALE_PREFIX\" || true)",
+                                "if [ -n \"$STALE_DEPS\" ]; then",
+                                "  for dep in $STALE_DEPS; do",
+                                "    echo \"  Deleting deployment: $dep\"",
+                                "    az deployment group delete -g \"$RG\" -n \"$dep\" --no-wait 2>&1 | tail -2 || true",
+                                "  done",
+                                "else",
+                                "  echo '  No stale deployments found with prefix'",
+                                "fi",
+                                "",
+                                "# Also delete the top-level deployment records that may have stale outputs",
+                                "ALL_DEPS=$(az deployment group list -g \"$RG\" --query \"[].name\" -o tsv 2>/dev/null || true)",
+                                "for dep in $ALL_DEPS; do",
+                                "  # Check if deployment has operations referencing the stale prefix",
+                                "  HAS_STALE=$(az deployment operation group list -g \"$RG\" -n \"$dep\" --query \"[?contains(to_string(properties), '$STALE_PREFIX')].id\" -o tsv 2>/dev/null | head -1 || true)",
+                                "  if [ -n \"$HAS_STALE\" ]; then",
+                                "    echo \"  Deleting deployment with stale refs: $dep\"",
+                                "    az deployment group delete -g \"$RG\" -n \"$dep\" --no-wait 2>&1 | tail -2 || true",
+                                "  fi",
+                                "done",
+                                "",
+                                "# 2. Delete orphaned resources (UAIs, etc.) with the stale prefix",
+                                "echo '--- Deleting orphaned resources with stale prefix ---'",
+                                "ORPHANS=$(az resource list -g \"$RG\" --query \"[?contains(name,'$STALE_PREFIX')].{id:id,name:name,type:type}\" -o json 2>/dev/null || echo '[]')",
+                                "echo \"Orphans found: $ORPHANS\"",
+                                "ORPHAN_IDS=$(echo \"$ORPHANS\" | python3 -c \"",
+                                "import json,sys",
+                                "data = json.load(sys.stdin)",
+                                "for r in data:",
+                                "    print(r['id'])\" 2>/dev/null || true)",
+                                "for oid in $ORPHAN_IDS; do",
+                                "  echo \"  Deleting orphan: $oid\"",
+                                "  az resource delete --ids \"$oid\" --no-wait 2>&1 | tail -2 || true",
+                                "done",
+                                "",
+                                "# 3. Brief wait for deletions to propagate",
+                                "sleep 10",
+                                "echo 'AutoPatch:stale-prefix done'",
+                                ""
+                            });
+                            var staleB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(staleScript));
+                            var staleCmd =
+                                "bash -lc 'echo " + staleB64 + " | base64 -d | bash'";
+                            previousAttempts.Add(
+                                "[AutoPatch:stale-prefix] ResourceNotFound caused " +
+                                "by stale ARM deployment records referencing old " +
+                                "resource token prefix '" + stalePrefixValue + "'. " +
+                                "Deleted stale ARM deployments and orphaned resources " +
+                                "with the old prefix so the next provision starts clean.");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:stale-prefix]: ResourceNotFound " +
+                                "references resource with old prefix '" + stalePrefixValue +
+                                "'. Deleting stale ARM deployments and orphaned " +
+                                "resources with that prefix, then retrying.",
+                                step.Id);
+                            var staleStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: delete stale ARM deployments + orphaned resources (prefix: " + stalePrefixValue + ")",
+                                staleCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(10));
+                            steps.Insert(i, staleStep);
+                            i--;
+                            continue;
+                        }
+
                         // 8.8: prefill previousAttempts with cross-session
                         // failed attempts for the same error signature on
                         // the same repo so the Doctor pivots instead of
