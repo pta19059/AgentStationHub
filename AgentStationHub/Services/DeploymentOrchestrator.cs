@@ -2177,6 +2177,91 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // 8.7.x: [AutoPatch:vm-sku] — when the
+                        // provision fails with SkuNotAvailable for a VM
+                        // size, cycle through known-available SKUs via
+                        // sed on main.parameters.json and
+                        // infra/main.parameters.json.
+                        var vmSkuUnavailable =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("SkuNotAvailable",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:vm-sku]"));
+                        if (vmSkuUnavailable)
+                        {
+                            // Extract the failed SKU name from the tail
+                            // and try the next one in our fallback list.
+                            var vmFallbacks = new[]
+                            {
+                                "Standard_D4as_v5",
+                                "Standard_D2as_v5",
+                                "Standard_B2ms",
+                                "Standard_B4ms",
+                                "Standard_D2s_v5",
+                            };
+                            // Build a sed chain that replaces ANY known
+                            // VM SKU pattern with the fallback list entry.
+                            // We use python to be safe with JSON.
+                            var vmScript = string.Join("\n", new[]
+                            {
+                                "set +e",
+                                "echo 'AutoPatch:vm-sku starting'",
+                                "python3 -c \"",
+                                "import json, sys, os",
+                                "fallbacks = " + System.Text.Json.JsonSerializer.Serialize(vmFallbacks),
+                                "for pf in ['main.parameters.json', 'infra/main.parameters.json']:",
+                                "    if not os.path.isfile(pf): continue",
+                                "    with open(pf) as f: d = json.load(f)",
+                                "    params = d.get('parameters', d)",
+                                "    changed = False",
+                                "    for k,v in params.items():",
+                                "        if 'vm' in k.lower() and 'size' in k.lower() or k.lower() in ('vmsize','testvmsize'):",
+                                "            old = v.get('value','') if isinstance(v,dict) else v",
+                                "            if old in fallbacks:",
+                                "                idx = fallbacks.index(old)",
+                                "                nxt = fallbacks[(idx+1) % len(fallbacks)]",
+                                "            else:",
+                                "                nxt = fallbacks[0]",
+                                "            if isinstance(v,dict): params[k]['value'] = nxt",
+                                "            else: params[k] = nxt",
+                                "            print(f'  {pf}: {k} {old} -> {nxt}')",
+                                "            changed = True",
+                                "    if changed:",
+                                "        with open(pf,'w') as f: json.dump(d,f,indent=2)",
+                                "        print(f'  rewrote {pf}')",
+                                "    else:",
+                                "        # fallback: sed any Standard_D*s_v* pattern",
+                                "        print(f'  no vmSize param found in {pf}, trying sed')",
+                                "        os.system(f\\\"sed -i 's/Standard_D[0-9]*s_v[0-9]*/Standard_B2ms/g' {pf}\\\")",
+                                "\"",
+                                "echo 'AutoPatch:vm-sku done'",
+                                ""
+                            });
+                            var vmB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(vmScript));
+                            var vmCmd = "bash -lc 'echo " + vmB64 +
+                                " | base64 -d | bash'";
+                            previousAttempts.Add(
+                                "[AutoPatch:vm-sku] SkuNotAvailable for VM size " +
+                                "in current region; cycling through fallback " +
+                                "VM SKUs in parameters.json.");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:vm-sku]: VM SKU not " +
+                                "available. Changing vmSize in parameters to " +
+                                "a known-available fallback SKU.",
+                                step.Id);
+                            var vmStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: change VM SKU to available size",
+                                vmCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(1));
+                            steps.Insert(i, vmStep);
+                            i--;
+                            continue;
+                        }
+
                         // 8.7.y: [AutoPatch:embedding-quota] — when an
                         // ARM template validation fails with
                         //   InsufficientQuota: This operation require N
