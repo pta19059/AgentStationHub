@@ -2830,6 +2830,133 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // ── AutoPatch:model-oscillation ──
+                        // Detect when the Doctor oscillates between two
+                        // model-related errors (e.g. SpecialFeatureOrQuotaIdRequired
+                        // for gpt-5-nano ↔ DeploymentModelNotSupported for
+                        // gpt-35-turbo) without ever trying a third option.
+                        // Pattern: previousAttempts contains at least 2 entries
+                        // referencing different model names that both failed
+                        // with deployment-model errors. Break the loop by
+                        // injecting a known-good model via sed on
+                        // main.parameters.json.
+                        if (!previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:model-oscillation]"))
+                            && ((stepTail ?? "").Contains("DeploymentModelNotSupported",
+                                    StringComparison.OrdinalIgnoreCase)
+                                || (stepTail ?? "").Contains("SpecialFeatureOrQuotaIdRequired",
+                                    StringComparison.OrdinalIgnoreCase)))
+                        {
+                            // Count how many prior attempts mention model-
+                            // deployment errors (either signature).
+                            var modelErrKeywords = new[]
+                            {
+                                "DeploymentModelNotSupported",
+                                "SpecialFeatureOrQuotaIdRequired",
+                                "ServiceModelDeprecated"
+                            };
+                            var modelFailCount = previousAttempts.Count(a =>
+                                modelErrKeywords.Any(k =>
+                                    a.Contains(k, StringComparison.OrdinalIgnoreCase)));
+                            // Also detect mention of at least 2 distinct model
+                            // names in previous attempts (indicating flip-flop).
+                            var modelNames = new[]
+                            {
+                                "gpt-5-nano", "gpt-35-turbo", "gpt-4-turbo",
+                                "gpt-4o-mini", "gpt-4o", "gpt-4.1-mini",
+                                "gpt-4.1-nano", "gpt-4.1"
+                            };
+                            var mentionedModels = modelNames
+                                .Where(m => previousAttempts.Any(a =>
+                                    a.Contains(m, StringComparison.OrdinalIgnoreCase))
+                                    || (stepTail ?? "").Contains(m,
+                                        StringComparison.OrdinalIgnoreCase))
+                                .ToList();
+
+                            if (modelFailCount >= 2 || mentionedModels.Count >= 2)
+                            {
+                                // Pick a fallback model that hasn't been tried.
+                                var fallbackCandidates = new[]
+                                {
+                                    ("gpt-4o-mini", "2024-07-18"),
+                                    ("gpt-4o", "2024-08-06"),
+                                    ("gpt-4.1-mini", "2025-04-14"),
+                                    ("gpt-4.1-nano", "2025-04-14"),
+                                };
+                                var allAttemptText = string.Join(" ", previousAttempts)
+                                    + " " + (stepTail ?? "");
+                                var chosen = fallbackCandidates.FirstOrDefault(c =>
+                                    !allAttemptText.Contains(c.Item1,
+                                        StringComparison.OrdinalIgnoreCase));
+                                if (chosen == default)
+                                    chosen = ("gpt-4o-mini", "2024-07-18");
+
+                                var (modelName, modelVersion) = chosen;
+                                // Build a sed script that patches all model name/version
+                                // references in main.parameters.json (and infra/*.bicepparam).
+                                var oscScript = string.Join("\n", new[]
+                                {
+                                    "set +e",
+                                    "echo 'AutoPatch:model-oscillation — breaking Doctor model loop'",
+                                    $"echo 'Fallback model: {modelName} version {modelVersion}'",
+                                    "",
+                                    "# Patch main.parameters.json",
+                                    "PARAMS=$(find /workspace -maxdepth 3 -name 'main.parameters.json' | head -1)",
+                                    "if [ -n \"$PARAMS\" ]; then",
+                                    $"  echo \"Patching $PARAMS with model={modelName} version={modelVersion}\"",
+                                    $"  sed -i 's/\"azureOpenAIModelName\"[[:space:]]*:[[:space:]]*{{[^}}]*}}/\"azureOpenAIModelName\": {{\"value\": \"{modelName}\"}}/g' \"$PARAMS\"",
+                                    $"  sed -i 's/\"azureOpenAIModelVersion\"[[:space:]]*:[[:space:]]*{{[^}}]*}}/\"azureOpenAIModelVersion\": {{\"value\": \"{modelVersion}\"}}/g' \"$PARAMS\"",
+                                    "  # Also patch common alternate parameter names",
+                                    $"  sed -i 's/\"chatGptModelName\"[[:space:]]*:[[:space:]]*{{[^}}]*}}/\"chatGptModelName\": {{\"value\": \"{modelName}\"}}/g' \"$PARAMS\"",
+                                    $"  sed -i 's/\"chatGptModelVersion\"[[:space:]]*:[[:space:]]*{{[^}}]*}}/\"chatGptModelVersion\": {{\"value\": \"{modelVersion}\"}}/g' \"$PARAMS\"",
+                                    $"  sed -i 's/\"azureOpenAiChatModel\"[[:space:]]*:[[:space:]]*{{[^}}]*}}/\"azureOpenAiChatModel\": {{\"value\": \"{modelName}\"}}/g' \"$PARAMS\"",
+                                    $"  sed -i 's/\"openAiModelName\"[[:space:]]*:[[:space:]]*{{[^}}]*}}/\"openAiModelName\": {{\"value\": \"{modelName}\"}}/g' \"$PARAMS\"",
+                                    "fi",
+                                    "",
+                                    "# Also patch .bicepparam files if present",
+                                    "for bp in $(find /workspace -maxdepth 4 -name '*.bicepparam' 2>/dev/null); do",
+                                    $"  sed -i \"s/param azureOpenAIModelName.*/param azureOpenAIModelName = '{modelName}'/\" \"$bp\"",
+                                    $"  sed -i \"s/param azureOpenAIModelVersion.*/param azureOpenAIModelVersion = '{modelVersion}'/\" \"$bp\"",
+                                    $"  sed -i \"s/param chatGptModelName.*/param chatGptModelName = '{modelName}'/\" \"$bp\"",
+                                    $"  sed -i \"s/param chatGptModelVersion.*/param chatGptModelVersion = '{modelVersion}'/\" \"$bp\"",
+                                    "done",
+                                    "",
+                                    "# Patch .env / azd env if model name is stored there",
+                                    $"azd env set AZURE_OPENAI_MODEL_NAME '{modelName}' 2>/dev/null || true",
+                                    $"azd env set AZURE_OPENAI_MODEL_VERSION '{modelVersion}' 2>/dev/null || true",
+                                    $"azd env set AZURE_OPENAI_CHATGPT_MODEL '{modelName}' 2>/dev/null || true",
+                                    "",
+                                    "echo 'AutoPatch:model-oscillation done'",
+                                });
+                                var oscB64 = Convert.ToBase64String(
+                                    System.Text.Encoding.UTF8.GetBytes(oscScript));
+                                var oscCmd =
+                                    "bash -lc 'echo " + oscB64 + " | base64 -d | bash'";
+                                previousAttempts.Add(
+                                    $"[AutoPatch:model-oscillation] Doctor was oscillating " +
+                                    $"between model errors ({string.Join(", ", mentionedModels)}). " +
+                                    $"Patched parameters to use fallback model '{modelName}' " +
+                                    $"version '{modelVersion}' which is broadly available " +
+                                    "on standard subscriptions and supported by Foundry.");
+                                await Log(s, "status",
+                                    $"Auto-patch [AutoPatch:model-oscillation]: Doctor " +
+                                    $"oscillating between model deployment errors " +
+                                    $"(tried: {string.Join(", ", mentionedModels)}). " +
+                                    $"Breaking loop by patching to '{modelName}' " +
+                                    $"v{modelVersion} (widely available fallback).",
+                                    step.Id);
+                                var oscStep = new DeploymentStep(
+                                    step.Id,
+                                    $"AutoPatch: break model oscillation → {modelName} v{modelVersion}",
+                                    oscCmd,
+                                    step.WorkingDirectory,
+                                    TimeSpan.FromMinutes(2));
+                                steps.Insert(i, oscStep);
+                                i--;
+                                continue;
+                            }
+                        }
+
                         // 8.8: prefill previousAttempts with cross-session
                         // failed attempts for the same error signature on
                         // the same repo so the Doctor pivots instead of
@@ -4754,6 +4881,7 @@ public sealed class DeploymentOrchestrator
         if (string.IsNullOrWhiteSpace(tail)) return "unknown";
         var knownCodes = new[]
         {
+            "SpecialFeatureOrQuotaIdRequired",
             "ServiceModelDeprecated",
             "DeploymentModelNotSupported",
             "InvalidTemplate",
