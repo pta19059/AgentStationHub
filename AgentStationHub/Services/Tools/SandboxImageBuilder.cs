@@ -610,10 +610,20 @@ public static class SandboxImageBuilder
         "  done\n" +
         "fi\n" +
         "if [ $svc_count -eq 0 ]; then\n" +
-        "  echo \"[agentic-azd-up] FATAL: 0 services parsed from $azfile — refusing to claim success.\" >&2\n" +
-        "  echo \"[agentic-azd-up] === azure.yaml dump (first 200 lines) ===\" >&2\n" +
-        "  head -n 200 \"$azfile\" >&2\n" +
-        "  exit 6\n" +
+        "  echo \"[agentic-azd-up] 0 services parsed from $azfile — hooks-only repo detected, falling back to azd deploy\"\n" +
+        "  echo \"[agentic-azd-up] running: azd deploy --no-prompt\"\n" +
+        "  deploy_log=\"/tmp/azd-deploy-fallback.log\"\n" +
+        "  if azd deploy --no-prompt 2>&1 | tee \"$deploy_log\"; then\n" +
+        "    echo \"[agentic-azd-up] azd deploy (hooks fallback) succeeded\"\n" +
+        "    exit 0\n" +
+        "  else\n" +
+        "    deploy_rc=$?\n" +
+        "    echo \"[agentic-azd-up] azd deploy (hooks fallback) FAILED rc=$deploy_rc — last 60 lines:\" >&2\n" +
+        "    tail -n 60 \"$deploy_log\" >&2 || true\n" +
+        "    echo \"[agentic-azd-up] === azure.yaml dump (first 200 lines) ===\" >&2\n" +
+        "    head -n 200 \"$azfile\" >&2\n" +
+        "    exit 6\n" +
+        "  fi\n" +
         "fi\n" +
         "if [ ${#succeeded[@]} -eq 0 ]; then\n" +
         "  echo \"[agentic-azd-up] FATAL: 0 services successfully built/deployed.\" >&2; exit 7\n" +
