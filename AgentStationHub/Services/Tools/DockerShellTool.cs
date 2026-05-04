@@ -19,7 +19,14 @@ public sealed record DockerShellResult(int ExitCode, string TailLog)
     /// and can propose a switch strategy (e.g. remote ACR build).
     /// </summary>
     public bool TimedOutBySilence { get; init; }
-}
+    /// <summary>
+    /// Lines from the full output that matched known critical error
+    /// patterns (e.g. "zonal redundant", "ServiceUnavailable",
+    /// "failed provisioning state"). These are captured regardless
+    /// of tail position so AutoPatch detection works even when the
+    /// error appears early in a long command output.
+    /// </summary>
+    public IReadOnlyList<string> ErrorSignatures { get; init; } = Array.Empty<string>();}
 
 /// <summary>
 /// Per-step shell driver. Wraps a long-lived <see cref="SandboxSession"/>
@@ -126,6 +133,25 @@ public sealed class DockerShellTool
         var effectiveTailSize = tailSize ?? 40;
         var tail = new Queue<string>(effectiveTailSize);
 
+        // Error-signature capture: lines matching known critical patterns
+        // are stored regardless of tail position (capped at 30 lines to
+        // bound memory). This lets the orchestrator's AutoPatch detect
+        // errors that appear early in a long command output.
+        var errorSigs = new List<string>(30);
+        void CaptureErrorSignature(string line)
+        {
+            if (errorSigs.Count >= 30 || string.IsNullOrWhiteSpace(line)) return;
+            if (line.Contains("zonal redundant", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("ServiceUnavailable", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("failed provisioning state", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("Please delete the previous instance", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("QuotaExceeded", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("InsufficientQuota", StringComparison.OrdinalIgnoreCase))
+            {
+                errorSigs.Add(line);
+            }
+        }
+
         // Prompt-loop detector: certain interactive prompts (notably
         // azd's "Enter a unique environment name: environment name ''
         // is invalid") fire 1000+ times per second on a closed stdin
@@ -185,6 +211,7 @@ public sealed class DockerShellTool
                     var line = Sanitize(o);
                     _onLog("info", line);
                     AppendTail(tail, line, effectiveTailSize);
+                    CaptureErrorSignature(line);
                     NotePromptLine(line);
                 },
                 onStderr: e =>
@@ -193,6 +220,7 @@ public sealed class DockerShellTool
                     var line = Sanitize(e);
                     _onLog("err", line);
                     AppendTail(tail, line, effectiveTailSize);
+                    CaptureErrorSignature(line);
                     NotePromptLine(line);
                 },
                 stepCts.Token);
@@ -208,7 +236,8 @@ public sealed class DockerShellTool
 
         return new DockerShellResult(exitCode, string.Join('\n', tail))
         {
-            TimedOutBySilence = silenceTriggered || promptLoopTriggered
+            TimedOutBySilence = silenceTriggered || promptLoopTriggered,
+            ErrorSignatures = errorSigs
         };
     }
 
