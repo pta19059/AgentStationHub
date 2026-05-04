@@ -104,7 +104,7 @@ public static class SandboxImageBuilder
     //             `azd deploy --no-prompt`. Idempotent and safe to call
     //             multiple times. Single source of truth for every
     //             post-`azd up` deploy step.
-    private const string LocalTag = "agentichub/sandbox:v38";
+    private const string LocalTag = "agentichub/sandbox:v39";
 
     // Azure Linux (Mariner)-based azure-cli is multi-arch and ships with bash
     // and curl. We install the system toolchain via tdnf (tar, git, python,
@@ -1056,8 +1056,10 @@ public static class SandboxImageBuilder
         "    found_dir=\"\"\n" +
         "    found_df=\"\"\n" +
         "    # Map well-known suffixes to repo directory names\n" +
+        "    # Search /workspace AND / (parent level) — GPT-RAG preDeploy.sh clones\n" +
+        "    # component repos to the parent of the repo root (e.g. /gpt-rag-orchestrator)\n" +
         "    for candidate in \"$suffix\" \"*$suffix*\" \"*${suffix%s}*\"; do\n" +
-        "      for d in $(find /workspace -maxdepth 2 -type d -iname \"$candidate\" 2>/dev/null); do\n" +
+        "      for d in $(find /workspace / -maxdepth 2 -type d -iname \"$candidate\" -not -path '/proc/*' -not -path '/sys/*' -not -path '/dev/*' 2>/dev/null | head -20); do\n" +
         "        if [ -f \"$d/Dockerfile\" ] || [ -f \"$d/Dockerfile.production\" ]; then\n" +
         "          found_dir=\"$d\"\n" +
         "          if [ -f \"$d/Dockerfile.production\" ]; then found_df=\"$d/Dockerfile.production\"; else found_df=\"$d/Dockerfile\"; fi\n" +
@@ -1068,13 +1070,13 @@ public static class SandboxImageBuilder
         "    # GPT-RAG-specific mappings\n" +
         "    if [ -z \"$found_dir\" ]; then\n" +
         "      case \"$suffix\" in\n" +
-        "        frontend) for p in /workspace/gpt-rag-ui /workspace/frontend /workspace/app/frontend; do\n" +
+        "        frontend) for p in /workspace/gpt-rag-ui /gpt-rag-ui /workspace/frontend /workspace/app/frontend /gpt-rag-frontend; do\n" +
         "                    if [ -f \"$p/Dockerfile\" ] || [ -f \"$p/Dockerfile.production\" ]; then found_dir=\"$p\"; break; fi\n" +
         "                  done ;;\n" +
-        "        dataingest|ingestion) for p in /workspace/gpt-rag-ingestion /workspace/ingestion /workspace/data-ingestion; do\n" +
+        "        dataingest|ingestion) for p in /workspace/gpt-rag-ingestion /gpt-rag-ingestion /workspace/ingestion /workspace/data-ingestion; do\n" +
         "                    if [ -f \"$p/Dockerfile\" ] || [ -f \"$p/Dockerfile.production\" ]; then found_dir=\"$p\"; break; fi\n" +
         "                  done ;;\n" +
-        "        orchestrator) for p in /workspace/gpt-rag-orchestrator /workspace/orchestrator; do\n" +
+        "        orchestrator) for p in /workspace/gpt-rag-orchestrator /gpt-rag-orchestrator /workspace/orchestrator; do\n" +
         "                    if [ -f \"$p/Dockerfile\" ] || [ -f \"$p/Dockerfile.production\" ]; then found_dir=\"$p\"; break; fi\n" +
         "                  done ;;\n" +
         "      esac\n" +
