@@ -1065,10 +1065,22 @@ public sealed class DeploymentOrchestrator
                         if (stepSilence > fragileCap) stepSilence = fragileCap;
                     }
 
+                    // Provision / up commands routinely emit 100-200+ lines;
+                    // the default 40-line tail window loses critical error
+                    // signatures (e.g. Cosmos zonal-redundancy) that appear
+                    // early in the output. Bump to 200 so AutoPatch patterns
+                    // still find them.
+                    var sbIsProvision =
+                        sbCmdLower.Contains("azd provision") ||
+                        sbCmdLower.Contains("azd up") ||
+                        sbCmdLower.Contains("agentic-azd-up");
+                    var stepTailSize = sbIsProvision ? 200 : (int?)null;
+
                     result = await docker.RunAsync(
                         commandToRun, step.WorkingDirectory,
                         env, stepTimeout, ct,
-                        silenceBudget: stepSilence);
+                        silenceBudget: stepSilence,
+                        tailSize: stepTailSize);
                     }
                 }
                 finally
@@ -1325,6 +1337,16 @@ public sealed class DeploymentOrchestrator
                 var stepTail = string.IsNullOrWhiteSpace(result.TailLog)
                     ? "(no output captured)"
                     : result.TailLog;
+
+                // Append error signatures captured during streaming so
+                // AutoPatch detection finds critical patterns even when
+                // they fell outside the tail window.
+                if (result.ErrorSignatures.Count > 0)
+                {
+                    var sigs = string.Join('\n', result.ErrorSignatures);
+                    if (!stepTail.Contains(sigs, StringComparison.Ordinal))
+                        stepTail = stepTail + "\n--- error signatures ---\n" + sigs;
+                }
 
                 // [Probe] short-circuit — read-only diagnostic steps
                 // tagged in their description with the literal "[Probe] "
