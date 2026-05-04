@@ -104,7 +104,15 @@ public static class SandboxImageBuilder
     //             `azd deploy --no-prompt`. Idempotent and safe to call
     //             multiple times. Single source of truth for every
     //             post-`azd up` deploy step.
-    private const string LocalTag = "agentichub/sandbox:v39";
+    //   v39 -> v40: install the GitHub CLI (`gh`) for repo-level
+    //             operations in the post-deploy autofix agent. The
+    //             autofix reviews deployed infra vs repo expectations
+    //             and needs `gh` to read repo structure / workflows.
+    //             Also installs the `gh copilot` extension so the
+    //             AI-assisted suggest/explain commands are available
+    //             in sandbox shells. Auth is via GITHUB_TOKEN env var
+    //             passed at container start (or `gh auth login`).
+    private const string LocalTag = "agentichub/sandbox:v40";
 
     // Azure Linux (Mariner)-based azure-cli is multi-arch and ships with bash
     // and curl. We install the system toolchain via tdnf (tar, git, python,
@@ -219,6 +227,24 @@ public static class SandboxImageBuilder
         "RUN pip3 install --no-cache-dir uv\n" +
         "RUN curl -fsSL https://aka.ms/install-azd.sh | bash\n" +
         "RUN azd config set auth.useAzCliAuth true\n" +
+        // GitHub CLI (gh) for repo-level operations and the Copilot
+        // extension for AI-assisted diagnostics. The autofix agent uses
+        // `gh` to read repo structure, compare deployed state with source,
+        // and optionally invoke `gh copilot suggest` for remediation ideas.
+        // Auth: GITHUB_TOKEN env var is passed at container start; falls
+        // back to `gh auth login --with-token` if a PAT is available.
+        "ENV GH_VERSION=2.63.2\n" +
+        "RUN set -eux; \\\n" +
+        "    case \"$(uname -m)\" in \\\n" +
+        "      x86_64)  GH_ARCH=linux_amd64 ;; \\\n" +
+        "      aarch64) GH_ARCH=linux_arm64 ;; \\\n" +
+        "      *) echo \"unsupported arch for gh: $(uname -m)\" && exit 1 ;; \\\n" +
+        "    esac; \\\n" +
+        "    curl -fsSL \"https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_${GH_ARCH}.tar.gz\" -o /tmp/gh.tgz; \\\n" +
+        "    tar -xzf /tmp/gh.tgz -C /tmp; \\\n" +
+        "    install -m 0755 /tmp/gh_${GH_VERSION}_${GH_ARCH}/bin/gh /usr/local/bin/gh; \\\n" +
+        "    rm -rf /tmp/gh* ; \\\n" +
+        "    gh --version\n" +
         // Pre-compile the azure-cli Python tree to .pyc bytecode. Saves
         // 6-10 seconds on the FIRST 'az' invocation inside a new sandbox
         // (the one that would otherwise be triggered by azd's credential
