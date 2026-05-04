@@ -104,7 +104,7 @@ public static class SandboxImageBuilder
     //             `azd deploy --no-prompt`. Idempotent and safe to call
     //             multiple times. Single source of truth for every
     //             post-`azd up` deploy step.
-    private const string LocalTag = "agentichub/sandbox:v36";
+    private const string LocalTag = "agentichub/sandbox:v37";
 
     // Azure Linux (Mariner)-based azure-cli is multi-arch and ships with bash
     // and curl. We install the system toolchain via tdnf (tar, git, python,
@@ -385,7 +385,7 @@ public static class SandboxImageBuilder
         "# in Azure (~2-4 min/svc) and avoids the qemu trap entirely.\n" +
         "set -euo pipefail\n" +
         "echo \"=========================================================\"\n" +
-        "echo \"[agentic-azd-up v34] starting (sanitize azd .env + resolve CA by azd-service-name tag)\"\n" +
+        "echo \"[agentic-azd-up v35] starting (sanitize azd .env + resolve CA by azd-service-name tag + post-provision identity fix)\"\n" +
         "echo \"=========================================================\"\n" +
         "# Sanitize the azd env file BEFORE any azd call. azd refuses to load\n" +
         "# the env if a single line is malformed (e.g. JSON value injected\n" +
@@ -418,6 +418,78 @@ public static class SandboxImageBuilder
         "fi\n" +
         "echo \"[agentic-azd-up] === phase 1: azd provision --no-prompt ===\"\n" +
         "azd provision --no-prompt\n" +
+        "# --- phase 1.5: post-provision managed identity fix-up ---\n" +
+        "# gpt-rag-ui (and similar) requires a user-assigned managed identity whose\n" +
+        "# clientId is passed via AZURE_CLIENT_ID. azd provision with these Bicep\n" +
+        "# templates may leave AZURE_CLIENT_ID=\"\" and only create system-assigned\n" +
+        "# identities. Detect and fix.\n" +
+        "_fix_managed_identity() {\n" +
+        "  local _rg _loc _env_name _envdump\n" +
+        "  _envdump=\"$(azd env get-values 2>/dev/null || true)\"\n" +
+        "  _pluck_id() { echo \"$_envdump\" | awk -F= -v k=\"$1\" '$1==k{ sub(/^\\\"/,\"\",$2); sub(/\\\"$/,\"\",$2); print $2; exit }'; }\n" +
+        "  _rg=\"$(_pluck_id AZURE_RESOURCE_GROUP)\"\n" +
+        "  [ -z \"$_rg\" ] && _rg=\"$(_pluck_id AZURE_RESOURCE_GROUP_NAME)\"\n" +
+        "  [ -z \"$_rg\" ] && _rg=\"$(_pluck_id RESOURCE_GROUP_NAME)\"\n" +
+        "  _env_name=\"$(_pluck_id AZURE_ENV_NAME)\"\n" +
+        "  if [ -z \"$_rg\" ] && [ -n \"$_env_name\" ]; then\n" +
+        "    _rg=\"$(az group list --tag azd-env-name=\"$_env_name\" --query '[0].name' -o tsv 2>/dev/null || true)\"\n" +
+        "  fi\n" +
+        "  if [ -z \"$_rg\" ]; then echo \"[identity-fix] cannot resolve RG — skipping\"; return 0; fi\n" +
+        "  _loc=\"$(_pluck_id AZURE_LOCATION)\"\n" +
+        "  [ -z \"$_loc\" ] && _loc=\"$(az group show -n \"$_rg\" --query location -o tsv 2>/dev/null || true)\"\n" +
+        "  # Check if any CA has empty AZURE_CLIENT_ID\n" +
+        "  local empty_cid\n" +
+        "  empty_cid=\"$(az containerapp list -g \"$_rg\" --query \\\"[?properties.template.containers[0].env[?name=='AZURE_CLIENT_ID' && value=='']].name | [0]\\\" -o tsv 2>/dev/null || true)\"\n" +
+        "  if [ -z \"$empty_cid\" ]; then\n" +
+        "    echo \"[identity-fix] no Container Apps with empty AZURE_CLIENT_ID — skipping\"\n" +
+        "    return 0\n" +
+        "  fi\n" +
+        "  echo \"[identity-fix] detected Container App(s) with empty AZURE_CLIENT_ID in $_rg — creating user-assigned identity\"\n" +
+        "  local id_name=\"id-${_env_name:-gptrag}-apps\"\n" +
+        "  # Create identity (idempotent — if it exists, az returns it)\n" +
+        "  local id_json\n" +
+        "  id_json=\"$(az identity create -g \"$_rg\" -n \"$id_name\" -l \"$_loc\" -o json 2>/dev/null || az identity show -g \"$_rg\" -n \"$id_name\" -o json 2>/dev/null)\"\n" +
+        "  local client_id principal_id id_resource_id\n" +
+        "  client_id=\"$(echo \"$id_json\" | grep -o '\"clientId\"[[:space:]]*:[[:space:]]*\"[^\"]*\"' | head -1 | sed 's/.*\"\\([^\"]*\\)\"$/\\1/')\"\n" +
+        "  principal_id=\"$(echo \"$id_json\" | grep -o '\"principalId\"[[:space:]]*:[[:space:]]*\"[^\"]*\"' | head -1 | sed 's/.*\"\\([^\"]*\\)\"$/\\1/')\"\n" +
+        "  id_resource_id=\"$(echo \"$id_json\" | grep -o '\"id\"[[:space:]]*:[[:space:]]*\"/subscriptions/[^\"]*\"' | head -1 | sed 's/.*\"\\([^\"]*\\)\"$/\\1/')\"\n" +
+        "  if [ -z \"$client_id\" ] || [ -z \"$principal_id\" ]; then\n" +
+        "    echo \"[identity-fix] WARN: failed to create/read identity $id_name\" >&2; return 0\n" +
+        "  fi\n" +
+        "  echo \"[identity-fix] identity=$id_name clientId=$client_id principalId=$principal_id\"\n" +
+        "  # Assign identity + set AZURE_CLIENT_ID on every CA in the RG\n" +
+        "  local ca_names\n" +
+        "  ca_names=\"$(az containerapp list -g \"$_rg\" --query '[].name' -o tsv 2>/dev/null || true)\"\n" +
+        "  for ca in $ca_names; do\n" +
+        "    echo \"[identity-fix]   assigning identity to $ca\"\n" +
+        "    az containerapp identity assign -g \"$_rg\" -n \"$ca\" --user-assigned \"$id_resource_id\" >/dev/null 2>&1 || true\n" +
+        "    az containerapp update -g \"$_rg\" -n \"$ca\" --set-env-vars \"AZURE_CLIENT_ID=$client_id\" >/dev/null 2>&1 || true\n" +
+        "  done\n" +
+        "  # RBAC: grant common data-plane roles on the RG scope\n" +
+        "  local sub_id scope\n" +
+        "  sub_id=\"$(_pluck_id AZURE_SUBSCRIPTION_ID)\"\n" +
+        "  [ -z \"$sub_id\" ] && sub_id=\"$(az account show --query id -o tsv 2>/dev/null || true)\"\n" +
+        "  scope=\"/subscriptions/$sub_id/resourceGroups/$_rg\"\n" +
+        "  # Cosmos DB Built-in Data Contributor\n" +
+        "  local cosmos_acct\n" +
+        "  cosmos_acct=\"$(az cosmosdb list -g \"$_rg\" --query '[0].name' -o tsv 2>/dev/null || true)\"\n" +
+        "  if [ -n \"$cosmos_acct\" ]; then\n" +
+        "    echo \"[identity-fix]   granting Cosmos RBAC on $cosmos_acct\"\n" +
+        "    az cosmosdb sql role assignment create --account-name \"$cosmos_acct\" -g \"$_rg\" --role-definition-id 00000000-0000-0000-0000-000000000002 --principal-id \"$principal_id\" --scope \"/\" 2>/dev/null || true\n" +
+        "  fi\n" +
+        "  # Storage Blob Data Contributor\n" +
+        "  az role assignment create --assignee-object-id \"$principal_id\" --assignee-principal-type ServicePrincipal --role \"Storage Blob Data Contributor\" --scope \"$scope\" 2>/dev/null || true\n" +
+        "  # Key Vault Secrets User\n" +
+        "  az role assignment create --assignee-object-id \"$principal_id\" --assignee-principal-type ServicePrincipal --role \"Key Vault Secrets User\" --scope \"$scope\" 2>/dev/null || true\n" +
+        "  # App Configuration Data Reader\n" +
+        "  az role assignment create --assignee-object-id \"$principal_id\" --assignee-principal-type ServicePrincipal --role \"App Configuration Data Reader\" --scope \"$scope\" 2>/dev/null || true\n" +
+        "  # Cognitive Services OpenAI User (for AI services)\n" +
+        "  az role assignment create --assignee-object-id \"$principal_id\" --assignee-principal-type ServicePrincipal --role \"Cognitive Services OpenAI User\" --scope \"$scope\" 2>/dev/null || true\n" +
+        "  # Search Index Data Contributor (for AI Search)\n" +
+        "  az role assignment create --assignee-object-id \"$principal_id\" --assignee-principal-type ServicePrincipal --role \"Search Index Data Contributor\" --scope \"$scope\" 2>/dev/null || true\n" +
+        "  echo \"[identity-fix] done — all CAs now have user-assigned identity with clientId=$client_id\"\n" +
+        "}\n" +
+        "_fix_managed_identity || echo \"[identity-fix] WARN: identity fix-up failed (non-fatal)\" >&2\n" +
         "echo \"[agentic-azd-up] === phase 2: per-service remote ACR build + containerapp update ===\"\n" +
         "# Robust RG/ACR resolution: dump full azd env, then try keys, then tag, then pattern match.\n" +
         "envdump=\"$(azd env get-values 2>/dev/null || true)\"\n" +
