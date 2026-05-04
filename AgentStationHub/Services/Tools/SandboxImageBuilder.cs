@@ -104,7 +104,7 @@ public static class SandboxImageBuilder
     //             `azd deploy --no-prompt`. Idempotent and safe to call
     //             multiple times. Single source of truth for every
     //             post-`azd up` deploy step.
-    private const string LocalTag = "agentichub/sandbox:v35";
+    private const string LocalTag = "agentichub/sandbox:v36";
 
     // Azure Linux (Mariner)-based azure-cli is multi-arch and ships with bash
     // and curl. We install the system toolchain via tdnf (tar, git, python,
@@ -889,7 +889,89 @@ public static class SandboxImageBuilder
         "  exit 0\n" +
         "fi\n" +
         "echo \"[agentic-azd-deploy] starting azd deploy --no-prompt $*\"\n" +
-        "exec azd deploy --no-prompt \"$@\"\n" +
+        "azd deploy --no-prompt \"$@\" || true\n" +
+        "# Re-check: did azd deploy actually replace the placeholders?\n" +
+        "placeholder_after=\"$(az containerapp list -g \"$rg\" --query \"length([?contains(properties.template.containers[0].image,'helloworld')])\" -o tsv 2>/dev/null || echo unknown)\"\n" +
+        "if [ \"$placeholder_after\" = \"0\" ]; then\n" +
+        "  echo \"[agentic-azd-deploy] ✓ azd deploy succeeded — no placeholders remain.\"\n" +
+        "  exit 0\n" +
+        "fi\n" +
+        "echo \"[agentic-azd-deploy] azd deploy left $placeholder_after placeholder(s). Falling back to remote ACR build approach.\"\n" +
+        "# --- Fallback: az acr build (remote, no Docker daemon needed) + az containerapp update ---\n" +
+        "acr=\"$(_pluck AZURE_CONTAINER_REGISTRY_NAME)\"\n" +
+        "[ -z \"$acr\" ] && acr=\"$(az acr list --resource-group \"$rg\" --query '[0].name' -o tsv 2>/dev/null || true)\"\n" +
+        "if [ -z \"$acr\" ] && [ -n \"$env_name\" ]; then\n" +
+        "  acr=\"$(az acr list --query \"[?tags.\\\"azd-env-name\\\"=='$env_name'].name | [0]\" -o tsv 2>/dev/null || true)\"\n" +
+        "fi\n" +
+        "if [ -z \"$acr\" ]; then echo \"[agentic-azd-deploy] FATAL: no ACR found in $rg\" >&2; exit 4; fi\n" +
+        "echo \"[agentic-azd-deploy] acr=$acr\"\n" +
+        "# Find azure.yaml\n" +
+        "azfile=\"\"\n" +
+        "for cand in /workspace/azure.yaml /workspace/azd/azure.yaml; do\n" +
+        "  if [ -f \"$cand\" ]; then azfile=\"$cand\"; break; fi\n" +
+        "done\n" +
+        "if [ ! -f \"$azfile\" ]; then echo \"[agentic-azd-deploy] FATAL: azure.yaml not found\" >&2; exit 5; fi\n" +
+        "azroot=\"$(dirname \"$azfile\")\"\n" +
+        "# Parse services from azure.yaml (same awk parser as agentic-azd-up)\n" +
+        "_parse_services() {\n" +
+        "  awk '\n" +
+        "    function strip(s){ gsub(/^[ \\t]+|[ \\t]+$/, \"\", s); gsub(/^\"|\"$/,\"\",s); gsub(/^'\\''|'\\''$/,\"\",s); return s }\n" +
+        "    function flush(){ if (svc!=\"\") print svc\"\\t\"project\"\\t\"host\"\\t\"dpath\"\\t\"dctx; svc=\"\";project=\"\";host=\"\";dpath=\"\";dctx=\"\";in_docker=0 }\n" +
+        "    BEGIN { in_services=0; svc=\"\"; in_docker=0 }\n" +
+        "    /^services:[[:space:]]*$/ { in_services=1; next }\n" +
+        "    in_services && /^[^[:space:]#]/ { flush(); in_services=0; next }\n" +
+        "    !in_services { next }\n" +
+        "    /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { flush(); s=$0; sub(/^  /,\"\",s); sub(/:[[:space:]]*$/,\"\",s); svc=s; next }\n" +
+        "    /^    project:/ { sub(/^    project:[[:space:]]*/,\"\"); project=strip($0); in_docker=0; next }\n" +
+        "    /^    host:/ { sub(/^    host:[[:space:]]*/,\"\"); host=strip($0); in_docker=0; next }\n" +
+        "    /^    docker:[[:space:]]*$/ { in_docker=1; next }\n" +
+        "    /^      path:/ && in_docker { sub(/^      path:[[:space:]]*/,\"\"); dpath=strip($0); next }\n" +
+        "    /^      context:/ && in_docker { sub(/^      context:[[:space:]]*/,\"\"); dctx=strip($0); next }\n" +
+        "    /^    [A-Za-z]/ { in_docker=0 }\n" +
+        "    END { flush() }\n" +
+        "  ' \"$1\"\n" +
+        "}\n" +
+        "deploy_ok=0\n" +
+        "deploy_fail=0\n" +
+        "while IFS=$'\\t' read -r svc proj host docker_path docker_context; do\n" +
+        "  [ -z \"$svc\" ] && continue\n" +
+        "  proj_dir=\"$azroot/$proj\"\n" +
+        "  if [ -n \"$docker_context\" ]; then ctx=\"$proj_dir/$docker_context\"; else ctx=\"$proj_dir\"; fi\n" +
+        "  ctx=\"$(cd \"$ctx\" 2>/dev/null && pwd || echo \"$ctx\")\"\n" +
+        "  if [ -n \"$docker_path\" ]; then df_full=\"$proj_dir/$docker_path\"\n" +
+        "  elif [ -f \"$proj_dir/Dockerfile.production\" ]; then df_full=\"$proj_dir/Dockerfile.production\"\n" +
+        "  else df_full=\"$proj_dir/Dockerfile\"; fi\n" +
+        "  if [ ! -f \"$df_full\" ]; then echo \"[agentic-azd-deploy] $svc: no Dockerfile — skip\"; deploy_fail=$((deploy_fail+1)); continue; fi\n" +
+        "  if [ ! -d \"$ctx\" ]; then echo \"[agentic-azd-deploy] $svc: context dir missing — skip\"; deploy_fail=$((deploy_fail+1)); continue; fi\n" +
+        "  # Auto .dockerignore\n" +
+        "  di=\"$ctx/.dockerignore\"\n" +
+        "  if [ ! -s \"$di\" ]; then printf 'node_modules\\n.git\\n.venv\\n__pycache__\\ndist\\nbuild\\n' > \"$di\"; fi\n" +
+        "  # Strip BuildKit-only flags for classic ACR builder\n" +
+        "  if grep -qE '^[[:space:]]*RUN[[:space:]]+--(mount|network|security)=' \"$df_full\" 2>/dev/null; then\n" +
+        "    sed -E -i 's/^([[:space:]]*RUN[[:space:]]+)((--(mount|network|security)=[^[:space:]]+[[:space:]]+)+)/\\1/' \"$df_full\"\n" +
+        "  fi\n" +
+        "  image=\"$svc:azd-$(date +%s)\"\n" +
+        "  echo \"[agentic-azd-deploy] $svc: az acr build (registry=$acr image=$image ctx=$ctx)\"\n" +
+        "  if ! az acr build --registry \"$acr\" --image \"$image\" --file \"$df_full\" \"$ctx\" --platform linux/amd64 2>&1 | tail -n 60; then\n" +
+        "    echo \"[agentic-azd-deploy] $svc: ACR build FAILED\" >&2; deploy_fail=$((deploy_fail+1)); continue\n" +
+        "  fi\n" +
+        "  # Resolve Container App name by azd-service-name tag, then name match\n" +
+        "  ca_name=\"$(az containerapp list -g \"$rg\" --query \"[?tags.\\\"azd-service-name\\\"=='$svc'].name | [0]\" -o tsv 2>/dev/null | tr -d '[:space:]' || true)\"\n" +
+        "  [ -z \"$ca_name\" ] && ca_name=\"$(az containerapp list -g \"$rg\" --query \"[?contains(name,'$svc')].name | [0]\" -o tsv 2>/dev/null | tr -d '[:space:]' || true)\"\n" +
+        "  svc_alt=\"$(echo \"$svc\" | tr '_' '-')\"\n" +
+        "  [ -z \"$ca_name\" ] && [ \"$svc_alt\" != \"$svc\" ] && ca_name=\"$(az containerapp list -g \"$rg\" --query \"[?contains(name,'$svc_alt')].name | [0]\" -o tsv 2>/dev/null | tr -d '[:space:]' || true)\"\n" +
+        "  if [ -z \"$ca_name\" ]; then echo \"[agentic-azd-deploy] $svc: cannot resolve CA name — skip\" >&2; deploy_fail=$((deploy_fail+1)); continue; fi\n" +
+        "  echo \"[agentic-azd-deploy] $svc: updating $ca_name -> $acr.azurecr.io/$image\"\n" +
+        "  if az containerapp update --name \"$ca_name\" --resource-group \"$rg\" --image \"$acr.azurecr.io/$image\" >/dev/null 2>&1; then\n" +
+        "    echo \"[agentic-azd-deploy] $svc: ✓ deployed\"\n" +
+        "    deploy_ok=$((deploy_ok+1))\n" +
+        "  else\n" +
+        "    echo \"[agentic-azd-deploy] $svc: containerapp update FAILED\" >&2; deploy_fail=$((deploy_fail+1))\n" +
+        "  fi\n" +
+        "done < <(_parse_services \"$azfile\")\n" +
+        "echo \"[agentic-azd-deploy] fallback complete: $deploy_ok ok, $deploy_fail failed\"\n" +
+        "[ $deploy_fail -gt 0 ] && exit 1\n" +
+        "exit 0\n" +
         "BAKED_SCRIPT\n" +
         // chmod + smoke-test
         "RUN chmod +x /usr/local/bin/relocate-venv \\\n" +
