@@ -143,6 +143,7 @@ public sealed class DeploymentSession
     public List<LogEntry> Logs { get; } = new();
     public string? FinalEndpoint { get; set; }
     public string? ErrorMessage { get; set; }
+    public string? AutofixReportPath { get; set; }
     public DateTime CreatedAtUtc { get; } = DateTime.UtcNow;
 
     /// <summary>

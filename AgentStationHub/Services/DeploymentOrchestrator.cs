@@ -3659,6 +3659,9 @@ public sealed class DeploymentOrchestrator
                         if (!string.IsNullOrEmpty(v.Endpoint))
                             _memory.UpsertInsight(s.RepoUrl, "lastSuccess.endpoint",
                                 v.Endpoint, confidence: 1.0);
+
+                        // Post-deploy infrastructure autofix pass.
+                        await RunInfraAutofixAsync(s, ct);
                         return;
                     }
                     // Still hollow after recovery — fall through to Failed.
@@ -3689,6 +3692,11 @@ public sealed class DeploymentOrchestrator
                 if (!string.IsNullOrEmpty(v.Endpoint))
                     _memory.UpsertInsight(s.RepoUrl, "lastSuccess.endpoint",
                         v.Endpoint, confidence: 1.0);
+
+                // Post-deploy infrastructure autofix: review all deployed
+                // resources in the Resource Group, compare with expected
+                // state, and fix anything degraded or misconfigured.
+                await RunInfraAutofixAsync(s, ct);
             }
             else if (!string.IsNullOrEmpty(v.Notes))
             {
@@ -4269,6 +4277,56 @@ public sealed class DeploymentOrchestrator
             }
         }
         return false;
+    }
+
+    /// <summary>
+    /// Post-deploy infrastructure autofix. Runs after a successful
+    /// deployment to review all resources in the target Resource Group,
+    /// compare with expected state, and automatically remediate issues
+    /// (degraded containers, wrong managed identity, missing revisions,
+    /// unreachable endpoints). Results are persisted as a JSON report.
+    /// Non-fatal: failures here never flip the deploy status.
+    /// </summary>
+    private async Task RunInfraAutofixAsync(DeploymentSession s, CancellationToken ct)
+    {
+        try
+        {
+            var rg = ExtractResourceGroupFromLogs(s.Logs);
+            if (string.IsNullOrWhiteSpace(rg))
+            {
+                await Log(s, "info",
+                    "[Autofix] Skipped: could not determine resource group from logs.");
+                return;
+            }
+
+            await Log(s, "info",
+                $"[Autofix] Starting post-deploy infrastructure review for '{rg}'...");
+
+            var agent = new Agents.InfraAutofixAgent(
+                _sp.GetRequiredService<ILogger<Agents.InfraAutofixAgent>>(),
+                (lvl, line) => _ = Log(s, lvl, line));
+
+            var report = await agent.RunAsync(s.Id, rg, s.RepoUrl, ct);
+
+            // Persist the report to disk
+            var reportPath = await Tools.AutofixReportStore.SaveAsync(report);
+            await Log(s, "info",
+                $"[Autofix] Report saved: {Path.GetFileName(reportPath)} " +
+                $"({report.TotalChecks} checks: {report.AlreadyHealthy} ok, " +
+                $"{report.Fixed} fixed, {report.FailedToFix} unresolved)");
+
+            // Store the report path on the session for UI access
+            s.AutofixReportPath = reportPath;
+            _store.SaveLater(s);
+        }
+        catch (OperationCanceledException) { /* user cancelled — don't block teardown */ }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "InfraAutofix failed for session {Id} (non-fatal).", s.Id);
+            await Log(s, "warn",
+                $"[Autofix] Non-fatal error during infrastructure review: {ex.Message}");
+        }
     }
 
     /// <summary>
