@@ -104,7 +104,7 @@ public static class SandboxImageBuilder
     //             `azd deploy --no-prompt`. Idempotent and safe to call
     //             multiple times. Single source of truth for every
     //             post-`azd up` deploy step.
-    private const string LocalTag = "agentichub/sandbox:v37";
+    private const string LocalTag = "agentichub/sandbox:v38";
 
     // Azure Linux (Mariner)-based azure-cli is multi-arch and ships with bash
     // and curl. We install the system toolchain via tdnf (tar, git, python,
@@ -1041,6 +1041,73 @@ public static class SandboxImageBuilder
         "    echo \"[agentic-azd-deploy] $svc: containerapp update FAILED\" >&2; deploy_fail=$((deploy_fail+1))\n" +
         "  fi\n" +
         "done < <(_parse_services \"$azfile\")\n" +
+        "# --- Discovery fallback: when azure.yaml has no services section\n" +
+        "# (e.g. GPT-RAG which deploys via hooks), discover CAs still on\n" +
+        "# placeholder images and find matching Dockerfiles in workspace.\n" +
+        "if [ $deploy_ok -eq 0 ] && [ $deploy_fail -eq 0 ] && [ \"$placeholder_after\" != \"0\" ]; then\n" +
+        "  echo \"[agentic-azd-deploy] no services in azure.yaml — trying discovery-based deploy\"\n" +
+        "  # Get CA names still on placeholder\n" +
+        "  ca_placeholders=\"$(az containerapp list -g \"$rg\" --query \"[?contains(properties.template.containers[0].image,'helloworld')].name\" -o tsv 2>/dev/null || true)\"\n" +
+        "  for ca in $ca_placeholders; do\n" +
+        "    # Extract suffix (e.g. ca-xxx-frontend -> frontend, ca-xxx-orchestrator -> orchestrator, ca-xxx-dataingest -> dataingest)\n" +
+        "    suffix=\"$(echo \"$ca\" | sed -E 's/^ca-[a-z0-9]+-//')\"\n" +
+        "    echo \"[agentic-azd-deploy] discovery: CA=$ca suffix=$suffix\"\n" +
+        "    # Search for a directory containing a Dockerfile that matches the suffix\n" +
+        "    found_dir=\"\"\n" +
+        "    found_df=\"\"\n" +
+        "    # Map well-known suffixes to repo directory names\n" +
+        "    for candidate in \"$suffix\" \"*$suffix*\" \"*${suffix%s}*\"; do\n" +
+        "      for d in $(find /workspace -maxdepth 2 -type d -iname \"$candidate\" 2>/dev/null); do\n" +
+        "        if [ -f \"$d/Dockerfile\" ] || [ -f \"$d/Dockerfile.production\" ]; then\n" +
+        "          found_dir=\"$d\"\n" +
+        "          if [ -f \"$d/Dockerfile.production\" ]; then found_df=\"$d/Dockerfile.production\"; else found_df=\"$d/Dockerfile\"; fi\n" +
+        "          break 2\n" +
+        "        fi\n" +
+        "      done\n" +
+        "    done\n" +
+        "    # GPT-RAG-specific mappings\n" +
+        "    if [ -z \"$found_dir\" ]; then\n" +
+        "      case \"$suffix\" in\n" +
+        "        frontend) for p in /workspace/gpt-rag-ui /workspace/frontend /workspace/app/frontend; do\n" +
+        "                    if [ -f \"$p/Dockerfile\" ] || [ -f \"$p/Dockerfile.production\" ]; then found_dir=\"$p\"; break; fi\n" +
+        "                  done ;;\n" +
+        "        dataingest|ingestion) for p in /workspace/gpt-rag-ingestion /workspace/ingestion /workspace/data-ingestion; do\n" +
+        "                    if [ -f \"$p/Dockerfile\" ] || [ -f \"$p/Dockerfile.production\" ]; then found_dir=\"$p\"; break; fi\n" +
+        "                  done ;;\n" +
+        "        orchestrator) for p in /workspace/gpt-rag-orchestrator /workspace/orchestrator; do\n" +
+        "                    if [ -f \"$p/Dockerfile\" ] || [ -f \"$p/Dockerfile.production\" ]; then found_dir=\"$p\"; break; fi\n" +
+        "                  done ;;\n" +
+        "      esac\n" +
+        "      if [ -n \"$found_dir\" ] && [ -z \"$found_df\" ]; then\n" +
+        "        if [ -f \"$found_dir/Dockerfile.production\" ]; then found_df=\"$found_dir/Dockerfile.production\"; else found_df=\"$found_dir/Dockerfile\"; fi\n" +
+        "      fi\n" +
+        "    fi\n" +
+        "    if [ -z \"$found_dir\" ] || [ -z \"$found_df\" ]; then\n" +
+        "      echo \"[agentic-azd-deploy] discovery: $ca ($suffix): no Dockerfile found — skip\"\n" +
+        "      deploy_fail=$((deploy_fail+1)); continue\n" +
+        "    fi\n" +
+        "    echo \"[agentic-azd-deploy] discovery: $ca -> dir=$found_dir df=$found_df\"\n" +
+        "    # Auto .dockerignore\n" +
+        "    di=\"$found_dir/.dockerignore\"\n" +
+        "    if [ ! -s \"$di\" ]; then printf 'node_modules\\n.git\\n.venv\\n__pycache__\\ndist\\nbuild\\n' > \"$di\"; fi\n" +
+        "    # Strip BuildKit-only flags\n" +
+        "    if grep -qE '^[[:space:]]*RUN[[:space:]]+--(mount|network|security)=' \"$found_df\" 2>/dev/null; then\n" +
+        "      sed -E -i 's/^([[:space:]]*RUN[[:space:]]+)((--(mount|network|security)=[^[:space:]]+[[:space:]]+)+)/\\1/' \"$found_df\"\n" +
+        "    fi\n" +
+        "    image=\"$suffix:azd-$(date +%s)\"\n" +
+        "    echo \"[agentic-azd-deploy] discovery: $ca: az acr build (registry=$acr image=$image ctx=$found_dir)\"\n" +
+        "    if ! az acr build --registry \"$acr\" --image \"$image\" --file \"$found_df\" \"$found_dir\" --platform linux/amd64 2>&1 | tail -n 60; then\n" +
+        "      echo \"[agentic-azd-deploy] discovery: $ca: ACR build FAILED\" >&2; deploy_fail=$((deploy_fail+1)); continue\n" +
+        "    fi\n" +
+        "    echo \"[agentic-azd-deploy] discovery: $ca: updating -> $acr.azurecr.io/$image\"\n" +
+        "    if az containerapp update --name \"$ca\" --resource-group \"$rg\" --image \"$acr.azurecr.io/$image\" >/dev/null 2>&1; then\n" +
+        "      echo \"[agentic-azd-deploy] discovery: $ca: ✓ deployed\"\n" +
+        "      deploy_ok=$((deploy_ok+1))\n" +
+        "    else\n" +
+        "      echo \"[agentic-azd-deploy] discovery: $ca: containerapp update FAILED\" >&2; deploy_fail=$((deploy_fail+1))\n" +
+        "    fi\n" +
+        "  done\n" +
+        "fi\n" +
         "echo \"[agentic-azd-deploy] fallback complete: $deploy_ok ok, $deploy_fail failed\"\n" +
         "[ $deploy_fail -gt 0 ] && exit 1\n" +
         "exit 0\n" +
