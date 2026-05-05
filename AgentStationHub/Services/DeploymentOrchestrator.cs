@@ -1945,13 +1945,14 @@ public sealed class DeploymentOrchestrator
                         // in failed state on the next provision because
                         // the previous deletion didn't fully complete
                         // before the next attempt started. Allow it to
-                        // refire up to 3 times before giving up to the
+                        // refire up to 5 times before giving up to the
                         // Doctor (which is likely to suggest the same
                         // cleanup but with broken syntax like
-                        // `azd env get --key`).
+                        // `azd env get --key`). The cleanup is fully
+                        // idempotent so extra firings are safe.
                         var cosmosFailedState =
                             !cosmosRegionWillFireFirst
-                            && ((cosmosStuck && cosmosStuckCount < 3)
+                            && ((cosmosStuck && cosmosStuckCount < 5)
                                 || (cosmosZonal && !cosmosZonalAlready));
                         if (cosmosFailedState)
                         {
