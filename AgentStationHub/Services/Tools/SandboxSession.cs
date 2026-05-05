@@ -100,11 +100,11 @@ public sealed class SandboxSession : IAsyncDisposable
             // the container.
             "--dns", "1.1.1.1",
             "--dns", "8.8.8.8",
-            // Memory / swap � same envelope as the previous per-step
-            // container; covers az CLI peak (~1.2 GB) + azd Go runtime
-            // + Bicep graph + buildx orchestration concurrently.
-            "--memory", "8g",
-            "--memory-swap", "16g",
+            // Memory / swap — sized for large templates (GPT-RAG
+            // deploys ~15 ARM resources in parallel via Bicep; each
+            // holds state while azd coordinates them).
+            "--memory", "12g",
+            "--memory-swap", "24g",
             "--memory-swappiness", "90",
             // Workspace and DooD socket. Workspace mount comes from the
             // per-session named volume (preferred) or a host bind on

@@ -1398,16 +1398,17 @@ public sealed class DeploymentOrchestrator
                 var priorCheapRetries = previousAttempts
                     .Count(a => a.Contains($"step {step.Id} [{cheapRetrySignature}] AUTO_RETRY",
                                            StringComparison.Ordinal));
-                if (cheapRetrySignature == "SignalKilled" && priorCheapRetries < 2)
+                if (cheapRetrySignature == "SignalKilled" && priorCheapRetries < 3)
                 {
+                    var delaySec = 30 * (priorCheapRetries + 1); // 30, 60, 90 s
                     await Log(s, "warn",
                         $"Step {step.Id} failed with [SignalKilled] — the host OOM killer " +
                         "interrupted 'az'. This is almost always transient. Auto-retrying the " +
-                        $"step in 10 s (attempt {priorCheapRetries + 1}/2, Doctor not yet invoked).",
+                        $"step in {delaySec} s (attempt {priorCheapRetries + 1}/3, Doctor not yet invoked).",
                         step.Id);
                     previousAttempts.Add(
                         $"step {step.Id} [SignalKilled] AUTO_RETRY: orchestrator-level no-LLM retry");
-                    try { await Task.Delay(TimeSpan.FromSeconds(10), ct); }
+                    try { await Task.Delay(TimeSpan.FromSeconds(delaySec), ct); }
                     catch (OperationCanceledException) { throw; }
                     i--; // re-execute the same step on next iteration
                     continue;
