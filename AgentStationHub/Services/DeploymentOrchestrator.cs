@@ -1898,16 +1898,29 @@ public sealed class DeploymentOrchestrator
                         // AutoPatch:foundry-capability-host — Foundry
                         // capability host (Microsoft.MachineLearningServices/
                         // workspaces/capabilityHosts) regularly fails with
-                        // 400 BadRequest from agent-management API right
-                        // after the cosmos/storage/search connections are
-                        // created. It's a propagation race in the AzureML
-                        // control plane: the connections exist in ARM but
-                        // the AML agent-management endpoint hasn't seen
-                        // them yet. Bicep is idempotent — wait 90s and
-                        // re-run azd provision; the retry recreates ONLY
-                        // the failed capability host (everything else is
-                        // already done) and almost always succeeds. Allow
-                        // up to 4 retries before giving up to the Doctor.
+                        // 400 BadRequest from agent-management API. From
+                        // Microsoft docs there are 2 root causes:
+                        //   1. Insufficient Cosmos DB throughput (the
+                        //      capability host creates database
+                        //      'enterprise_memory' with 3 containers each
+                        //      needing 1000 RU/s = min 3000 RU/s).
+                        //   2. Capability hosts cannot be updated after
+                        //      creation: a failed prior attempt leaves
+                        //      the resource in a corrupted state that
+                        //      MUST be deleted before retrying.
+                        // Real fix:
+                        //   - delete the failed capabilityHost(s)
+                        //   - delete any partial 'enterprise_memory' DB
+                        //     on cosmos-aif (so the capability host can
+                        //     recreate it cleanly)
+                        //   - pre-create 'enterprise_memory' with shared
+                        //     3000 RU/s autoscale on cosmos-aif so the
+                        //     next capability host has the throughput
+                        //     it needs from the start
+                        //   - retry azd provision (Bicep idempotent;
+                        //     only the failed capability host is recreated).
+                        // Allow up to 4 firings (each fixes a different
+                        // potential failure mode).
                         var foundryCapHostFailed =
                             !string.IsNullOrEmpty(stepTail)
                             && stepTail.Contains("capabilityHost",
@@ -1922,29 +1935,98 @@ public sealed class DeploymentOrchestrator
                             a.Contains("[AutoPatch:foundry-capability-host]"));
                         if (foundryCapHostFailed && foundryCapHostCount < 4)
                         {
-                            var retryCmd =
-                                "bash -lc \"echo 'AutoPatch:foundry-capability-host " +
-                                "waiting 90s for AzureML agent-management propagation...'; " +
-                                "sleep 90; cd /workspace 2>/dev/null || true; " +
-                                "azd provision --no-prompt\"";
+                            var capHostScript = string.Join("\n", new[]
+                            {
+                                "set +e",
+                                "echo 'AutoPatch:foundry-capability-host starting'",
+                                "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
+                                "if [ -z \"$RG\" ]; then",
+                                "  ENV_NAME=$(azd env get-value AZURE_ENV_NAME 2>/dev/null)",
+                                "  if [ -n \"$ENV_NAME\" ]; then RG=\"rg-$ENV_NAME\"; fi",
+                                "fi",
+                                "echo \"RG=$RG\"",
+                                "if [ -z \"$RG\" ]; then echo 'no RG resolved'; exit 0; fi",
+                                "# 1) Find the Foundry (AzureML workspace) account in the RG.",
+                                "WORKSPACE=$(az resource list -g \"$RG\" --resource-type Microsoft.CognitiveServices/accounts --query \"[?starts_with(name, 'aif-')].name\" -o tsv 2>/dev/null | head -n1)",
+                                "if [ -z \"$WORKSPACE\" ]; then",
+                                "  WORKSPACE=$(az resource list -g \"$RG\" --resource-type Microsoft.MachineLearningServices/workspaces --query \"[?starts_with(name, 'aif-')].name\" -o tsv 2>/dev/null | head -n1)",
+                                "fi",
+                                "echo \"Foundry workspace: $WORKSPACE\"",
+                                "# 2) Delete any failed capabilityHost subresources (cannot be updated, must be recreated).",
+                                "if [ -n \"$WORKSPACE\" ]; then",
+                                "  SUB=$(az account show --query id -o tsv 2>/dev/null)",
+                                "  for ch in $(az resource list -g \"$RG\" --resource-type Microsoft.CognitiveServices/accounts/capabilityHosts --query \"[].name\" -o tsv 2>/dev/null); do",
+                                "    echo \"deleting account-level capabilityHost: $ch\"",
+                                "    az resource delete --ids \"/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.CognitiveServices/accounts/$WORKSPACE/capabilityHosts/$ch\" 2>&1 | tail -n 3",
+                                "  done",
+                                "  # Also project-level capability hosts.",
+                                "  for proj in $(az resource list -g \"$RG\" --resource-type Microsoft.CognitiveServices/accounts/projects --query \"[].name\" -o tsv 2>/dev/null); do",
+                                "    projname=$(echo \"$proj\" | awk -F/ '{print $NF}')",
+                                "    for ch in $(az resource list -g \"$RG\" --resource-type Microsoft.CognitiveServices/accounts/projects/capabilityHosts --query \"[?contains(name, '$projname/')].name\" -o tsv 2>/dev/null); do",
+                                "      chname=$(echo \"$ch\" | awk -F/ '{print $NF}')",
+                                "      echo \"deleting project-level capabilityHost: $WORKSPACE/$projname/$chname\"",
+                                "      az resource delete --ids \"/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.CognitiveServices/accounts/$WORKSPACE/projects/$projname/capabilityHosts/$chname\" 2>&1 | tail -n 3",
+                                "    done",
+                                "  done",
+                                "fi",
+                                "# 3) Pre-create 'enterprise_memory' DB on cosmos-aif with 3000 RU/s shared autoscale.",
+                                "#    The capability host needs 3 containers × 1000 RU/s = 3000 RU/s minimum.",
+                                "#    Insufficient throughput is the #1 cause of capability host failures.",
+                                "COSMOS_AIF=$(az resource list -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --query \"[?starts_with(name, 'cosmos-aif')].name\" -o tsv 2>/dev/null | head -n1)",
+                                "if [ -z \"$COSMOS_AIF\" ]; then",
+                                "  COSMOS_AIF=$(az resource list -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --query \"[?starts_with(name, 'cosmos-')].name\" -o tsv 2>/dev/null | head -n1)",
+                                "fi",
+                                "echo \"cosmos-aif account: $COSMOS_AIF\"",
+                                "if [ -n \"$COSMOS_AIF\" ]; then",
+                                "  # Drop partial DB if it exists in a failed state.",
+                                "  if az cosmosdb sql database show -g \"$RG\" -a \"$COSMOS_AIF\" -n enterprise_memory >/dev/null 2>&1; then",
+                                "    echo 'enterprise_memory DB already exists; checking throughput'",
+                                "    THR=$(az cosmosdb sql database throughput show -g \"$RG\" -a \"$COSMOS_AIF\" -n enterprise_memory --query 'resource.autoscaleSettings.maxThroughput' -o tsv 2>/dev/null)",
+                                "    echo \"current max autoscale RU/s: $THR\"",
+                                "    if [ -z \"$THR\" ] || [ \"$THR\" -lt 3000 ] 2>/dev/null; then",
+                                "      echo 'bumping enterprise_memory autoscale to 4000 RU/s'",
+                                "      az cosmosdb sql database throughput update -g \"$RG\" -a \"$COSMOS_AIF\" -n enterprise_memory --max-throughput 4000 2>&1 | tail -n 5 || true",
+                                "    fi",
+                                "  else",
+                                "    echo 'creating enterprise_memory DB with 4000 RU/s autoscale shared throughput'",
+                                "    az cosmosdb sql database create -g \"$RG\" -a \"$COSMOS_AIF\" -n enterprise_memory --max-throughput 4000 2>&1 | tail -n 5 || true",
+                                "  fi",
+                                "fi",
+                                "# 4) Wait for AzureML agent-management API propagation.",
+                                "echo 'waiting 60s for AzureML control plane propagation...'",
+                                "sleep 60",
+                                "# 5) Retry azd provision; only failed resources are recreated.",
+                                "cd /workspace 2>/dev/null || true",
+                                "echo 'AutoPatch:foundry-capability-host running azd provision retry'",
+                                "azd provision --no-prompt",
+                                ""
+                            });
+                            var capHostB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(capHostScript));
+                            var capHostCmd =
+                                "bash -lc 'echo " + capHostB64 + " | base64 -d | bash'";
                             previousAttempts.Add(
                                 "[AutoPatch:foundry-capability-host] Foundry " +
-                                "capabilityHost creation failed with 400 BadRequest " +
-                                "from agent-management API (transient propagation " +
-                                "race). Inserted 90s wait + azd provision retry " +
+                                "capabilityHost creation failed with 400 BadRequest. " +
+                                "Deleted failed capability host(s), pre-created " +
+                                "enterprise_memory DB with 3000 RU/s on cosmos-aif " +
+                                "(per Microsoft docs: 3 containers × 1000 RU/s), " +
+                                "and retried azd provision " +
                                 $"(attempt {foundryCapHostCount + 1}/4).");
                             await Log(s, "status",
                                 "Auto-patch [AutoPatch:foundry-capability-host]: " +
                                 "Foundry capability host failed with 400 BadRequest. " +
-                                "This is a known transient propagation race in the " +
-                                "AzureML agent-management API. Inserting a 90s wait " +
-                                "+ azd provision retry " +
+                                "Per MS docs the root cause is insufficient Cosmos " +
+                                "throughput and/or a corrupted prior capability host. " +
+                                "Deleting failed capabilityHosts, pre-creating " +
+                                "enterprise_memory DB with 4000 RU/s autoscale on " +
+                                "cosmos-aif, then retrying azd provision " +
                                 $"(attempt {foundryCapHostCount + 1}/4).",
                                 step.Id);
                             var retryStep = new DeploymentStep(
                                 step.Id,
-                                "AutoPatch: wait for AzureML propagation + retry azd provision",
-                                retryCmd,
+                                "AutoPatch: cleanup failed capabilityHost + bump cosmos throughput + retry provision",
+                                capHostCmd,
                                 step.WorkingDirectory,
                                 TimeSpan.FromMinutes(30));
                             steps.Insert(i, retryStep);
