@@ -873,6 +873,26 @@ public sealed class DeploymentOrchestrator
                     steps[i] = step;
                 }
 
+                // Pre-execution normalisation #6: replace any `az login`
+                // commands with `az account show`. The sandbox is already
+                // authenticated by SandboxAzureAuth.EnsureAsync (device-code
+                // flow before step 1). Any `az login` injected by the
+                // Doctor or EscalationResolver will hang forever in the
+                // headless sandbox (waiting for interactive browser auth)
+                // or fail with missing service-principal creds.
+                if (IsAzLogin(step.Command))
+                {
+                    var verify = "bash -lc \"az account show -o table\"";
+                    await Log(s, "info",
+                        "Replacing 'az login' with 'az account show' — the " +
+                        "sandbox is already authenticated via SandboxAzureAuth. " +
+                        "Running 'az login' in a headless container would hang " +
+                        "waiting for interactive browser auth.",
+                        step.Id);
+                    step = step with { Command = verify };
+                    steps[i] = step;
+                }
+
                 await Log(s, "status", $"▶ Step {step.Id}: {step.Description}", step.Id);
 
                 // Long-running azd commands can go silent for several minutes
@@ -4142,6 +4162,18 @@ public sealed class DeploymentOrchestrator
             cmd, @"(^|[\s""'|&;])azd\s+auth\s+login\b",
             System.Text.RegularExpressions.RegexOptions.IgnoreCase);
     }
+
+    private static bool IsAzLogin(string? cmd)
+    {
+        if (string.IsNullOrWhiteSpace(cmd)) return false;
+        // Match `az login` (with any flags) but NOT `azd auth login` (handled above)
+        // and NOT `az account show` or other non-login commands.
+        return System.Text.RegularExpressions.Regex.IsMatch(
+            cmd, @"(^|[\s""'|&;])az\s+login\b",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+            && !IsAzdAuthLogin(cmd);
+    }
+
     private static bool ContainsAzureEnvNameExport(string? cmd)
     {
         if (string.IsNullOrEmpty(cmd)) return false;
