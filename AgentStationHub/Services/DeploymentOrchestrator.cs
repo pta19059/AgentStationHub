@@ -1859,6 +1859,70 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // AutoPatch:empty-rg — the Doctor generates
+                        // commands that use `$RG=$(azd env get-value
+                        // AZURE_RESOURCE_GROUP)` but that variable is
+                        // never set until a first successful provision.
+                        // The CLI errors out with "argument
+                        // --resource-group/-g: expected one argument".
+                        // Fix: rewrite the step command to derive RG
+                        // from AZURE_ENV_NAME (pattern: rg-{envName}).
+                        var emptyRg =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("--resource-group/-g: expected one argument",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:empty-rg]"));
+                        if (emptyRg)
+                        {
+                            // Replace the broken RG resolution in the
+                            // Doctor's command with our fallback pattern.
+                            var fixedCmd = (step.Command ?? "")
+                                .Replace(
+                                    "RG=$(azd env get-value AZURE_RESOURCE_GROUP)",
+                                    "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null); " +
+                                    "if [ -z \"$RG\" ]; then ENV_NAME=$(azd env get-value AZURE_ENV_NAME 2>/dev/null); " +
+                                    "if [ -n \"$ENV_NAME\" ]; then RG=\"rg-$ENV_NAME\"; fi; fi")
+                                .Replace(
+                                    "RG=\"$(azd env get-value AZURE_RESOURCE_GROUP)\"",
+                                    "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null); " +
+                                    "if [ -z \"$RG\" ]; then ENV_NAME=$(azd env get-value AZURE_ENV_NAME 2>/dev/null); " +
+                                    "if [ -n \"$ENV_NAME\" ]; then RG=\"rg-$ENV_NAME\"; fi; fi");
+                            // If the command didn't change (different
+                            // pattern), just prefix the entire command
+                            // with a proper RG derivation.
+                            if (fixedCmd == step.Command)
+                            {
+                                var prefix =
+                                    "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null); " +
+                                    "if [ -z \"$RG\" ]; then ENV_NAME=$(azd env get-value AZURE_ENV_NAME 2>/dev/null); " +
+                                    "if [ -n \"$ENV_NAME\" ]; then RG=\"rg-$ENV_NAME\"; fi; fi; " +
+                                    "export AZURE_RESOURCE_GROUP=\"$RG\"; ";
+                                // Inject the prefix inside bash -lc "..."
+                                if (fixedCmd.Contains("bash -lc \""))
+                                    fixedCmd = fixedCmd.Replace(
+                                        "bash -lc \"",
+                                        "bash -lc \"" + prefix);
+                                else if (fixedCmd.Contains("bash -lc '"))
+                                    fixedCmd = fixedCmd.Replace(
+                                        "bash -lc '",
+                                        "bash -lc '" + prefix);
+                            }
+                            previousAttempts.Add(
+                                "[AutoPatch:empty-rg] Doctor step failed because " +
+                                "AZURE_RESOURCE_GROUP is not set (provision never " +
+                                "succeeded). Rewrote RG derivation to use " +
+                                "rg-$AZURE_ENV_NAME fallback.");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:empty-rg]: AZURE_RESOURCE_GROUP " +
+                                "is empty (provision hasn't succeeded yet). Rewriting " +
+                                "the step to derive RG from AZURE_ENV_NAME.",
+                                step.Id);
+                            steps[i] = step with { Command = fixedCmd };
+                            i--;
+                            continue;
+                        }
+
                         // Pre-Doctor deterministic patch: Cosmos DB stuck
                         // in "failed provisioning state" + recurring
                         // "Please delete the previous instance" errors,
