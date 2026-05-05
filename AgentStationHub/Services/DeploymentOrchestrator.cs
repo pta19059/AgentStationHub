@@ -2979,6 +2979,123 @@ public sealed class DeploymentOrchestrator
                             }
                         }
 
+                        // ── AutoPatch:private-endpoint-conflict ──
+                        // When azd provision fails because existing resources
+                        // (CAE, ACR) have private endpoints configured and
+                        // the template tries to set publicNetworkAccess=Enabled
+                        // or change the SKU. Error signatures:
+                        //   "public network access value can not be set to Enabled
+                        //    for environment with private endpoints configured"
+                        //   "Cannot update the registry SKU due to reason:
+                        //    Registry has private endpoint connections"
+                        // Fix: remove private endpoints from the affected
+                        // resources, enable public network access, disable
+                        // retention policies on ACR, then retry.
+                        var privateEndpointConflict =
+                            !string.IsNullOrEmpty(stepTail)
+                            && (stepTail.Contains("private endpoints configured",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || stepTail.Contains("Registry has private endpoint connections",
+                                                     StringComparison.OrdinalIgnoreCase)
+                                || (stepTail.Contains("SkuUpdateConflict",
+                                                      StringComparison.OrdinalIgnoreCase)
+                                    && stepTail.Contains("private endpoint",
+                                                         StringComparison.OrdinalIgnoreCase)))
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:private-endpoint-conflict]"));
+                        if (privateEndpointConflict)
+                        {
+                            var peScript = string.Join("\n", new[]
+                            {
+                                "set +e",
+                                "echo 'AutoPatch:private-endpoint-conflict starting'",
+                                "",
+                                "# Resolve RG",
+                                "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
+                                "if [ -z \"$RG\" ]; then",
+                                "  RG=$(az group list --query \"[?starts_with(name,'rg-')].name | [0]\" -o tsv)",
+                                "fi",
+                                "echo \"RG=$RG\"",
+                                "if [ -z \"$RG\" ]; then echo 'no RG resolved; aborting'; exit 0; fi",
+                                "",
+                                "# 1. Fix Container Apps Environments with private endpoints",
+                                "echo '--- Checking Container App Environments ---'",
+                                "CAES=$(az containerapp env list -g \"$RG\" --query \"[].name\" -o tsv 2>/dev/null)",
+                                "for cae in $CAES; do",
+                                "  echo \"  Checking CAE: $cae\"",
+                                "  PES=$(az network private-endpoint-connection list --id $(az containerapp env show -g \"$RG\" -n \"$cae\" --query id -o tsv 2>/dev/null) --query \"[].id\" -o tsv 2>/dev/null || true)",
+                                "  for pe in $PES; do",
+                                "    echo \"    Removing private endpoint connection: $pe\"",
+                                "    az network private-endpoint-connection delete --id \"$pe\" --yes 2>&1 | tail -3 || true",
+                                "  done",
+                                "done",
+                                "",
+                                "# 2. Fix Container Registries with private endpoints / disabled public access / retention",
+                                "echo '--- Checking Container Registries ---'",
+                                "ACRS=$(az acr list -g \"$RG\" --query \"[].name\" -o tsv 2>/dev/null)",
+                                "for acr in $ACRS; do",
+                                "  echo \"  Checking ACR: $acr\"",
+                                "  # Remove private endpoint connections",
+                                "  PES=$(az network private-endpoint-connection list --id $(az acr show -g \"$RG\" -n \"$acr\" --query id -o tsv 2>/dev/null) --query \"[].id\" -o tsv 2>/dev/null || true)",
+                                "  for pe in $PES; do",
+                                "    echo \"    Removing private endpoint: $pe\"",
+                                "    az network private-endpoint-connection delete --id \"$pe\" --yes 2>&1 | tail -3 || true",
+                                "  done",
+                                "  # Enable public network access",
+                                "  echo \"    Enabling public network access\"",
+                                "  az acr update -g \"$RG\" -n \"$acr\" --public-network-enabled true 2>&1 | tail -5 || true",
+                                "  # Disable retention policy (required for SKU downgrade)",
+                                "  echo \"    Disabling retention policy\"",
+                                "  az acr config retention update -r \"$acr\" --status disabled --type UntaggedManifests 2>&1 | tail -3 || true",
+                                "done",
+                                "",
+                                "# 3. Also check for any other private endpoints on resources in the RG",
+                                "#    that might block provisioning (Storage, KeyVault, etc.)",
+                                "echo '--- Checking for other private endpoints in RG ---'",
+                                "ALL_PES=$(az network private-endpoint list -g \"$RG\" --query \"[].{name:name,id:id}\" -o tsv 2>/dev/null || true)",
+                                "if [ -n \"$ALL_PES\" ]; then",
+                                "  echo \"  Found private endpoints in RG:\"",
+                                "  echo \"$ALL_PES\"",
+                                "  # Delete all private endpoints in the RG",
+                                "  az network private-endpoint list -g \"$RG\" --query \"[].name\" -o tsv 2>/dev/null | while read -r peName; do",
+                                "    echo \"    Deleting PE: $peName\"",
+                                "    az network private-endpoint delete -g \"$RG\" -n \"$peName\" 2>&1 | tail -3 || true",
+                                "  done",
+                                "fi",
+                                "",
+                                "# Brief wait for deletions to propagate",
+                                "sleep 15",
+                                "echo 'AutoPatch:private-endpoint-conflict done'",
+                                ""
+                            });
+                            var peB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(peScript));
+                            var peCmd =
+                                "bash -lc 'echo " + peB64 + " | base64 -d | bash'";
+                            previousAttempts.Add(
+                                "[AutoPatch:private-endpoint-conflict] Provisioning " +
+                                "failed because existing resources have private " +
+                                "endpoints configured that block public network access " +
+                                "or SKU changes. Removed all private endpoint " +
+                                "connections from CAE and ACR, enabled public network " +
+                                "access on ACR, and disabled retention policies.");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:private-endpoint-conflict]: " +
+                                "existing resources have private endpoints blocking " +
+                                "provisioning. Removing PEs, enabling public access, " +
+                                "disabling ACR retention policies, then retrying.",
+                                step.Id);
+                            var peStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: remove private endpoints + enable public access on CAE/ACR",
+                                peCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(10));
+                            steps.Insert(i, peStep);
+                            i--;
+                            continue;
+                        }
+
                         // 8.8: prefill previousAttempts with cross-session
                         // failed attempts for the same error signature on
                         // the same repo so the Doctor pivots instead of
