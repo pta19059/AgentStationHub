@@ -1895,6 +1895,63 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // AutoPatch:foundry-capability-host — Foundry
+                        // capability host (Microsoft.MachineLearningServices/
+                        // workspaces/capabilityHosts) regularly fails with
+                        // 400 BadRequest from agent-management API right
+                        // after the cosmos/storage/search connections are
+                        // created. It's a propagation race in the AzureML
+                        // control plane: the connections exist in ARM but
+                        // the AML agent-management endpoint hasn't seen
+                        // them yet. Bicep is idempotent — wait 90s and
+                        // re-run azd provision; the retry recreates ONLY
+                        // the failed capability host (everything else is
+                        // already done) and almost always succeeds. Allow
+                        // up to 4 retries before giving up to the Doctor.
+                        var foundryCapHostFailed =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("capabilityHost",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && (stepTail.Contains("400",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || stepTail.Contains("BadRequest",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || stepTail.Contains("conflicting state",
+                                                  StringComparison.OrdinalIgnoreCase));
+                        var foundryCapHostCount = previousAttempts.Count(a =>
+                            a.Contains("[AutoPatch:foundry-capability-host]"));
+                        if (foundryCapHostFailed && foundryCapHostCount < 4)
+                        {
+                            var retryCmd =
+                                "bash -lc \"echo 'AutoPatch:foundry-capability-host " +
+                                "waiting 90s for AzureML agent-management propagation...'; " +
+                                "sleep 90; cd /workspace 2>/dev/null || true; " +
+                                "azd provision --no-prompt\"";
+                            previousAttempts.Add(
+                                "[AutoPatch:foundry-capability-host] Foundry " +
+                                "capabilityHost creation failed with 400 BadRequest " +
+                                "from agent-management API (transient propagation " +
+                                "race). Inserted 90s wait + azd provision retry " +
+                                $"(attempt {foundryCapHostCount + 1}/4).");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:foundry-capability-host]: " +
+                                "Foundry capability host failed with 400 BadRequest. " +
+                                "This is a known transient propagation race in the " +
+                                "AzureML agent-management API. Inserting a 90s wait " +
+                                "+ azd provision retry " +
+                                $"(attempt {foundryCapHostCount + 1}/4).",
+                                step.Id);
+                            var retryStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: wait for AzureML propagation + retry azd provision",
+                                retryCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(30));
+                            steps.Insert(i, retryStep);
+                            i--;
+                            continue;
+                        }
+
                         // AutoPatch:empty-rg — the Doctor generates
                         // commands that use `$RG=$(azd env get-value
                         // AZURE_RESOURCE_GROUP)` but that variable is
