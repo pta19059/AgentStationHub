@@ -2418,24 +2418,23 @@ public sealed class DeploymentOrchestrator
                         }
 
                         // 8.7.z: [AutoPatch:cosmos-region] — when a cosmos
-                        // creation fails repeatedly with
-                        //   ServiceUnavailable: ... high demand in East US
-                        //   region for the zonal redundant (Availability
-                        //   Zones) accounts
-                        // simply pinning AZURE_COSMOS_LOCATION=eastus2 via
-                        // azd env set is unreliable: the loader sometimes
-                        // re-reads stale azd .env, and main.parameters.json
-                        // hardcodes "useZoneRedundancy" as a STRING ("false")
-                        // which Bicep coerces inconsistently. The robust
-                        // fix is to rewrite main.parameters.json directly:
-                        //   - set cosmosLocation literal to "eastus2"
-                        //   - convert useZoneRedundancy "false" string to
-                        //     boolean false (Bicep param is bool)
-                        // and to set the azd env var as well so the rest
-                        // of the deploy stays consistent. Then run the
-                        // standard cosmos-stuck cleanup so the previously-
-                        // failed accounts in eastus get deleted before the
-                        // next provision (which will land in eastus2).
+                        // creation fails with
+                        //   ServiceUnavailable: ... high demand in <region>
+                        //   for the zonal redundant (Availability Zones)
+                        //   accounts
+                        // The fix is to disable zone redundancy (NOT to
+                        // change the region — changing region causes
+                        // InvalidResourceLocation when the failed account
+                        // still lingers in the original region). We:
+                        //   - set useZoneRedundancy to boolean false in
+                        //     main.parameters.json
+                        //   - delete any pre-existing failed cosmos
+                        //     accounts in the RG (they linger even after
+                        //     ServiceUnavailable)
+                        //   - set the azd env var as belt-and-suspenders
+                        // The RG name is derived from AZURE_ENV_NAME
+                        // (pattern: rg-{envName}) since AZURE_RESOURCE_GROUP
+                        // isn't set until after a successful provision.
                         var cosmosRegion =
                             !string.IsNullOrEmpty(stepTail)
                             && stepTail.Contains("zonal redundant",
@@ -2454,10 +2453,9 @@ public sealed class DeploymentOrchestrator
                                 "echo 'AutoPatch:cosmos-region starting'",
                                 "cd /workspace 2>/dev/null || true",
                                 "# Patch BOTH root and infra copies of main.parameters.json using Python",
-                                "# (sed on JSON is fragile and corrupts the file). Python json module guarantees valid output.",
-                                "# azd provision copies root→infra ('Applying project main.parameters.json to infra...')",
-                                "# so patching only infra/ gets overwritten. We patch root first (authoritative),",
-                                "# then infra/ as belt-and-suspenders.",
+                                "# Key change: do NOT alter cosmosLocation — only disable zone redundancy.",
+                                "# Changing region causes InvalidResourceLocation when the failed account still",
+                                "# lingers in the original region.",
                                 "python3 - <<'PYREGION'",
                                 "import json, os, sys",
                                 "files = ['main.parameters.json', 'infra/main.parameters.json']",
@@ -2471,7 +2469,6 @@ public sealed class DeploymentOrchestrator
                                 "        j = json.loads(data)",
                                 "    except json.JSONDecodeError as e:",
                                 "        print(f'  WARNING: {p} is not valid JSON ({e}), attempting best-effort repair')",
-                                "        # Try stripping trailing garbage",
                                 "        import re",
                                 "        m = re.search(r'\\}\\s*$', data)",
                                 "        if m:",
@@ -2483,20 +2480,22 @@ public sealed class DeploymentOrchestrator
                                 "            print(f'  FATAL: cannot parse {p}, skipping'); continue",
                                 "    params = j.get('parameters', {})",
                                 "    changed = False",
-                                "    # 1. cosmosLocation → eastus2",
+                                "    # 1. cosmosLocation — LEAVE UNCHANGED (region must match existing resource)",
                                 "    if 'cosmosLocation' in params:",
-                                "        old = params['cosmosLocation'].get('value')",
-                                "        params['cosmosLocation']['value'] = 'eastus2'",
-                                "        if old != 'eastus2': changed = True",
-                                "        print(f'  cosmosLocation: {old} -> eastus2')",
-                                "    # 2. aiFoundryLocation — leave unchanged (srch-aif, kv-ai are already in primary region)",
-                                "    # 3. useZoneRedundancy → bool false (Bicep param is bool, not string)",
+                                "        print(f'  cosmosLocation: {params[\"cosmosLocation\"].get(\"value\")} (unchanged)')",
+                                "    # 2. useZoneRedundancy → bool false (Bicep param is bool, not string)",
                                 "    if 'useZoneRedundancy' in params:",
                                 "        old = params['useZoneRedundancy'].get('value')",
                                 "        params['useZoneRedundancy']['value'] = False",
                                 "        if old is not False: changed = True",
                                 "        print(f'  useZoneRedundancy: {repr(old)} -> False')",
+                                "    else:",
+                                "        # Add it if not present",
+                                "        params['useZoneRedundancy'] = {'value': False}",
+                                "        changed = True",
+                                "        print(f'  useZoneRedundancy: (added) -> False')",
                                 "    if changed:",
+                                "        j['parameters'] = params",
                                 "        with open(p, 'w', encoding='utf-8') as f:",
                                 "            json.dump(j, f, indent=2, ensure_ascii=False)",
                                 "            f.write('\\n')",
@@ -2504,76 +2503,41 @@ public sealed class DeploymentOrchestrator
                                 "    else:",
                                 "        print(f'  no changes needed in {p}')",
                                 "PYREGION",
-                                "# 3b. Patch Bicep: AI Foundry module creates its own Cosmos (cosmos-aif-*) using",
-                                "#     'location: location' (primary region eastus) which fails with zonal redundancy.",
-                                "#     The AVM module doesn't support per-resource location override.",
-                                "#     Strategy: if a main cosmos account already exists in the RG (in eastus2),",
-                                "#     set aiFoundryCosmosDBAccountResourceId to reuse it. Otherwise, patch the",
-                                "#     Bicep to move the entire aiFoundry module location to cosmosLocation.",
-                                "python3 - <<'PYCOSMOS_AIF'",
-                                "import json, os, sys, subprocess, re",
-                                "",
-                                "rg = subprocess.run(['azd', 'env', 'get-value', 'AZURE_RESOURCE_GROUP'],",
-                                "                    capture_output=True, text=True).stdout.strip()",
-                                "if not rg:",
-                                "    rg = subprocess.run(['az', 'group', 'list', '--query',",
-                                "                        \"[?starts_with(name,'rg-')].name | [0]\", '-o', 'tsv'],",
-                                "                       capture_output=True, text=True).stdout.strip()",
-                                "print(f'RG={rg}')",
-                                "",
-                                "cosmos_id = ''",
-                                "if rg:",
-                                "    out = subprocess.run(['az', 'cosmosdb', 'list', '-g', rg, '--query',",
-                                "                         \"[?!contains(name,'-aif-')].{name:name,id:id}\", '-o', 'json'],",
-                                "                        capture_output=True, text=True).stdout.strip()",
-                                "    try:",
-                                "        accounts = json.loads(out) if out else []",
-                                "    except Exception:",
-                                "        accounts = []",
-                                "    cosmos_id = accounts[0]['id'] if accounts else ''",
-                                "",
-                                "if cosmos_id:",
-                                "    # Reuse existing main cosmos for AI Foundry (skip cosmos-aif creation)",
-                                "    print(f'Found main cosmos: {cosmos_id}')",
-                                "    for p in ['main.parameters.json', 'infra/main.parameters.json']:",
-                                "        if not os.path.exists(p): continue",
-                                "        with open(p, 'r') as fh:",
-                                "            j = json.loads(fh.read())",
-                                "        params = j.get('parameters', {})",
-                                "        old = params.get('aiFoundryCosmosDBAccountResourceId', {}).get('value')",
-                                "        if old != cosmos_id:",
-                                "            params.setdefault('aiFoundryCosmosDBAccountResourceId', {})['value'] = cosmos_id",
-                                "            with open(p, 'w') as fh:",
-                                "                json.dump(j, fh, indent=2, ensure_ascii=False)",
-                                "                fh.write('\\n')",
-                                "            print(f'  {p}: aiFoundryCosmosDBAccountResourceId = {cosmos_id}')",
-                                "else:",
-                                "    print('No main cosmos found yet — cosmos-aif fix will run on next attempt')",
-                                "PYCOSMOS_AIF",
-                                "# 3. Belt-and-suspenders: also set the azd env vars.",
-                                "azd env set AZURE_COSMOS_LOCATION eastus2 || true",
-                                "# aiFoundryLocation left unchanged — sub-resources already exist in primary region",
+                                "# 3. Belt-and-suspenders: set azd env var for zone redundancy.",
                                 "azd env set USE_ZONE_REDUNDANCY false || true",
                                 "echo 'azd env after set:'",
-                                "azd env get-values 2>/dev/null | grep -E 'COSMOS_LOCATION|AI_FOUNDRY_LOCATION|ZONE_REDUNDANCY' || true",
-                                "# 4. Delete any cosmos accounts already in failed state in the current RG so the next provision starts clean.",
+                                "azd env get-values 2>/dev/null | grep -E 'COSMOS_LOCATION|ZONE_REDUNDANCY' || true",
+                                "# 4. Delete failed cosmos accounts in the RG so ARM doesn't see them.",
+                                "#    Derive RG from env name (pattern: rg-{AZURE_ENV_NAME}) since",
+                                "#    AZURE_RESOURCE_GROUP is not yet set.",
                                 "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
-                                "if [ -z \"$RG\" ]; then RG=$(az group list --query \"[?starts_with(name,'rg-')].name | [0]\" -o tsv); fi",
+                                "if [ -z \"$RG\" ]; then",
+                                "  ENV_NAME=$(azd env get-value AZURE_ENV_NAME 2>/dev/null)",
+                                "  if [ -n \"$ENV_NAME\" ]; then RG=\"rg-$ENV_NAME\"; fi",
+                                "fi",
                                 "echo \"RG=$RG\"",
                                 "if [ -n \"$RG\" ]; then",
                                 "  NAMES=$(az resource list -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --query \"[].name\" -o tsv 2>/dev/null)",
-                                "  for n in $NAMES; do",
-                                "    echo \"deleting cosmos $n in $RG\"",
-                                "    az resource delete -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" 2>&1 | tail -n 3 || true",
-                                "  done",
-                                "  for n in $NAMES; do",
-                                "    for try in $(seq 1 60); do",
-                                "      if ! az resource show -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" >/dev/null 2>&1; then",
-                                "        echo \"  $n deletion confirmed (try=$try)\"; break",
-                                "      fi",
-                                "      sleep 15",
+                                "  if [ -n \"$NAMES\" ]; then",
+                                "    echo \"Found cosmos accounts to delete: $NAMES\"",
+                                "    for n in $NAMES; do",
+                                "      echo \"deleting cosmos $n in $RG\"",
+                                "      az cosmosdb delete -g \"$RG\" -n \"$n\" --yes 2>&1 | tail -n 3 || true",
                                 "    done",
-                                "  done",
+                                "    # Wait for deletions to complete (ARM still sees them otherwise)",
+                                "    for n in $NAMES; do",
+                                "      for try in $(seq 1 40); do",
+                                "        if ! az cosmosdb show -g \"$RG\" -n \"$n\" >/dev/null 2>&1; then",
+                                "          echo \"  $n deletion confirmed (try=$try)\"; break",
+                                "        fi",
+                                "        sleep 15",
+                                "      done",
+                                "    done",
+                                "  else",
+                                "    echo 'No cosmos accounts found in RG — nothing to delete'",
+                                "  fi",
+                                "else",
+                                "  echo 'WARNING: could not determine RG name, skipping cosmos cleanup'",
                                 "fi",
                                 "echo 'AutoPatch:cosmos-region done'",
                                 ""
@@ -2583,26 +2547,22 @@ public sealed class DeploymentOrchestrator
                             var regionCmd =
                                 "bash -lc 'echo " + regionB64 + " | base64 -d | bash'";
                             previousAttempts.Add(
-                                "[AutoPatch:cosmos-region] Cosmos creation kept " +
-                                "failing with ServiceUnavailable for zonal redundant " +
-                                "accounts in East US. Rewrote main.parameters.json " +
-                                "to hardcode cosmosLocation='eastus2' AND " +
-                                "useZoneRedundancy from string 'false' to bool false; " +
-                                "also set the azd env vars (belt-and-suspenders) and " +
-                                "deleted any pre-existing failed cosmos accounts in " +
-                                "the RG so the next provision starts clean.");
+                                "[AutoPatch:cosmos-region] Cosmos creation failed " +
+                                "with ServiceUnavailable for zonal redundant " +
+                                "accounts. Disabled zone redundancy in " +
+                                "main.parameters.json (useZoneRedundancy=false) " +
+                                "and deleted pre-existing failed cosmos accounts " +
+                                "in the RG so the next provision retries cleanly " +
+                                "in the same region.");
                             await Log(s, "status",
-                                "Auto-patch [AutoPatch:cosmos-region]: persistent " +
-                                "Cosmos zonal-redundancy ServiceUnavailable in " +
-                                "eastus. Hardcoding cosmosLocation=eastus2, " +
-                                "useZoneRedundancy=false in both root and infra " +
-                                "main.parameters.json, " +
-                                "setting matching azd env vars, and deleting any " +
-                                "stale cosmos accounts in the RG before retrying.",
+                                "Auto-patch [AutoPatch:cosmos-region]: Cosmos " +
+                                "zonal-redundancy ServiceUnavailable. Disabling " +
+                                "zone redundancy (keeping same region) and deleting " +
+                                "failed cosmos accounts in the RG before retrying.",
                                 step.Id);
                             var regionStep = new DeploymentStep(
                                 step.Id,
-                                "AutoPatch: pin Cosmos to eastus2 + disable zone redundancy + cleanup stale accounts",
+                                "AutoPatch: disable zone redundancy + cleanup failed cosmos accounts",
                                 regionCmd,
                                 step.WorkingDirectory,
                                 TimeSpan.FromMinutes(20));
@@ -2640,9 +2600,10 @@ public sealed class DeploymentOrchestrator
                                 "rg = subprocess.run(['azd', 'env', 'get-value', 'AZURE_RESOURCE_GROUP'],",
                                 "                    capture_output=True, text=True).stdout.strip()",
                                 "if not rg:",
-                                "    rg = subprocess.run(['az', 'group', 'list', '--query',",
-                                "                        \"[?starts_with(name,'rg-')].name | [0]\", '-o', 'tsv'],",
-                                "                       capture_output=True, text=True).stdout.strip()",
+                                "    env_name = subprocess.run(['azd', 'env', 'get-value', 'AZURE_ENV_NAME'],",
+                                "                             capture_output=True, text=True).stdout.strip()",
+                                "    if env_name:",
+                                "        rg = f'rg-{env_name}'",
                                 "print(f'RG={rg}')",
                                 "",
                                 "cosmos_id = ''",
@@ -2675,7 +2636,10 @@ public sealed class DeploymentOrchestrator
                                 "PYAIF",
                                 "# Also delete cosmos-aif if in failed state",
                                 "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
-                                "if [ -z \"$RG\" ]; then RG=$(az group list --query \"[?starts_with(name,'rg-')].name | [0]\" -o tsv); fi",
+                                "if [ -z \"$RG\" ]; then",
+                                "  ENV_NAME=$(azd env get-value AZURE_ENV_NAME 2>/dev/null)",
+                                "  if [ -n \"$ENV_NAME\" ]; then RG=\"rg-$ENV_NAME\"; fi",
+                                "fi",
                                 "if [ -n \"$RG\" ]; then",
                                 "  AIF=$(az resource list -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --query \"[?contains(name,'-aif-')].name\" -o tsv 2>/dev/null)",
                                 "  for n in $AIF; do",
