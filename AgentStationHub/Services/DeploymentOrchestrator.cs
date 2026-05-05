@@ -1859,6 +1859,42 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // AutoPatch:azd-confirm — `azd init` prompts
+                        // "Continue initializing an app in <dir>? (y/N)"
+                        // and the plan's `yes |` is often misplaced
+                        // (before `export` instead of before `azd init`).
+                        // Fix: strip any misplaced `yes |` and re-inject
+                        // it directly before the `azd init` invocation.
+                        var azdConfirmDeclined =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("confirmation declined",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && (step.Command ?? "").Contains("azd init",
+                                                             StringComparison.OrdinalIgnoreCase)
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:azd-confirm]"));
+                        if (azdConfirmDeclined)
+                        {
+                            // Remove any misplaced `yes |` and inject it
+                            // immediately before `azd init`.
+                            var fixedCmd = (step.Command ?? "")
+                                .Replace("yes | ", "")
+                                .Replace("yes| ", "")
+                                .Replace("azd init", "yes | azd init");
+                            previousAttempts.Add(
+                                "[AutoPatch:azd-confirm] azd init confirmation " +
+                                "declined because 'yes |' was piping to the wrong " +
+                                "command. Fixed pipe position.");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:azd-confirm]: 'azd init' " +
+                                "declined confirmation. Repositioning 'yes |' to " +
+                                "pipe directly into azd init and retrying.",
+                                step.Id);
+                            steps[i] = step with { Command = fixedCmd };
+                            i--;
+                            continue;
+                        }
+
                         // AutoPatch:empty-rg — the Doctor generates
                         // commands that use `$RG=$(azd env get-value
                         // AZURE_RESOURCE_GROUP)` but that variable is
