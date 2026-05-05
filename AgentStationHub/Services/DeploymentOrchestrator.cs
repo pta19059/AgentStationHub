@@ -1895,7 +1895,52 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
-                        // AutoPatch:foundry-capability-host — Foundry
+                        // AutoPatch:gpt-rag-deploy-script — GPT-RAG no
+                        // longer ships scripts/deploy.sh (it was
+                        // refactored into preDeploy.sh + azd deploy
+                        // hooks). Plans generated against the older
+                        // README still try to invoke it. The correct
+                        // workflow is `azd deploy --no-prompt` which
+                        // runs preDeploy.sh (clones component repos)
+                        // and then deploys each service.
+                        var deployScriptMissing =
+                            !string.IsNullOrEmpty(stepTail)
+                            && (stepTail.Contains("scripts/deploy.sh",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || stepTail.Contains("deploy.sh: No such file",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || stepTail.Contains("deploy.sh not found",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || stepTail.Contains("parent deploy script",
+                                                  StringComparison.OrdinalIgnoreCase))
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:gpt-rag-deploy-script]"));
+                        if (deployScriptMissing)
+                        {
+                            var deployCmd =
+                                "bash -lc \"cd /workspace && azd deploy --no-prompt\"";
+                            previousAttempts.Add(
+                                "[AutoPatch:gpt-rag-deploy-script] scripts/deploy.sh " +
+                                "is no longer present in GPT-RAG (refactored into " +
+                                "preDeploy.sh + azd deploy hooks). Replaced step " +
+                                "with `azd deploy --no-prompt` which clones " +
+                                "component repos via preDeploy.sh and deploys all " +
+                                "services.");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:gpt-rag-deploy-script]: " +
+                                "scripts/deploy.sh missing — modern GPT-RAG uses " +
+                                "azd deploy hooks (preDeploy.sh clones component " +
+                                "repos automatically). Replacing step with " +
+                                "`azd deploy --no-prompt`.",
+                                step.Id);
+                            steps[i] = step with
+                            {
+                                Command = deployCmd,
+                                Description = "AutoPatch: deploy GPT-RAG components via 'azd deploy'"
+                            };
+                            i--;
+                            continue;
+                        }
                         // capability host (Microsoft.MachineLearningServices/
                         // workspaces/capabilityHosts) regularly fails with
                         // 400 BadRequest from agent-management API. From
