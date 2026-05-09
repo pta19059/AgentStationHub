@@ -112,7 +112,7 @@ public static class SandboxImageBuilder
     //             AI-assisted suggest/explain commands are available
     //             in sandbox shells. Auth is via GITHUB_TOKEN env var
     //             passed at container start (or `gh auth login`).
-    private const string LocalTag = "agentichub/sandbox:v40";
+    private const string LocalTag = "agentichub/sandbox:v41";
 
     // Azure Linux (Mariner)-based azure-cli is multi-arch and ships with bash
     // and curl. We install the system toolchain via tdnf (tar, git, python,
@@ -708,7 +708,18 @@ public static class SandboxImageBuilder
         "  done\n" +
         "fi\n" +
         "if [ $svc_count -eq 0 ]; then\n" +
-        "  echo \"[agentic-azd-up] 0 services parsed from $azfile — hooks-only repo detected, falling back to azd deploy\"\n" +
+        "  echo \"[agentic-azd-up] 0 services parsed from $azfile — hooks-only repo detected\"\n" +
+        "  # Phase A: run preDeploy.sh (if present) to clone component repos\n" +
+        "  predeploy=\"\"\n" +
+        "  for candidate in /workspace/scripts/preDeploy.sh /workspace/hooks/predeploy.sh /workspace/infra/hooks/predeploy.sh; do\n" +
+        "    if [ -f \"$candidate\" ]; then predeploy=\"$candidate\"; break; fi\n" +
+        "  done\n" +
+        "  if [ -n \"$predeploy\" ]; then\n" +
+        "    echo \"[agentic-azd-up] running preDeploy hook: $predeploy\"\n" +
+        "    chmod +x \"$predeploy\" 2>/dev/null || true\n" +
+        "    bash \"$predeploy\" 2>&1 || echo \"[agentic-azd-up] preDeploy exited $? (non-fatal, continuing)\"\n" +
+        "  fi\n" +
+        "  # Phase B: try azd deploy first (may work if hooks handle everything)\n" +
         "  echo \"[agentic-azd-up] running: azd deploy --no-prompt\"\n" +
         "  deploy_log=\"/tmp/azd-deploy-fallback.log\"\n" +
         "  if azd deploy --no-prompt 2>&1 | tee \"$deploy_log\"; then\n" +
@@ -716,7 +727,15 @@ public static class SandboxImageBuilder
         "    exit 0\n" +
         "  else\n" +
         "    deploy_rc=$?\n" +
-        "    echo \"[agentic-azd-up] azd deploy (hooks fallback) FAILED rc=$deploy_rc — last 60 lines:\" >&2\n" +
+        "    echo \"[agentic-azd-up] azd deploy (hooks fallback) FAILED rc=$deploy_rc\" >&2\n" +
+        "  fi\n" +
+        "  # Phase C: discovery-based deploy via az acr build (no Docker daemon needed)\n" +
+        "  echo \"[agentic-azd-up] falling back to agentic-azd-deploy (discovery-based)\"\n" +
+        "  if command -v agentic-azd-deploy >/dev/null 2>&1; then\n" +
+        "    agentic-azd-deploy\n" +
+        "    exit $?\n" +
+        "  else\n" +
+        "    echo \"[agentic-azd-up] agentic-azd-deploy not available — last 60 lines of azd deploy:\" >&2\n" +
         "    tail -n 60 \"$deploy_log\" >&2 || true\n" +
         "    echo \"[agentic-azd-up] === azure.yaml dump (first 200 lines) ===\" >&2\n" +
         "    head -n 200 \"$azfile\" >&2\n" +

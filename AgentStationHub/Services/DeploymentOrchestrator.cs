@@ -4773,8 +4773,15 @@ public sealed class DeploymentOrchestrator
                 "set -e; " +
                 "cd /workspace; " +
                 "echo '[recovery] azd env list:'; azd env list --output table 2>&1 || true; " +
+                // Phase 1: try preDeploy hook to clone component repos (GPT-RAG pattern)
+                "for h in scripts/preDeploy.sh hooks/predeploy.sh infra/hooks/predeploy.sh; do " +
+                "  if [ -f \"$h\" ]; then echo \"[recovery] running preDeploy hook: $h\"; chmod +x \"$h\" 2>/dev/null || true; bash \"$h\" 2>&1 || true; break; fi; " +
+                "done; " +
                 $"echo '[recovery] launching {azdSubcmd} --no-prompt'; " +
-                $"{azdSubcmd} --no-prompt";
+                $"if {azdSubcmd} --no-prompt; then exit 0; fi; " +
+                // Phase 2: if azd deploy failed, try discovery-based deploy (az acr build, no Docker daemon)
+                "echo '[recovery] azd deploy failed — trying agentic-azd-deploy (discovery-based)'; " +
+                "if command -v agentic-azd-deploy >/dev/null 2>&1; then agentic-azd-deploy; else exit 1; fi";
 
             var result = await docker.RunAsync(
                 recoveryCmd, ".",
