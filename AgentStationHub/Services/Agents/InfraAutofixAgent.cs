@@ -39,6 +39,9 @@ public sealed class InfraAutofixAgent
         var startedAt = DateTimeOffset.UtcNow;
         var checks = new List<AutofixCheck>();
 
+        // Ensure az CLI is logged in (service principal from env vars)
+        await EnsureAzLoginAsync(ct);
+
         _onLog("info", $"[Autofix] Starting full infrastructure review for RG '{resourceGroup}'");
 
         // Phase 1: Discover ALL resources in the RG
@@ -67,6 +70,41 @@ public sealed class InfraAutofixAgent
         return new AutofixReport(
             sessionId, resourceGroup, repoUrl,
             startedAt, completedAt, checks, summary);
+    }
+
+    // ─── Azure CLI Login ─────────────────────────────────────────────────
+
+    private async Task EnsureAzLoginAsync(CancellationToken ct)
+    {
+        // Quick check: is az already logged in?
+        var checkResult = await RunAzCommandAsync("az account show", ct);
+        if (checkResult.ExitCode == 0)
+            return;
+
+        var clientId = Environment.GetEnvironmentVariable("AZURE_CLIENT_ID");
+        var clientSecret = Environment.GetEnvironmentVariable("AZURE_CLIENT_SECRET");
+        var tenantId = Environment.GetEnvironmentVariable("AZURE_TENANT_ID");
+
+        if (string.IsNullOrEmpty(clientId) || string.IsNullOrEmpty(clientSecret) || string.IsNullOrEmpty(tenantId))
+        {
+            _log.LogWarning("No AZURE_CLIENT_ID/SECRET/TENANT_ID env vars; az CLI login skipped.");
+            _onLog("warn", "[Autofix] No Azure service principal env vars found; resource discovery may fail.");
+            return;
+        }
+
+        var stdout = new StringBuilder();
+        var result = await Cli.Wrap("az")
+            .WithArguments(new[] { "login", "--service-principal",
+                "-u", clientId, "-p", clientSecret, "--tenant", tenantId })
+            .WithValidation(CommandResultValidation.None)
+            .WithStandardOutputPipe(PipeTarget.ToStringBuilder(stdout))
+            .WithStandardErrorPipe(PipeTarget.Null)
+            .ExecuteAsync(ct);
+
+        if (result.ExitCode == 0)
+            _log.LogInformation("InfraAutofix: az login succeeded via service principal.");
+        else
+            _log.LogWarning("InfraAutofix: az login failed (exit {Code}). Resource discovery may fail.", result.ExitCode);
     }
 
     // ─── Resource Discovery ───────────────────────────────────────────────
