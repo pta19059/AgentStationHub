@@ -39,8 +39,10 @@ public sealed class InfraAutofixAgent
         var startedAt = DateTimeOffset.UtcNow;
         var checks = new List<AutofixCheck>();
 
-        // Ensure az CLI is logged in (service principal from env vars)
-        await EnsureAzLoginAsync(ct);
+        // Ensure az CLI can see the target RG. Prefer the host's az login
+        // (mounted at ~/.azure); fall back to the SP env vars only if the
+        // host login does NOT have visibility into the target RG.
+        await EnsureAzLoginAsync(resourceGroup, ct);
 
         _onLog("info", $"[Autofix] Starting full infrastructure review for RG '{resourceGroup}'");
 
@@ -74,52 +76,94 @@ public sealed class InfraAutofixAgent
 
     // ─── Azure CLI Login ─────────────────────────────────────────────────
 
-    private async Task EnsureAzLoginAsync(CancellationToken ct)
+    private async Task EnsureAzLoginAsync(string targetRg, CancellationToken ct)
     {
-        var clientId = Environment.GetEnvironmentVariable("AZURE_CLIENT_ID");
-        var clientSecret = Environment.GetEnvironmentVariable("AZURE_CLIENT_SECRET");
-        var tenantId = Environment.GetEnvironmentVariable("AZURE_TENANT_ID");
-
-        // When service principal env vars are present, ALWAYS login with
-        // them. The container inherits the host's ~/.azure profile which
-        // may be stale/expired or targeting a different subscription;
-        // `az account show` returns exit 0 on cached profiles even when
-        // the token is expired, so the old "exit 0 → return" shortcut
-        // silently left the CLI in a state where `az resource list`
-        // returned empty results.
-        if (!string.IsNullOrEmpty(clientId) && !string.IsNullOrEmpty(clientSecret) && !string.IsNullOrEmpty(tenantId))
+        // Strategy:
+        //   1. Try the host's az login (mounted ~/.azure inside the
+        //      container). The orchestrator already deployed against
+        //      this profile, so if the deploy succeeded the host login
+        //      sees the RG.
+        //   2. Only fall back to SP env vars if the host login canNOT
+        //      see the RG. The SP may have narrower subscription access
+        //      than the user account, and unconditionally replacing the
+        //      host login with the SP broke discovery (Autofix found 0
+        //      resources in RGs the user had just deployed to).
+        //   3. After SP login, explicitly select AZURE_SUBSCRIPTION_ID
+        //      because `az login --service-principal` picks the SP's
+        //      first reachable subscription which may not be the one
+        //      the deployment used.
+        if (await CanSeeRgAsync(targetRg, ct))
         {
-            var stdout = new StringBuilder();
-            var stderr = new StringBuilder();
-            var result = await Cli.Wrap("az")
-                .WithArguments(new[] { "login", "--service-principal",
-                    "-u", clientId, "-p", clientSecret, "--tenant", tenantId })
-                .WithValidation(CommandResultValidation.None)
-                .WithStandardOutputPipe(PipeTarget.ToStringBuilder(stdout))
-                .WithStandardErrorPipe(PipeTarget.ToStringBuilder(stderr))
-                .ExecuteAsync(ct);
-
-            if (result.ExitCode == 0)
-            {
-                _log.LogInformation("InfraAutofix: az login succeeded via service principal.");
-                _onLog("info", "[Autofix] Logged in via service principal.");
-            }
-            else
-            {
-                _log.LogWarning("InfraAutofix: az login failed (exit {Code}): {Err}",
-                    result.ExitCode, stderr.ToString().Trim());
-                _onLog("warn", $"[Autofix] az login failed (exit {result.ExitCode}): {stderr.ToString().Trim()[..Math.Min(200, stderr.Length)]}");
-            }
+            _log.LogInformation("InfraAutofix: host az login already sees RG '{Rg}'.", targetRg);
+            _onLog("info", $"[Autofix] Using host az login (RG '{targetRg}' visible).");
             return;
         }
 
-        // No SP env vars — fall back to checking if az is already logged in
-        var checkResult = await RunAzCommandAsync("az account show", ct);
-        if (checkResult.ExitCode == 0)
-            return;
+        var clientId = Environment.GetEnvironmentVariable("AZURE_CLIENT_ID");
+        var clientSecret = Environment.GetEnvironmentVariable("AZURE_CLIENT_SECRET");
+        var tenantId = Environment.GetEnvironmentVariable("AZURE_TENANT_ID");
+        var subId = Environment.GetEnvironmentVariable("AZURE_SUBSCRIPTION_ID");
 
-        _log.LogWarning("No AZURE_CLIENT_ID/SECRET/TENANT_ID env vars and az not logged in; resource discovery will likely fail.");
-        _onLog("warn", "[Autofix] No Azure service principal env vars found and az CLI not logged in; resource discovery may fail.");
+        if (string.IsNullOrEmpty(clientId) || string.IsNullOrEmpty(clientSecret) || string.IsNullOrEmpty(tenantId))
+        {
+            _log.LogWarning("InfraAutofix: host az login can't see RG '{Rg}' and no SP env vars; discovery will likely fail.", targetRg);
+            _onLog("warn", $"[Autofix] az CLI cannot see RG '{targetRg}' and no service principal env vars present.");
+            return;
+        }
+
+        var stderr = new StringBuilder();
+        var loginResult = await Cli.Wrap("az")
+            .WithArguments(new[] { "login", "--service-principal",
+                "-u", clientId, "-p", clientSecret, "--tenant", tenantId })
+            .WithValidation(CommandResultValidation.None)
+            .WithStandardOutputPipe(PipeTarget.Null)
+            .WithStandardErrorPipe(PipeTarget.ToStringBuilder(stderr))
+            .ExecuteAsync(ct);
+
+        if (loginResult.ExitCode != 0)
+        {
+            var errMsg = stderr.ToString().Trim();
+            if (errMsg.Length > 200) errMsg = errMsg[..200];
+            _log.LogWarning("InfraAutofix: SP login failed (exit {Code}): {Err}", loginResult.ExitCode, errMsg);
+            _onLog("warn", $"[Autofix] SP login failed (exit {loginResult.ExitCode}): {errMsg}");
+            return;
+        }
+
+        // Pin the active subscription if we know which one the deploy
+        // used. The SP may have multiple subs; without this, `az` may
+        // default to a sub that doesn't contain the target RG.
+        if (!string.IsNullOrEmpty(subId))
+        {
+            await Cli.Wrap("az")
+                .WithArguments(new[] { "account", "set", "--subscription", subId })
+                .WithValidation(CommandResultValidation.None)
+                .WithStandardOutputPipe(PipeTarget.Null)
+                .WithStandardErrorPipe(PipeTarget.Null)
+                .ExecuteAsync(ct);
+        }
+
+        if (await CanSeeRgAsync(targetRg, ct))
+        {
+            _log.LogInformation("InfraAutofix: SP login + subscription set; RG '{Rg}' visible.", targetRg);
+            _onLog("info", $"[Autofix] Logged in via service principal (RG '{targetRg}' visible).");
+        }
+        else
+        {
+            _log.LogWarning("InfraAutofix: SP logged in but RG '{Rg}' still not visible (likely missing role assignment).", targetRg);
+            _onLog("warn", $"[Autofix] SP authenticated but cannot see RG '{targetRg}' — check the SP's role assignment on subscription '{subId}'.");
+        }
+    }
+
+    private async Task<bool> CanSeeRgAsync(string rg, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(rg)) return false;
+        var result = await Cli.Wrap("az")
+            .WithArguments(new[] { "group", "show", "-n", rg, "--query", "name", "-o", "tsv" })
+            .WithValidation(CommandResultValidation.None)
+            .WithStandardOutputPipe(PipeTarget.Null)
+            .WithStandardErrorPipe(PipeTarget.Null)
+            .ExecuteAsync(ct);
+        return result.ExitCode == 0;
     }
 
     // ─── Resource Discovery ───────────────────────────────────────────────

@@ -2419,6 +2419,108 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // [AutoPatch:acr-firewall] — `az acr build`
+                        // (and any `docker push`) fails when the ACR
+                        // has `publicNetworkAccess=Disabled` and the
+                        // ARM-managed build agent's public IP is not
+                        // in the firewall allow-list. Symptom:
+                        //   "denied: client with IP 'X.X.X.X' is not
+                        //    allowed access. Refer https://aka.ms/
+                        //    acr/firewall to grant access."
+                        // The Doctor consistently hits this with
+                        // GPT-RAG (NETWORK_ISOLATION=true creates a
+                        // private-endpoint-only ACR), then "fixes" it
+                        // by running `az acr update` against a STALE
+                        // ACR from a previous RG (because the Doctor
+                        // resolves ACR via `az acr list` without
+                        // pinning the RG, or with an empty RG, so the
+                        // first match in the subscription wins —
+                        // which is rarely the current deployment's
+                        // ACR). Make this deterministic: resolve the
+                        // CURRENT deployment's RG via azd env, list
+                        // ACRs in THAT RG only, and flip
+                        // publicNetworkAccess=true + defaultAction=
+                        // Allow on each. Fire up to 3 times because
+                        // ARM propagation can take a minute and a
+                        // subsequent step may still see the cached
+                        // 403.
+                        var acrFirewallBlocked =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("acr/firewall",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && (stepTail.Contains("not allowed access",
+                                                  StringComparison.OrdinalIgnoreCase)
+                                || stepTail.Contains("denied: client with IP",
+                                                  StringComparison.OrdinalIgnoreCase));
+                        var acrFirewallCount = previousAttempts.Count(a =>
+                            a.Contains("[AutoPatch:acr-firewall]"));
+                        if (acrFirewallBlocked && acrFirewallCount < 3)
+                        {
+                            var acrFwScript = string.Join("\n", new[]
+                            {
+                                "set +e",
+                                "echo 'AutoPatch:acr-firewall starting'",
+                                "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
+                                "if [ -z \"$RG\" ]; then",
+                                "  ENV_NAME=$(azd env get-value AZURE_ENV_NAME 2>/dev/null)",
+                                "  if [ -n \"$ENV_NAME\" ]; then RG=\"rg-$ENV_NAME\"; fi",
+                                "fi",
+                                "echo \"AutoPatch:acr-firewall RG=$RG\"",
+                                "if [ -z \"$RG\" ]; then echo 'no RG resolved; aborting'; exit 0; fi",
+                                "# Pin the registry list to the CURRENT deployment's RG.",
+                                "# Without -g, the Doctor would pick the first ACR in the",
+                                "# subscription which is typically a stale one from a previous",
+                                "# session and the update would be a no-op.",
+                                "ACRS=$(az acr list -g \"$RG\" --query '[].name' -o tsv 2>/dev/null)",
+                                "if [ -z \"$ACRS\" ]; then",
+                                "  echo \"no ACRs found in $RG; AutoPatch is a no-op\"",
+                                "  exit 0",
+                                "fi",
+                                "for ACR in $ACRS; do",
+                                "  echo \"opening ACR firewall on $ACR (RG=$RG): publicNetworkAccess=Enabled defaultAction=Allow\"",
+                                "  az acr update -g \"$RG\" -n \"$ACR\" --public-network-enabled true --default-action Allow 2>&1 | tail -n 5 || true",
+                                "  # Some ACRs require an explicit network-rule update too (Premium SKU).",
+                                "  az acr network-rule list -g \"$RG\" -n \"$ACR\" -o json 2>/dev/null | head -n 5 || true",
+                                "done",
+                                "# Give ARM ~30s to propagate the firewall change before",
+                                "# the next step retries the push/build.",
+                                "echo 'sleeping 30s for ARM propagation'",
+                                "sleep 30",
+                                "echo 'AutoPatch:acr-firewall done'",
+                                ""
+                            });
+                            var acrFwB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(acrFwScript));
+                            var acrFwCmd =
+                                "bash -lc 'echo " + acrFwB64 + " | base64 -d | bash'";
+                            previousAttempts.Add(
+                                "[AutoPatch:acr-firewall] ACR build agent IP " +
+                                "blocked by registry firewall. Resolved current RG " +
+                                "via azd env, listed ACRs in THAT RG (not blindly " +
+                                "via subscription), and set publicNetworkAccess=" +
+                                "Enabled + defaultAction=Allow on each. Slept 30s " +
+                                "for ARM propagation. " +
+                                $"(attempt {acrFirewallCount + 1}/3).");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:acr-firewall]: ACR build " +
+                                "blocked by registry firewall ('client with IP X is " +
+                                "not allowed access'). Resolving current RG and " +
+                                "opening publicNetworkAccess on every ACR in it " +
+                                "(the Doctor was updating a stale ACR from a " +
+                                "previous deployment because `az acr list` without " +
+                                $"-g returns the first sub-wide match). attempt {acrFirewallCount + 1}/3.",
+                                step.Id);
+                            var acrFwStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: open ACR firewall on the current RG (publicNetworkAccess + defaultAction=Allow)",
+                                acrFwCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(5));
+                            steps.Insert(i, acrFwStep);
+                            i--;
+                            continue;
+                        }
+
                         // 8.7.x: [AutoPatch:azd-remote-build] — when azd
                         // deploy fails because the buildpacks `pack` CLI
                         // bundled in the sandbox image is too old to
