@@ -1593,6 +1593,89 @@ public sealed class DeploymentOrchestrator
                             $"(attempt #{previousAttempts.Count + 1})...",
                             step.Id);
 
+                        // [AutoPatch:bash-quoting] — when the Doctor
+                        // emits a `bash -lc "<inner>"` whose <inner>
+                        // contains `$(...)` AND escaped `\"...\"` AND
+                        // single-quote literals like 'aif-', the auth
+                        // pre-warm prefix prepended by DockerShellTool
+                        // turns the command into a single string that
+                        // the OUTER bash must parse. Inside the outer
+                        // double-quoted block, $() command substitution
+                        // expands at the OUTER level, and the nested
+                        // \"...\" + 'literal' combination produces a
+                        // parse error like:
+                        //   bash: -c: line 1: syntax error near
+                        //   unexpected token '('
+                        // We rescue ANY such step by extracting the
+                        // inner command, base64-encoding it, and
+                        // re-emitting:
+                        //   bash -lc 'echo <b64> | base64 -d | bash'
+                        // The single-quoted base64 string is opaque
+                        // to every bash parser layer, so the auth
+                        // pre-warm + outer wrapping no longer interact
+                        // with the Doctor's nested quotes. This is the
+                        // same technique the cosmos-failed-state and
+                        // foundry-capability-host AutoPatches use.
+                        var bashQuotingFailed =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("syntax error near unexpected token",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && !string.IsNullOrEmpty(step.Command)
+                            && step.Command!.Contains("bash -lc \"",
+                                                      StringComparison.Ordinal)
+                            && !previousAttempts.Any(a =>
+                                a.Contains($"[AutoPatch:bash-quoting:{step.Id}]"));
+                        if (bashQuotingFailed)
+                        {
+                            // Extract the inner command. The Doctor's
+                            // output is `bash -lc "<inner>"` where the
+                            // closing `"` is the LAST `"` in the cmd
+                            // (Doctor never appends trailing args after
+                            // the closing quote). We grab everything
+                            // between the first `bash -lc "` and the
+                            // last `"`, then unescape `\"` -> `"`.
+                            var raw = step.Command!;
+                            var openIdx = raw.IndexOf("bash -lc \"", StringComparison.Ordinal);
+                            var closeIdx = raw.LastIndexOf('"');
+                            string inner;
+                            if (openIdx >= 0 && closeIdx > openIdx + 10)
+                            {
+                                var start = openIdx + "bash -lc \"".Length;
+                                inner = raw.Substring(start, closeIdx - start);
+                                // Reverse the escaping the Doctor put in
+                                // to make `"` survive the outer "...".
+                                inner = inner.Replace("\\\"", "\"");
+                            }
+                            else
+                            {
+                                // Fallback: if we cannot safely extract,
+                                // wrap the whole original command verbatim.
+                                inner = raw;
+                            }
+                            var b64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(inner));
+                            var rescued =
+                                "bash -lc 'echo " + b64 + " | base64 -d | bash'";
+                            previousAttempts.Add(
+                                $"[AutoPatch:bash-quoting:{step.Id}] step {step.Id} " +
+                                "produced 'syntax error near unexpected token' from " +
+                                "outer bash because the Doctor's nested `bash -lc " +
+                                "\"...$(...)...\\\"...\\\"...\"` mixed with the auth " +
+                                "pre-warm prefix triggered double-quote $-expansion " +
+                                "at the outer level. Re-encoded inner as base64 and " +
+                                "wrapped in `bash -lc 'echo <b64> | base64 -d | " +
+                                "bash'` so no shell layer touches the inner quotes.");
+                            await Log(s, "status",
+                                $"Auto-patch [AutoPatch:bash-quoting]: step {step.Id} " +
+                                "tripped bash's outer parser on nested quoting. " +
+                                "Re-encoding the inner command as base64 to make it " +
+                                "opaque to every wrapper layer.",
+                                step.Id);
+                            steps[i] = step with { Command = rescued };
+                            i--;
+                            continue;
+                        }
+
                         // Pre-Doctor deterministic patch: 'azd init -t
                         // <template>' refuses to overwrite a non-empty
                         // working dir and aborts with exit 1 + the prompt
