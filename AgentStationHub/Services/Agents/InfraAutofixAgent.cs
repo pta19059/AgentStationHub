@@ -76,35 +76,50 @@ public sealed class InfraAutofixAgent
 
     private async Task EnsureAzLoginAsync(CancellationToken ct)
     {
-        // Quick check: is az already logged in?
-        var checkResult = await RunAzCommandAsync("az account show", ct);
-        if (checkResult.ExitCode == 0)
-            return;
-
         var clientId = Environment.GetEnvironmentVariable("AZURE_CLIENT_ID");
         var clientSecret = Environment.GetEnvironmentVariable("AZURE_CLIENT_SECRET");
         var tenantId = Environment.GetEnvironmentVariable("AZURE_TENANT_ID");
 
-        if (string.IsNullOrEmpty(clientId) || string.IsNullOrEmpty(clientSecret) || string.IsNullOrEmpty(tenantId))
+        // When service principal env vars are present, ALWAYS login with
+        // them. The container inherits the host's ~/.azure profile which
+        // may be stale/expired or targeting a different subscription;
+        // `az account show` returns exit 0 on cached profiles even when
+        // the token is expired, so the old "exit 0 → return" shortcut
+        // silently left the CLI in a state where `az resource list`
+        // returned empty results.
+        if (!string.IsNullOrEmpty(clientId) && !string.IsNullOrEmpty(clientSecret) && !string.IsNullOrEmpty(tenantId))
         {
-            _log.LogWarning("No AZURE_CLIENT_ID/SECRET/TENANT_ID env vars; az CLI login skipped.");
-            _onLog("warn", "[Autofix] No Azure service principal env vars found; resource discovery may fail.");
+            var stdout = new StringBuilder();
+            var stderr = new StringBuilder();
+            var result = await Cli.Wrap("az")
+                .WithArguments(new[] { "login", "--service-principal",
+                    "-u", clientId, "-p", clientSecret, "--tenant", tenantId })
+                .WithValidation(CommandResultValidation.None)
+                .WithStandardOutputPipe(PipeTarget.ToStringBuilder(stdout))
+                .WithStandardErrorPipe(PipeTarget.ToStringBuilder(stderr))
+                .ExecuteAsync(ct);
+
+            if (result.ExitCode == 0)
+            {
+                _log.LogInformation("InfraAutofix: az login succeeded via service principal.");
+                _onLog("info", "[Autofix] Logged in via service principal.");
+            }
+            else
+            {
+                _log.LogWarning("InfraAutofix: az login failed (exit {Code}): {Err}",
+                    result.ExitCode, stderr.ToString().Trim());
+                _onLog("warn", $"[Autofix] az login failed (exit {result.ExitCode}): {stderr.ToString().Trim()[..Math.Min(200, stderr.Length)]}");
+            }
             return;
         }
 
-        var stdout = new StringBuilder();
-        var result = await Cli.Wrap("az")
-            .WithArguments(new[] { "login", "--service-principal",
-                "-u", clientId, "-p", clientSecret, "--tenant", tenantId })
-            .WithValidation(CommandResultValidation.None)
-            .WithStandardOutputPipe(PipeTarget.ToStringBuilder(stdout))
-            .WithStandardErrorPipe(PipeTarget.Null)
-            .ExecuteAsync(ct);
+        // No SP env vars — fall back to checking if az is already logged in
+        var checkResult = await RunAzCommandAsync("az account show", ct);
+        if (checkResult.ExitCode == 0)
+            return;
 
-        if (result.ExitCode == 0)
-            _log.LogInformation("InfraAutofix: az login succeeded via service principal.");
-        else
-            _log.LogWarning("InfraAutofix: az login failed (exit {Code}). Resource discovery may fail.", result.ExitCode);
+        _log.LogWarning("No AZURE_CLIENT_ID/SECRET/TENANT_ID env vars and az not logged in; resource discovery will likely fail.");
+        _onLog("warn", "[Autofix] No Azure service principal env vars found and az CLI not logged in; resource discovery may fail.");
     }
 
     // ─── Resource Discovery ───────────────────────────────────────────────
