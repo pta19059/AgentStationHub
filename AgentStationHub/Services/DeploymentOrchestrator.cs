@@ -2296,6 +2296,15 @@ public sealed class DeploymentOrchestrator
                         // would burn the single-fire token of the
                         // zonal/stuck patch on a palliative cleanup
                         // before the real fix has had a chance to run.
+                        // Also yield to [AutoPatch:cosmos-region-pivot]
+                        // when cosmos-region already fired (zone-redundancy
+                        // disable was insufficient): the pivot patch
+                        // changes the cosmos region (eastus2/centralus)
+                        // and re-deletes failed accounts. Without this
+                        // second-level yield, cosmos-failed-state fires
+                        // up to 5 times and never pivots region —
+                        // exactly the loop we hit on the 20260510-1454
+                        // session that ended in a hollow deploy.
                         var cosmosRegionWillFireFirst =
                             !string.IsNullOrEmpty(stepTail)
                             && stepTail.Contains("zonal redundant",
@@ -2306,6 +2315,14 @@ public sealed class DeploymentOrchestrator
                                                   StringComparison.OrdinalIgnoreCase))
                             && !previousAttempts.Any(a =>
                                 a.Contains("[AutoPatch:cosmos-region]"));
+                        var cosmosRegionPivotWillFireFirst =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("zonal redundant",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:cosmos-region]"))
+                            && previousAttempts.Count(a =>
+                                a.Contains("[AutoPatch:cosmos-region-pivot]")) < 2;
                         // cosmos-stuck cleanup is IDEMPOTENT (delete +
                         // wait + no-op when nothing matches) and we have
                         // observed cases where Bicep re-creates accounts
@@ -2319,6 +2336,7 @@ public sealed class DeploymentOrchestrator
                         // idempotent so extra firings are safe.
                         var cosmosFailedState =
                             !cosmosRegionWillFireFirst
+                            && !cosmosRegionPivotWillFireFirst
                             && ((cosmosStuck && cosmosStuckCount < 5)
                                 || (cosmosZonal && !cosmosZonalAlready));
                         if (cosmosFailedState)
@@ -3058,6 +3076,153 @@ public sealed class DeploymentOrchestrator
                                 step.WorkingDirectory,
                                 TimeSpan.FromMinutes(20));
                             steps.Insert(i, regionStep);
+                            i--;
+                            continue;
+                        }
+
+                        // [AutoPatch:cosmos-region-pivot] — when
+                        // cosmos-region already fired (disabled zone
+                        // redundancy + deleted accounts) but the SAME
+                        // zonal-redundant ServiceUnavailable comes back,
+                        // it means GPT-RAG's Bicep template ignores the
+                        // `useZoneRedundancy` parameter for Cosmos (the
+                        // module hardcodes `availabilityZones`/`zones`)
+                        // and the only escape is to PIVOT the cosmos
+                        // location to a different region. East US 2 is
+                        // the closest paired region without the current
+                        // capacity issue. We:
+                        //   - delete every cosmos in the current RG so
+                        //     the next provision starts clean (avoids
+                        //     "InvalidResourceLocation" from a lingering
+                        //     account in the original region)
+                        //   - set AZURE_COSMOS_LOCATION=eastus2 in azd env
+                        //   - rewrite cosmosLocation in main.parameters.json
+                        //     (root + infra/) to "eastus2"
+                        //   - retry azd provision
+                        // Up to 2 firings (eastus2 → centralus fallback).
+                        var cosmosRegionPivot =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("zonal redundant",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:cosmos-region]"));
+                        var cosmosRegionPivotCount = previousAttempts.Count(a =>
+                            a.Contains("[AutoPatch:cosmos-region-pivot]"));
+                        if (cosmosRegionPivot && cosmosRegionPivotCount < 2)
+                        {
+                            // First firing: eastus2. Second: centralus.
+                            var newRegion = cosmosRegionPivotCount == 0
+                                ? "eastus2"
+                                : "centralus";
+                            var pivotScript = string.Join("\n", new[]
+                            {
+                                "set +e",
+                                "echo 'AutoPatch:cosmos-region-pivot starting'",
+                                "cd /workspace 2>/dev/null || true",
+                                "TARGET_REGION=" + newRegion,
+                                "echo \"target cosmos region: $TARGET_REGION\"",
+                                "# 1. Delete every cosmos account in the current RG so the next",
+                                "#    provision is not blocked by 'InvalidResourceLocation' (account",
+                                "#    exists in original region but Bicep wants new region).",
+                                "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
+                                "if [ -z \"$RG\" ]; then",
+                                "  ENV_NAME=$(azd env get-value AZURE_ENV_NAME 2>/dev/null)",
+                                "  if [ -n \"$ENV_NAME\" ]; then RG=\"rg-$ENV_NAME\"; fi",
+                                "fi",
+                                "echo \"RG=$RG\"",
+                                "if [ -n \"$RG\" ]; then",
+                                "  NAMES=$(az resource list -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --query \"[].name\" -o tsv 2>/dev/null)",
+                                "  for n in $NAMES; do",
+                                "    echo \"deleting cosmos $n in $RG (was zonal-failed in original region)\"",
+                                "    az resource delete -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" 2>&1 | tail -n 3 || true",
+                                "  done",
+                                "  for n in $NAMES; do",
+                                "    for try in $(seq 1 40); do",
+                                "      if ! az cosmosdb show -g \"$RG\" -n \"$n\" >/dev/null 2>&1 \\",
+                                "         && ! az resource show -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" >/dev/null 2>&1; then",
+                                "        echo \"  $n deletion confirmed (try=$try)\"; break",
+                                "      fi",
+                                "      sleep 15",
+                                "    done",
+                                "  done",
+                                "fi",
+                                "# 2. Pivot AZURE_COSMOS_LOCATION in azd env.",
+                                "azd env set AZURE_COSMOS_LOCATION \"$TARGET_REGION\" || true",
+                                "# 3. Rewrite cosmosLocation in main.parameters.json (root + infra/).",
+                                "python3 - <<PYPIVOT",
+                                "import json, os, sys",
+                                "target = os.environ.get('TARGET_REGION', 'eastus2')",
+                                "files = ['main.parameters.json', 'infra/main.parameters.json']",
+                                "for p in files:",
+                                "    if not os.path.exists(p):",
+                                "        continue",
+                                "    print(f'patching: {p}')",
+                                "    try:",
+                                "        with open(p, 'r', encoding='utf-8') as f:",
+                                "            j = json.load(f)",
+                                "    except Exception as e:",
+                                "        print(f'  WARN: cannot parse {p}: {e}'); continue",
+                                "    params = j.get('parameters', {})",
+                                "    changed = False",
+                                "    if 'cosmosLocation' in params:",
+                                "        old = params['cosmosLocation'].get('value')",
+                                "        params['cosmosLocation']['value'] = target",
+                                "        changed = True",
+                                "        print(f'  cosmosLocation: {old} -> {target}')",
+                                "    else:",
+                                "        params['cosmosLocation'] = {'value': target}",
+                                "        changed = True",
+                                "        print(f'  cosmosLocation: (added) -> {target}')",
+                                "    # Belt: also force useZoneRedundancy=False (paired region may also reject zonal).",
+                                "    if 'useZoneRedundancy' in params:",
+                                "        params['useZoneRedundancy']['value'] = False",
+                                "    else:",
+                                "        params['useZoneRedundancy'] = {'value': False}",
+                                "    if changed:",
+                                "        j['parameters'] = params",
+                                "        with open(p, 'w', encoding='utf-8') as f:",
+                                "            json.dump(j, f, indent=2, ensure_ascii=False)",
+                                "            f.write('\\n')",
+                                "        print(f'  rewrote {p}')",
+                                "PYPIVOT",
+                                "echo 'azd env after pivot:'",
+                                "azd env get-values 2>/dev/null | grep -E 'COSMOS_LOCATION|ZONE_REDUNDANCY' || true",
+                                "echo 'AutoPatch:cosmos-region-pivot done'",
+                                ""
+                            });
+                            // Inject TARGET_REGION via a bash export prefix so",
+                            // the heredoc python sees it.
+                            var pivotScriptWithEnv =
+                                "export TARGET_REGION=" + newRegion + "\n" + pivotScript;
+                            var pivotB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(pivotScriptWithEnv));
+                            var pivotCmd =
+                                "bash -lc 'echo " + pivotB64 + " | base64 -d | bash'";
+                            previousAttempts.Add(
+                                $"[AutoPatch:cosmos-region-pivot] cosmos-region " +
+                                "already fired but the same zonal-redundant " +
+                                "ServiceUnavailable came back — GPT-RAG's Bicep " +
+                                "is hardcoded to use availability zones for Cosmos " +
+                                "regardless of useZoneRedundancy. Pivoting Cosmos " +
+                                $"location to '{newRegion}' and deleting failed " +
+                                "accounts in the current RG before retry. " +
+                                $"(attempt {cosmosRegionPivotCount + 1}/2).");
+                            await Log(s, "status",
+                                $"Auto-patch [AutoPatch:cosmos-region-pivot]: " +
+                                "cosmos-region already disabled zone redundancy " +
+                                "but the SAME zonal-redundant error reappeared. " +
+                                "GPT-RAG's Bicep ignores useZoneRedundancy for " +
+                                $"Cosmos. Pivoting cosmosLocation to '{newRegion}' " +
+                                "(deleting failed accounts in original region " +
+                                $"first). attempt {cosmosRegionPivotCount + 1}/2.",
+                                step.Id);
+                            var pivotStep = new DeploymentStep(
+                                step.Id,
+                                $"AutoPatch: pivot Cosmos location to {newRegion} + cleanup",
+                                pivotCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(20));
+                            steps.Insert(i, pivotStep);
                             i--;
                             continue;
                         }
