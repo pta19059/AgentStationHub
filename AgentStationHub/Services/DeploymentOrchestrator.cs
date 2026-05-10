@@ -2226,6 +2226,186 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // [AutoPatch:cosmos-analytical-storage] —
+                        // "Enabling Analytical Storage during account
+                        // creation is no longer supported." Azure
+                        // deprecated this feature and now rejects new
+                        // cosmos accounts that ask for analytical
+                        // storage at creation time. GPT-RAG's Bicep
+                        // (and AVM modules) sets enableAnalyticalStorage
+                        // = true unconditionally. We:
+                        //   - delete any failed cosmos accounts in the RG
+                        //   - sed/python-rewrite all *.bicep files to
+                        //     change `enableAnalyticalStorage: true` →
+                        //     `enableAnalyticalStorage: false`
+                        //   - delete any analyticalStorageConfiguration
+                        //     blocks (they contain schemaType which is
+                        //     also rejected when analytical storage is
+                        //     disabled)
+                        //   - set enableAnalyticalStorage=false in
+                        //     main.parameters.json as belt-and-suspenders
+                        // Up to 2 firings (rare second-pass cleanup).
+                        var cosmosAnalytical =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("Enabling Analytical Storage",
+                                                 StringComparison.OrdinalIgnoreCase);
+                        var cosmosAnalyticalCount = previousAttempts.Count(a =>
+                            a.Contains("[AutoPatch:cosmos-analytical-storage]"));
+                        if (cosmosAnalytical && cosmosAnalyticalCount < 2)
+                        {
+                            var analyticalScript = string.Join("\n", new[]
+                            {
+                                "set +e",
+                                "echo 'AutoPatch:cosmos-analytical-storage starting'",
+                                "cd /workspace 2>/dev/null || true",
+                                "# 1. Delete any failed cosmos accounts in the RG so the",
+                                "#    next provision is not blocked by 'failed provisioning state'.",
+                                "RG=$(azd env get-value AZURE_RESOURCE_GROUP 2>/dev/null)",
+                                "if [ -z \"$RG\" ]; then",
+                                "  ENV_NAME=$(azd env get-value AZURE_ENV_NAME 2>/dev/null)",
+                                "  if [ -n \"$ENV_NAME\" ]; then RG=\"rg-$ENV_NAME\"; fi",
+                                "fi",
+                                "echo \"RG=$RG\"",
+                                "if [ -n \"$RG\" ]; then",
+                                "  NAMES=$(az resource list -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --query \"[].name\" -o tsv 2>/dev/null)",
+                                "  for n in $NAMES; do",
+                                "    echo \"deleting failed cosmos $n in $RG\"",
+                                "    az resource delete -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" 2>&1 | tail -n 3 || true",
+                                "  done",
+                                "  for n in $NAMES; do",
+                                "    for try in $(seq 1 40); do",
+                                "      if ! az cosmosdb show -g \"$RG\" -n \"$n\" >/dev/null 2>&1 \\",
+                                "         && ! az resource show -g \"$RG\" --resource-type Microsoft.DocumentDB/databaseAccounts --name \"$n\" >/dev/null 2>&1; then",
+                                "        echo \"  $n deletion confirmed (try=$try)\"; break",
+                                "      fi",
+                                "      sleep 15",
+                                "    done",
+                                "  done",
+                                "fi",
+                                "# 2. Patch every *.bicep file under /workspace to disable",
+                                "#    analytical storage. AVM modules use camelCase",
+                                "#    `enableAnalyticalStorage` and may also have an",
+                                "#    `analyticalStorageConfiguration` block.",
+                                "python3 - <<'PYANALYTIC'",
+                                "import os, re, glob",
+                                "patched_count = 0",
+                                "# Walk all bicep files under /workspace (depth-unlimited).",
+                                "for root, dirs, files in os.walk('.'):",
+                                "    # Skip hidden dirs and node_modules / azd cache",
+                                "    dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', '__pycache__')]",
+                                "    for fn in files:",
+                                "        if not fn.endswith('.bicep'):",
+                                "            continue",
+                                "        path = os.path.join(root, fn)",
+                                "        try:",
+                                "            with open(path, 'r', encoding='utf-8') as f:",
+                                "                src = f.read()",
+                                "        except Exception as e:",
+                                "            print(f'WARN: cannot read {path}: {e}'); continue",
+                                "        original = src",
+                                "        # 2a. enableAnalyticalStorage: true  -> false",
+                                "        src = re.sub(",
+                                "            r'enableAnalyticalStorage\\s*:\\s*true\\b',",
+                                "            'enableAnalyticalStorage: false',",
+                                "            src)",
+                                "        # 2b. enableAnalyticalStorage: param -> false (literal)",
+                                "        # Some Bicep wires the value through a parameter;",
+                                "        # we leave that path alone and patch the param value below.",
+                                "        # 2c. Remove analyticalStorageConfiguration blocks.",
+                                "        # Pattern: analyticalStorageConfiguration: {  ...  }",
+                                "        # Use balanced-brace matching with a simple counter.",
+                                "        out = []",
+                                "        i = 0",
+                                "        n = len(src)",
+                                "        while i < n:",
+                                "            m = re.search(r'analyticalStorageConfiguration\\s*:\\s*\\{', src[i:])",
+                                "            if not m:",
+                                "                out.append(src[i:]); break",
+                                "            out.append(src[i:i + m.start()])",
+                                "            j = i + m.end()",
+                                "            depth = 1",
+                                "            while j < n and depth > 0:",
+                                "                if src[j] == '{': depth += 1",
+                                "                elif src[j] == '}': depth -= 1",
+                                "                j += 1",
+                                "            # j now points just past the matching close brace.",
+                                "            # Strip trailing comma/newline if present.",
+                                "            while j < n and src[j] in ', \\t':",
+                                "                j += 1",
+                                "            i = j",
+                                "        src = ''.join(out)",
+                                "        if src != original:",
+                                "            with open(path, 'w', encoding='utf-8') as f:",
+                                "                f.write(src)",
+                                "            patched_count += 1",
+                                "            print(f'patched: {path}')",
+                                "print(f'total bicep files patched: {patched_count}')",
+                                "PYANALYTIC",
+                                "# 3. Belt: also patch main.parameters.json to set",
+                                "#    enableAnalyticalStorage=false where the Bicep",
+                                "#    accepts the parameter externally.",
+                                "python3 - <<'PYPARAM'",
+                                "import json, os",
+                                "for p in ['main.parameters.json', 'infra/main.parameters.json']:",
+                                "    if not os.path.exists(p):",
+                                "        continue",
+                                "    try:",
+                                "        with open(p, 'r', encoding='utf-8') as f:",
+                                "            j = json.load(f)",
+                                "    except Exception as e:",
+                                "        print(f'WARN: cannot parse {p}: {e}'); continue",
+                                "    params = j.get('parameters', {})",
+                                "    if 'enableAnalyticalStorage' in params:",
+                                "        params['enableAnalyticalStorage']['value'] = False",
+                                "    else:",
+                                "        params['enableAnalyticalStorage'] = {'value': False}",
+                                "    j['parameters'] = params",
+                                "    with open(p, 'w', encoding='utf-8') as f:",
+                                "        json.dump(j, f, indent=2, ensure_ascii=False)",
+                                "        f.write('\\n')",
+                                "    print(f'patched parameters: {p}')",
+                                "PYPARAM",
+                                "# 4. Also set the azd env var for any Bicep that reads it.",
+                                "azd env set ENABLE_ANALYTICAL_STORAGE false || true",
+                                "azd env set USE_ANALYTICAL_STORAGE false || true",
+                                "echo 'AutoPatch:cosmos-analytical-storage done'",
+                                ""
+                            });
+                            var analyticalB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(analyticalScript));
+                            var analyticalCmd =
+                                "bash -lc 'echo " + analyticalB64 + " | base64 -d | bash'";
+                            previousAttempts.Add(
+                                "[AutoPatch:cosmos-analytical-storage] Cosmos " +
+                                "creation failed with 'Enabling Analytical Storage " +
+                                "during account creation is no longer supported'. " +
+                                "Azure deprecated this feature. Patched all *.bicep " +
+                                "files (enableAnalyticalStorage: true → false; " +
+                                "removed analyticalStorageConfiguration blocks) and " +
+                                "set enableAnalyticalStorage=false in " +
+                                "main.parameters.json. Deleted failed cosmos " +
+                                "accounts in the RG before retry. " +
+                                $"(attempt {cosmosAnalyticalCount + 1}/2).");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:cosmos-analytical-storage]: " +
+                                "Azure no longer supports analytical storage at " +
+                                "cosmos account creation. Patching Bicep templates " +
+                                "(enableAnalyticalStorage → false; removing " +
+                                "analyticalStorageConfiguration), main.parameters.json, " +
+                                "and deleting failed accounts before retry. " +
+                                $"attempt {cosmosAnalyticalCount + 1}/2.",
+                                step.Id);
+                            var analyticalStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: disable enableAnalyticalStorage in Bicep + cleanup",
+                                analyticalCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(20));
+                            steps.Insert(i, analyticalStep);
+                            i--;
+                            continue;
+                        }
+
                         // Pre-Doctor deterministic patch: Cosmos DB stuck
                         // in "failed provisioning state" + recurring
                         // "Please delete the previous instance" errors,
@@ -2323,6 +2503,18 @@ public sealed class DeploymentOrchestrator
                                 a.Contains("[AutoPatch:cosmos-region]"))
                             && previousAttempts.Count(a =>
                                 a.Contains("[AutoPatch:cosmos-region-pivot]")) < 2;
+                        // Yield to [AutoPatch:cosmos-analytical-storage]
+                        // (defined above): when the error tail contains
+                        // "Enabling Analytical Storage" the Bicep patch
+                        // is the real fix; cleanup-only here would burn
+                        // the cosmos-stuck retry budget on accounts the
+                        // analytical-storage patch is already deleting.
+                        var cosmosAnalyticalWillFireFirst =
+                            !string.IsNullOrEmpty(stepTail)
+                            && stepTail.Contains("Enabling Analytical Storage",
+                                                 StringComparison.OrdinalIgnoreCase)
+                            && previousAttempts.Count(a =>
+                                a.Contains("[AutoPatch:cosmos-analytical-storage]")) < 2;
                         // cosmos-stuck cleanup is IDEMPOTENT (delete +
                         // wait + no-op when nothing matches) and we have
                         // observed cases where Bicep re-creates accounts
@@ -2337,6 +2529,7 @@ public sealed class DeploymentOrchestrator
                         var cosmosFailedState =
                             !cosmosRegionWillFireFirst
                             && !cosmosRegionPivotWillFireFirst
+                            && !cosmosAnalyticalWillFireFirst
                             && ((cosmosStuck && cosmosStuckCount < 5)
                                 || (cosmosZonal && !cosmosZonalAlready));
                         if (cosmosFailedState)
