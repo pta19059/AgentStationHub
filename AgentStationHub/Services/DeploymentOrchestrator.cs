@@ -3694,13 +3694,25 @@ public sealed class DeploymentOrchestrator
                         // gpt-realtime, realtime-preview). The patch is
                         // surgical (python regex anchored on context),
                         // so it does not touch unrelated deployments.
+                        //
+                        // NOTE: we deliberately do NOT use a once-only
+                        // guard. The Doctor/Strategist sometimes
+                        // overwrite our canonical names with chat-model
+                        // pivots (gpt-4.1-mini etc.) on subsequent
+                        // attempts; we must be able to re-fire and
+                        // restore the realtime model each time. The
+                        // patch is idempotent. We only suppress
+                        // re-firing if the previous attempt was also
+                        // this exact patch with no Doctor step in
+                        // between (rate-limit safeguard).
                         var rtTail = stepTail ?? "";
                         var rtSignal =
                             rtTail.Contains("DeploymentModelNotSupported",
                                 StringComparison.OrdinalIgnoreCase);
-                        if (rtSignal
-                            && !previousAttempts.Any(a =>
-                                a.Contains("[AutoPatch:realtime-canonical]")))
+                        var rtLastAttempt = previousAttempts.LastOrDefault() ?? "";
+                        var rtJustRan = rtLastAttempt.Contains(
+                            "[AutoPatch:realtime-canonical]");
+                        if (rtSignal && !rtJustRan)
                         {
                             var rtHaystack = string.Join(" ", previousAttempts)
                                 + " " + rtTail
@@ -3726,38 +3738,64 @@ public sealed class DeploymentOrchestrator
                                 // sandbox shell.
                                 var pyScript = string.Join("\n", new[]
                                 {
-                                    "import re, glob, os, sys",
-                                    "candidates = sorted(set(",
+                                    "import re, glob, os, sys, json",
+                                    "CANONICAL_NAME = 'gpt-4o-realtime-preview'",
+                                    "CANONICAL_VERSION = '2024-12-17'",
+                                    "# Param names commonly used in Azure-Samples bicep",
+                                    "# templates for the realtime deployment.",
+                                    "RT_NAME_PARAMS = [",
+                                    "    'openAiRealtimeDeploymentName',",
+                                    "    'realtimeDeploymentName',",
+                                    "    'openAIRealtimeDeploymentName',",
+                                    "    'azureOpenAiRealtimeDeploymentName',",
+                                    "    'realtimeModelName',",
+                                    "    'openAiRealtimeModelName',",
+                                    "]",
+                                    "RT_VERSION_PARAMS = [",
+                                    "    'realtimeDeploymentVersion',",
+                                    "    'openAiRealtimeDeploymentVersion',",
+                                    "    'realtimeModelVersion',",
+                                    "    'openAiRealtimeModelVersion',",
+                                    "]",
+                                    "bicep_candidates = sorted(set(",
                                     "    glob.glob('/workspace/**/main.bicep', recursive=True)",
                                     "    + glob.glob('/workspace/infra/main.bicep')",
+                                    "    + glob.glob('/workspace/infra/**/*.bicep', recursive=True)",
                                     "))",
-                                    "if not candidates:",
-                                    "    print('[realtime-canonical] no main.bicep found')",
-                                    "    sys.exit(0)",
-                                    "for bicep_path in candidates:",
-                                    "    with open(bicep_path, 'r') as f:",
-                                    "        content = f.read()",
+                                    "for bicep_path in bicep_candidates:",
+                                    "    try:",
+                                    "        with open(bicep_path, 'r') as f:",
+                                    "            content = f.read()",
+                                    "    except Exception:",
+                                    "        continue",
                                     "    original = content",
-                                    "    # 1. Force realtimeDeploymentVersion default to a supported value",
-                                    "    content = re.sub(",
-                                    "        r\"param\\s+realtimeDeploymentVersion\\s+string(\\s*=\\s*'[^']*')?\",",
-                                    "        \"param realtimeDeploymentVersion string = '2024-12-17'\",",
-                                    "        content)",
+                                    "    # 1a. Force realtime VERSION param default to canonical value.",
+                                    "    for p in RT_VERSION_PARAMS:",
+                                    "        content = re.sub(",
+                                    "            rf\"param\\s+{re.escape(p)}\\s+string(\\s*=\\s*'[^']*')?\",",
+                                    "            f\"param {p} string = '{CANONICAL_VERSION}'\",",
+                                    "            content)",
+                                    "    # 1b. Force realtime NAME param default to canonical value.",
+                                    "    for p in RT_NAME_PARAMS:",
+                                    "        content = re.sub(",
+                                    "            rf\"param\\s+{re.escape(p)}\\s+string(\\s*=\\s*'[^']*')?\",",
+                                    "            f\"param {p} string = '{CANONICAL_NAME}'\",",
+                                    "            content)",
                                     "    lines = content.split('\\n')",
-                                    "    # 2. Any 'name: <X>' followed within 6 lines by",
-                                    "    #    'realtimeDeploymentVersion' or 'realtime' (case-insensitive)",
-                                    "    #    must be the realtime model. Force canonical name.",
+                                    "    # 2. Any literal 'name: <X>' followed within 8 lines by a",
+                                    "    #    realtime token must be the realtime model. Force canonical.",
                                     "    for i, line in enumerate(lines):",
                                     "        m = re.match(r\"(\\s*name:\\s*)'([^']+)'\", line)",
                                     "        if not m:",
                                     "            continue",
-                                    "        nearby = '\\n'.join(lines[i:i+8])",
-                                    "        if ('realtimeDeploymentVersion' in nearby",
-                                    "                or 'realtime' in nearby.lower()):",
-                                    "            if m.group(2) != 'gpt-4o-realtime-preview':",
-                                    "                lines[i] = m.group(1) + \"'gpt-4o-realtime-preview'\"",
-                                    "    # 3. Restore text-embedding-3-large version to '1'",
-                                    "    #    if the Doctor's earlier global sed clobbered it.",
+                                    "        nearby = '\\n'.join(lines[i:i+10])",
+                                    "        if (any(p in nearby for p in RT_VERSION_PARAMS)",
+                                    "                or 'realtime' in nearby.lower()",
+                                    "                or 'gpt-realtime' in nearby.lower()",
+                                    "                or 'gpt-4o-realtime' in nearby.lower()):",
+                                    "            if m.group(2) != CANONICAL_NAME:",
+                                    "                lines[i] = m.group(1) + f\"'{CANONICAL_NAME}'\"",
+                                    "    # 3. Restore text-embedding-3-large version to '1' if clobbered.",
                                     "    for i, line in enumerate(lines):",
                                     "        if \"'text-embedding-3-large'\" in line:",
                                     "            for j in range(i+1, min(i+8, len(lines))):",
@@ -3772,8 +3810,33 @@ public sealed class DeploymentOrchestrator
                                     "        with open(bicep_path, 'w') as f:",
                                     "            f.write(content)",
                                     "        print(f'[realtime-canonical] patched {bicep_path}')",
-                                    "    else:",
-                                    "        print(f'[realtime-canonical] no change needed in {bicep_path}')",
+                                    "# 4. Patch main.parameters.json — any value matching a realtime",
+                                    "#    NAME param key gets reset to CANONICAL_NAME; VERSION param key",
+                                    "#    gets reset to CANONICAL_VERSION.",
+                                    "param_files = sorted(set(",
+                                    "    glob.glob('/workspace/**/main.parameters.json', recursive=True)",
+                                    "    + glob.glob('/workspace/infra/main.parameters.json')",
+                                    "))",
+                                    "for pf in param_files:",
+                                    "    try:",
+                                    "        with open(pf, 'r') as f:",
+                                    "            data = json.load(f)",
+                                    "    except Exception:",
+                                    "        continue",
+                                    "    params = data.get('parameters', {})",
+                                    "    changed = False",
+                                    "    for k in list(params.keys()):",
+                                    "        if k in RT_NAME_PARAMS:",
+                                    "            params[k] = {'value': CANONICAL_NAME}",
+                                    "            changed = True",
+                                    "        elif k in RT_VERSION_PARAMS:",
+                                    "            params[k] = {'value': CANONICAL_VERSION}",
+                                    "            changed = True",
+                                    "    if changed:",
+                                    "        data['parameters'] = params",
+                                    "        with open(pf, 'w') as f:",
+                                    "            json.dump(data, f, indent=2)",
+                                    "        print(f'[realtime-canonical] patched {pf}')",
                                 });
                                 var pyB64 = Convert.ToBase64String(
                                     System.Text.Encoding.UTF8.GetBytes(pyScript));
@@ -3783,6 +3846,8 @@ public sealed class DeploymentOrchestrator
                                     "echo 'AutoPatch:realtime-canonical — restoring gpt-4o-realtime-preview v2024-12-17'",
                                     $"echo {pyB64} | base64 -d | python3",
                                     "azd env set realtimeDeploymentVersion '2024-12-17' 2>/dev/null || true",
+                                    "azd env set openAiRealtimeDeploymentName 'gpt-4o-realtime-preview' 2>/dev/null || true",
+                                    "azd env set realtimeDeploymentName 'gpt-4o-realtime-preview' 2>/dev/null || true",
                                     "azd env set AZURE_OPENAI_SERVICE_LOCATION 'eastus2' 2>/dev/null || true",
                                     "azd env set AZURE_OPENAI_REALTIME_DEPLOYMENT 'gpt-4o-realtime-preview' 2>/dev/null || true",
                                     "echo 'AutoPatch:realtime-canonical done'",
