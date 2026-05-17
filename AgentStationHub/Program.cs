@@ -97,6 +97,7 @@ builder.Services.AddSimpleAuth();
 builder.Services.AddSingleton<AgentCatalogService>();
 builder.Services.AddSingleton<AgentMemoryStore>();
 builder.Services.AddSingleton<DeploymentSessionStore>();
+builder.Services.AddSingleton<DeploymentErrorLog>();
 builder.Services.AddScoped<AzureAIToolkitService>();
 builder.Services.AddHttpClient("github", c =>
 {

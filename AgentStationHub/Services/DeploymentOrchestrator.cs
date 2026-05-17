@@ -17,6 +17,7 @@ public sealed class DeploymentOrchestrator
     private readonly ILogger<DeploymentOrchestrator> _log;
     private readonly AgentMemoryStore _memory;
     private readonly DeploymentSessionStore _store;
+    private readonly DeploymentErrorLog _errorLog;
     private readonly ConcurrentDictionary<string, DeploymentSession> _sessions = new();
 
     public DeploymentOrchestrator(
@@ -25,7 +26,8 @@ public sealed class DeploymentOrchestrator
         IOptions<DeploymentOptions> opt,
         ILogger<DeploymentOrchestrator> log,
         AgentMemoryStore memory,
-        DeploymentSessionStore store)
+        DeploymentSessionStore store,
+        DeploymentErrorLog errorLog)
     {
         _hub = hub;
         _sp = sp;
@@ -33,6 +35,7 @@ public sealed class DeploymentOrchestrator
         _log = log;
         _memory = memory;
         _store = store;
+        _errorLog = errorLog;
 
         // Rehydrate sessions left on disk by a previous app lifetime.
         // The in-process pipeline task cannot be resurrected — the
@@ -5065,6 +5068,16 @@ public sealed class DeploymentOrchestrator
     {
         s.Status = st;
         _store.SaveLater(s);
+        // Append a JSONL entry to errors.jsonl on terminal-failure
+        // states so the host can tail the file out-of-band without
+        // touching the SignalR hub.
+        if (st is DeploymentStatus.Failed
+              or DeploymentStatus.Rejected
+              or DeploymentStatus.NotDeployable
+              or DeploymentStatus.BlockedNeedsHumanOrSourceFix)
+        {
+            _errorLog.Record(s);
+        }
         await _hub.Clients.Group(s.Id).SendAsync("StatusChanged", st.ToString(), s.ErrorMessage, s.FinalEndpoint);
     }
 
