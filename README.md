@@ -213,7 +213,7 @@ AgentStationHub.SandboxRunner/
 
 ---
 
-## Sandbox Image (v40)
+## Sandbox Image (v41)
 
 Built on demand by `SandboxImageBuilder`. Base: `mcr.microsoft.com/azure-cli:latest` plus:
 
