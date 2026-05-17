@@ -3666,6 +3666,158 @@ public sealed class DeploymentOrchestrator
                             continue;
                         }
 
+                        // ── AutoPatch:realtime-canonical ──
+                        // Repos that need OpenAI realtime/audio models
+                        // (e.g. aisearch-openai-rag-audio) confuse the
+                        // Doctor: chat-model pivots (gpt-35-turbo,
+                        // gpt-4o-mini, gpt-4o) all fail with
+                        // DeploymentModelNotSupported because realtime
+                        // deployments require a realtime model. The
+                        // Doctor's broad seds also clobber sibling
+                        // deployments (e.g. text-embedding-3-large
+                        // version flipped to '2024-07-18').
+                        //
+                        // Definitive fix: restore the canonical realtime
+                        // configuration in main.bicep —
+                        //   • realtime block:
+                        //       name = 'gpt-4o-realtime-preview'
+                        //       version = '2024-12-17'
+                        //   • text-embedding-3-large block: version = '1'
+                        //   • realtimeDeploymentVersion param default
+                        //     = '2024-12-17'
+                        //   • AZURE_OPENAI_SERVICE_LOCATION = eastus2
+                        //
+                        // Detection: stepTail mentions
+                        // DeploymentModelNotSupported AND any prior step
+                        // / current tail mentions a realtime token
+                        // (realtimeDeploymentVersion, gpt-4o-realtime,
+                        // gpt-realtime, realtime-preview). The patch is
+                        // surgical (python regex anchored on context),
+                        // so it does not touch unrelated deployments.
+                        var rtTail = stepTail ?? "";
+                        var rtSignal =
+                            rtTail.Contains("DeploymentModelNotSupported",
+                                StringComparison.OrdinalIgnoreCase);
+                        if (rtSignal
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:realtime-canonical]")))
+                        {
+                            var rtHaystack = string.Join(" ", previousAttempts)
+                                + " " + rtTail
+                                + " " + string.Join(" ", steps.Select(st => st.Description ?? ""))
+                                + " " + string.Join(" ", steps.Select(st => st.Command ?? ""));
+                            var rtTokens = new[]
+                            {
+                                "realtimeDeploymentVersion",
+                                "gpt-4o-realtime",
+                                "gpt-realtime",
+                                "realtime-preview",
+                                "rag-audio"
+                            };
+                            var isRealtimeRepo = rtTokens.Any(t =>
+                                rtHaystack.Contains(t,
+                                    StringComparison.OrdinalIgnoreCase));
+
+                            if (isRealtimeRepo)
+                            {
+                                // Python script: surgical bicep rewrite.
+                                // Stored as base64 to survive the bash
+                                // single-quote envelope used by the
+                                // sandbox shell.
+                                var pyScript = string.Join("\n", new[]
+                                {
+                                    "import re, glob, os, sys",
+                                    "candidates = sorted(set(",
+                                    "    glob.glob('/workspace/**/main.bicep', recursive=True)",
+                                    "    + glob.glob('/workspace/infra/main.bicep')",
+                                    "))",
+                                    "if not candidates:",
+                                    "    print('[realtime-canonical] no main.bicep found')",
+                                    "    sys.exit(0)",
+                                    "for bicep_path in candidates:",
+                                    "    with open(bicep_path, 'r') as f:",
+                                    "        content = f.read()",
+                                    "    original = content",
+                                    "    # 1. Force realtimeDeploymentVersion default to a supported value",
+                                    "    content = re.sub(",
+                                    "        r\"param\\s+realtimeDeploymentVersion\\s+string(\\s*=\\s*'[^']*')?\",",
+                                    "        \"param realtimeDeploymentVersion string = '2024-12-17'\",",
+                                    "        content)",
+                                    "    lines = content.split('\\n')",
+                                    "    # 2. Any 'name: <X>' followed within 6 lines by",
+                                    "    #    'realtimeDeploymentVersion' or 'realtime' (case-insensitive)",
+                                    "    #    must be the realtime model. Force canonical name.",
+                                    "    for i, line in enumerate(lines):",
+                                    "        m = re.match(r\"(\\s*name:\\s*)'([^']+)'\", line)",
+                                    "        if not m:",
+                                    "            continue",
+                                    "        nearby = '\\n'.join(lines[i:i+8])",
+                                    "        if ('realtimeDeploymentVersion' in nearby",
+                                    "                or 'realtime' in nearby.lower()):",
+                                    "            if m.group(2) != 'gpt-4o-realtime-preview':",
+                                    "                lines[i] = m.group(1) + \"'gpt-4o-realtime-preview'\"",
+                                    "    # 3. Restore text-embedding-3-large version to '1'",
+                                    "    #    if the Doctor's earlier global sed clobbered it.",
+                                    "    for i, line in enumerate(lines):",
+                                    "        if \"'text-embedding-3-large'\" in line:",
+                                    "            for j in range(i+1, min(i+8, len(lines))):",
+                                    "                if re.match(r\"\\s*version:\\s*'[^']+'\", lines[j]):",
+                                    "                    lines[j] = re.sub(",
+                                    "                        r\"version:\\s*'[^']+'\",",
+                                    "                        \"version: '1'\",",
+                                    "                        lines[j])",
+                                    "                    break",
+                                    "    content = '\\n'.join(lines)",
+                                    "    if content != original:",
+                                    "        with open(bicep_path, 'w') as f:",
+                                    "            f.write(content)",
+                                    "        print(f'[realtime-canonical] patched {bicep_path}')",
+                                    "    else:",
+                                    "        print(f'[realtime-canonical] no change needed in {bicep_path}')",
+                                });
+                                var pyB64 = Convert.ToBase64String(
+                                    System.Text.Encoding.UTF8.GetBytes(pyScript));
+                                var rtScript = string.Join("\n", new[]
+                                {
+                                    "set +e",
+                                    "echo 'AutoPatch:realtime-canonical — restoring gpt-4o-realtime-preview v2024-12-17'",
+                                    $"echo {pyB64} | base64 -d | python3",
+                                    "azd env set realtimeDeploymentVersion '2024-12-17' 2>/dev/null || true",
+                                    "azd env set AZURE_OPENAI_SERVICE_LOCATION 'eastus2' 2>/dev/null || true",
+                                    "azd env set AZURE_OPENAI_REALTIME_DEPLOYMENT 'gpt-4o-realtime-preview' 2>/dev/null || true",
+                                    "echo 'AutoPatch:realtime-canonical done'",
+                                });
+                                var rtB64 = Convert.ToBase64String(
+                                    System.Text.Encoding.UTF8.GetBytes(rtScript));
+                                var rtCmd =
+                                    "bash -lc 'echo " + rtB64 + " | base64 -d | bash'";
+                                previousAttempts.Add(
+                                    "[AutoPatch:realtime-canonical] Realtime/audio repo " +
+                                    "kept failing because the Doctor pivoted to chat-only " +
+                                    "models. Restored canonical realtime config in " +
+                                    "main.bicep (gpt-4o-realtime-preview v2024-12-17 " +
+                                    "GlobalStandard), repaired text-embedding-3-large " +
+                                    "version, and pinned AZURE_OPENAI_SERVICE_LOCATION=eastus2.");
+                                await Log(s, "status",
+                                    "Auto-patch [AutoPatch:realtime-canonical]: detected " +
+                                    "realtime/audio repo with DeploymentModelNotSupported " +
+                                    "loop. Restoring canonical gpt-4o-realtime-preview " +
+                                    "v2024-12-17 in main.bicep and repairing sibling " +
+                                    "deployments (text-embedding-3-large -> v1).",
+                                    step.Id);
+                                var rtStep = new DeploymentStep(
+                                    step.Id,
+                                    "AutoPatch: restore canonical realtime model " +
+                                    "(gpt-4o-realtime-preview v2024-12-17, eastus2)",
+                                    rtCmd,
+                                    step.WorkingDirectory,
+                                    TimeSpan.FromMinutes(2));
+                                steps.Insert(i, rtStep);
+                                i--;
+                                continue;
+                            }
+                        }
+
                         // ── AutoPatch:model-oscillation ──
                         // Detect when the Doctor oscillates between two
                         // model-related errors (e.g. SpecialFeatureOrQuotaIdRequired

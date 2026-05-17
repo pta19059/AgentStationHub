@@ -109,7 +109,7 @@ Clone → Inspect → Plan → Approve → Execute → Verify → InfraAutofix
 
 When a step fails, the orchestrator applies fixes in this order:
 
-1. **Deterministic auto-patches** — regex-based pattern matching for known ARM errors (deprecated models, invalid secrets, zone-redundant capacity, region collisions)
+1. **Deterministic auto-patches** — regex-based pattern matching for known ARM errors (deprecated models, invalid secrets, zone-redundant capacity, region collisions, realtime/audio model misrouting)
 2. **In-sandbox Doctor** — reasoning model (`o4-mini`) with full workspace access
 3. **EscalationResolver** — LLM-driven last-line resolver for novel failures
 4. **Foundry-hosted Doctor** — optional hosted variant with portal-editable instructions
