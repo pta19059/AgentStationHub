@@ -3818,6 +3818,121 @@ public sealed class DeploymentOrchestrator
                             }
                         }
 
+                        // ── AutoPatch:search-capacity ──
+                        // Azure Cognitive Search frequently throws
+                        // InsufficientResourcesAvailable in popular regions
+                        // (eastus2, westus3). The OpenAI deployment usually
+                        // succeeded — we just need to relocate the Search
+                        // service to a less saturated region. Search service
+                        // can live in a different region than the rest of
+                        // the resource group; it's only accessed via HTTPS.
+                        //
+                        // Strategy: rotate through a fallback list, picking
+                        // the first region not yet tried. Patch main.bicep
+                        // surgically (only the Search resource's `location`
+                        // property) and also set azd env vars commonly used
+                        // (AZURE_SEARCH_SERVICE_LOCATION, searchServiceLocation).
+                        var searchTail = stepTail ?? "";
+                        var isSearchCapacity =
+                            searchTail.Contains("InsufficientResourcesAvailable",
+                                StringComparison.OrdinalIgnoreCase)
+                            && (searchTail.Contains("Search service",
+                                    StringComparison.OrdinalIgnoreCase)
+                                || searchTail.Contains("Microsoft.Search",
+                                    StringComparison.OrdinalIgnoreCase)
+                                || searchTail.Contains("gptkb-",
+                                    StringComparison.OrdinalIgnoreCase));
+                        if (isSearchCapacity)
+                        {
+                            var fallbacks = new[]
+                            {
+                                "swedencentral", "northeurope", "westeurope",
+                                "uksouth", "eastus", "westus", "australiaeast",
+                            };
+                            var triedRegions = previousAttempts
+                                .Where(a => a.Contains("[AutoPatch:search-capacity]"))
+                                .ToList();
+                            var nextRegion = fallbacks.FirstOrDefault(r =>
+                                !triedRegions.Any(t =>
+                                    t.Contains(r, StringComparison.OrdinalIgnoreCase)));
+                            if (nextRegion is not null)
+                            {
+                                var pySearch = string.Join("\n", new[]
+                                {
+                                    "import re, glob, os, sys",
+                                    "target_region = os.environ.get('FALLBACK_REGION', 'swedencentral')",
+                                    "candidates = sorted(set(",
+                                    "    glob.glob('/workspace/**/main.bicep', recursive=True)",
+                                    "    + glob.glob('/workspace/infra/main.bicep')",
+                                    "    + glob.glob('/workspace/**/search*.bicep', recursive=True)",
+                                    "))",
+                                    "patched_any = False",
+                                    "for bicep_path in candidates:",
+                                    "    with open(bicep_path, 'r') as f:",
+                                    "        content = f.read()",
+                                    "    original = content",
+                                    "    # Find each resource block of type Microsoft.Search/searchServices",
+                                    "    # and rewrite its `location:` line (within the block) to target_region.",
+                                    "    pattern = re.compile(",
+                                    "        r\"(resource\\s+\\w+\\s+'Microsoft\\.Search/searchServices@[^']+'\\s*=\\s*\\{)([\\s\\S]*?)(^\\})\",",
+                                    "        re.MULTILINE)",
+                                    "    def fix_block(m):",
+                                    "        head, body, tail = m.group(1), m.group(2), m.group(3)",
+                                    "        new_body, n = re.subn(",
+                                    "            r\"(^\\s*location:\\s*)[^\\n]+\",",
+                                    "            lambda mm: mm.group(1) + repr(target_region).replace('\"', \"'\"),",
+                                    "            body, count=1, flags=re.MULTILINE)",
+                                    "        if n == 0:",
+                                    "            new_body = body.rstrip() + f\"\\n  location: '{target_region}'\\n\"",
+                                    "        return head + new_body + tail",
+                                    "    content = pattern.sub(fix_block, content)",
+                                    "    if content != original:",
+                                    "        with open(bicep_path, 'w') as f:",
+                                    "            f.write(content)",
+                                    "        patched_any = True",
+                                    "        print(f'[search-capacity] patched {bicep_path} -> {target_region}')",
+                                    "if not patched_any:",
+                                    "    print('[search-capacity] no Search resource block found to patch')",
+                                });
+                                var pyB64s = Convert.ToBase64String(
+                                    System.Text.Encoding.UTF8.GetBytes(pySearch));
+                                var scScript = string.Join("\n", new[]
+                                {
+                                    "set +e",
+                                    $"echo 'AutoPatch:search-capacity — relocating Search service to {nextRegion}'",
+                                    $"export FALLBACK_REGION='{nextRegion}'",
+                                    $"echo {pyB64s} | base64 -d | python3",
+                                    $"azd env set AZURE_SEARCH_SERVICE_LOCATION '{nextRegion}' 2>/dev/null || true",
+                                    $"azd env set searchServiceLocation '{nextRegion}' 2>/dev/null || true",
+                                    $"azd env set SEARCH_SERVICE_LOCATION '{nextRegion}' 2>/dev/null || true",
+                                    "echo 'AutoPatch:search-capacity done'",
+                                });
+                                var scB64 = Convert.ToBase64String(
+                                    System.Text.Encoding.UTF8.GetBytes(scScript));
+                                var scCmd =
+                                    "bash -lc 'echo " + scB64 + " | base64 -d | bash'";
+                                previousAttempts.Add(
+                                    $"[AutoPatch:search-capacity] InsufficientResourcesAvailable " +
+                                    $"for Search service. Relocated Search resource " +
+                                    $"location to '{nextRegion}' in main.bicep and set " +
+                                    "azd env (AZURE_SEARCH_SERVICE_LOCATION).");
+                                await Log(s, "status",
+                                    $"Auto-patch [AutoPatch:search-capacity]: Search " +
+                                    $"service capacity exhausted in the current region. " +
+                                    $"Relocating Search to '{nextRegion}'.",
+                                    step.Id);
+                                var scStep = new DeploymentStep(
+                                    step.Id,
+                                    $"AutoPatch: relocate Search service to {nextRegion}",
+                                    scCmd,
+                                    step.WorkingDirectory,
+                                    TimeSpan.FromMinutes(2));
+                                steps.Insert(i, scStep);
+                                i--;
+                                continue;
+                            }
+                        }
+
                         // ── AutoPatch:model-oscillation ──
                         // Detect when the Doctor oscillates between two
                         // model-related errors (e.g. SpecialFeatureOrQuotaIdRequired
