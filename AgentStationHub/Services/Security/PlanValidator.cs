@@ -8,8 +8,13 @@ public static class PlanValidator
     private static readonly HashSet<string> AllowedBinaries = new(StringComparer.OrdinalIgnoreCase)
     {
         "git", "azd", "az", "pac", "docker", "dotnet",
-        "npm", "node", "pwsh", "python", "pip", "bash", "sh",
+        "npm", "node", "pwsh", "python", "python3", "pip", "bash", "sh",
         "make", "terraform",
+        // Harmless shell utilities the Strategist/Doctor frequently use
+        // as Step 1 (status messages, no-op probes). Rejecting these
+        // forces a full plan re-roll for what is essentially a print
+        // statement.
+        "echo", "true", "false", "test", "[",
         // v17 baked helpers in /usr/local/bin (see SandboxImageBuilder.cs).
         // Single-token, no nested quoting. The Strategist + Doctor prefer
         // these over hand-rolled shell. Adding them here makes the
