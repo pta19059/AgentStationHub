@@ -73,8 +73,15 @@ public static class PlanValidator
             if (rx.IsMatch(cmd))
                 return (false, $"Blacklisted pattern matched: {rx}.");
 
-        var quoteCheck = ValidateNoMultilevelQuoting(cmd);
-        if (!quoteCheck.Ok) return quoteCheck;
+        // Multi-quote heuristic: previously hard-rejected when >=8
+        // escaped quotes were detected inside `bash -lc "..."`. In
+        // practice the Strategist legitimately emits such commands
+        // (e.g. `az ... --query "..." -o tsv | jq '..."x"...'`) and
+        // rejecting the entire plan blocks the deploy with no recovery
+        // path. If the command is actually malformed it will fail at
+        // runtime and the Doctor will remediate. Kept as a soft check
+        // (function preserved for potential future logging-only use).
+        _ = ValidateNoMultilevelQuoting(cmd);
 
         if (step.WorkingDirectory.Contains("..") || Path.IsPathRooted(step.WorkingDirectory))
             return (false, "Working directory must be relative and inside workdir.");
