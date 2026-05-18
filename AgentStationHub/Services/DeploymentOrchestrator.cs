@@ -4035,6 +4035,88 @@ public sealed class DeploymentOrchestrator
                             }
                         }
 
+                        // ── AutoPatch:resolve-rg-from-tag ──
+                        // 'agentic-azd-deploy' fails with "could not resolve
+                        // resource group for env '<name>'" when the azd env
+                        // file lacks AZURE_RESOURCE_GROUP (a previous azd up
+                        // may have provisioned resources without persisting
+                        // the RG into the local env, e.g. when the sandbox
+                        // was recreated mid-flight). The Doctor's only fix
+                        // is "run azd up again", which gets blocked as a
+                        // near-duplicate, leaving the orchestrator stuck.
+                        //
+                        // Definitive fix: query Azure for any RG tagged
+                        //   azd-env-name = $AZURE_ENV_NAME
+                        // and inject it via `azd env set AZURE_RESOURCE_GROUP`.
+                        // azd up tags every RG it creates with this exact tag,
+                        // so the lookup is deterministic and idempotent.
+                        var rgTail = stepTail ?? "";
+                        var rgSignal =
+                            rgTail.Contains("could not resolve resource group for env",
+                                StringComparison.OrdinalIgnoreCase)
+                            || (rgTail.Contains("AZURE_RESOURCE_GROUP",
+                                    StringComparison.OrdinalIgnoreCase)
+                                && rgTail.Contains("not set",
+                                    StringComparison.OrdinalIgnoreCase));
+                        if (rgSignal
+                            && !previousAttempts.Any(a =>
+                                a.Contains("[AutoPatch:resolve-rg-from-tag]")))
+                        {
+                            var rgScript = string.Join("\n", new[]
+                            {
+                                "set +e",
+                                "echo 'AutoPatch:resolve-rg-from-tag — looking up RG by azd-env-name tag'",
+                                "ENV_NAME=$(azd env get-values 2>/dev/null | grep -E '^AZURE_ENV_NAME=' | head -1 | cut -d'=' -f2- | tr -d '\"' )",
+                                "if [ -z \"$ENV_NAME\" ]; then",
+                                "  echo 'no AZURE_ENV_NAME in azd env; cannot lookup RG'",
+                                "  exit 0",
+                                "fi",
+                                "echo \"Searching for RG tagged azd-env-name=$ENV_NAME ...\"",
+                                "RG=$(az group list --query \"[?tags.\\\"azd-env-name\\\"=='$ENV_NAME'].name | [0]\" -o tsv 2>/dev/null)",
+                                "if [ -z \"$RG\" ] || [ \"$RG\" = \"null\" ]; then",
+                                "  # Fallback: convention used by azd up — rg-$ENV_NAME",
+                                "  CANDIDATE=\"rg-$ENV_NAME\"",
+                                "  EXISTS=$(az group exists -n \"$CANDIDATE\" 2>/dev/null)",
+                                "  if [ \"$EXISTS\" = \"true\" ]; then",
+                                "    RG=\"$CANDIDATE\"",
+                                "    echo \"Found RG by convention: $RG\"",
+                                "  else",
+                                "    echo \"No RG found for env '$ENV_NAME' (neither by tag nor by convention 'rg-$ENV_NAME')\"",
+                                "    exit 0",
+                                "  fi",
+                                "else",
+                                "  echo \"Found RG by tag: $RG\"",
+                                "fi",
+                                "azd env set AZURE_RESOURCE_GROUP \"$RG\" 2>/dev/null || true",
+                                "echo \"AutoPatch:resolve-rg-from-tag done — AZURE_RESOURCE_GROUP=$RG\"",
+                            });
+                            var rgB64 = Convert.ToBase64String(
+                                System.Text.Encoding.UTF8.GetBytes(rgScript));
+                            var rgCmd =
+                                "bash -lc 'echo " + rgB64 + " | base64 -d | bash'";
+                            previousAttempts.Add(
+                                "[AutoPatch:resolve-rg-from-tag] agentic-azd-deploy could " +
+                                "not resolve resource group for env. Looked up the RG by " +
+                                "azd-env-name tag (and fell back to 'rg-<env>' convention) " +
+                                "and injected it into the azd env file so the next deploy " +
+                                "step can find it.");
+                            await Log(s, "status",
+                                "Auto-patch [AutoPatch:resolve-rg-from-tag]: resource " +
+                                "group not recorded in azd env. Querying Azure for the " +
+                                "RG tagged azd-env-name=<current env> and writing it " +
+                                "back via 'azd env set AZURE_RESOURCE_GROUP'.",
+                                step.Id);
+                            var rgStep = new DeploymentStep(
+                                step.Id,
+                                "AutoPatch: resolve AZURE_RESOURCE_GROUP from azd-env-name tag",
+                                rgCmd,
+                                step.WorkingDirectory,
+                                TimeSpan.FromMinutes(1));
+                            steps.Insert(i, rgStep);
+                            i--;
+                            continue;
+                        }
+
                         // ── AutoPatch:model-oscillation ──
                         // Detect when the Doctor oscillates between two
                         // model-related errors (e.g. SpecialFeatureOrQuotaIdRequired
