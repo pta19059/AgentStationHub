@@ -525,9 +525,54 @@ public sealed class DeploymentOrchestrator
             var (ok, reason) = PlanValidator.Validate(plan);
             if (!ok)
             {
-                s.ErrorMessage = reason;
-                await SetStatus(s, DeploymentStatus.Rejected);
-                return;
+                // One-shot re-plan: the Strategist sometimes emits a single
+                // problematic step (heavy nested quoting, banned binary,
+                // unsafe pattern). Killing the whole deploy on the first
+                // try is too harsh — feed the rejection reason back as a
+                // prior insight and ask the planner to try once more.
+                await Log(s, "warn",
+                    $"Plan rejected by validator: {reason}. Requesting one re-plan with feedback.");
+                var feedbackInsight = new AgentInsight(
+                    DateTimeOffset.UtcNow,
+                    s.RepoUrl,
+                    "plan.validator.rejection",
+                    $"PRIOR_VALIDATION_FAILURE: {reason} " +
+                    "DO NOT repeat this pattern. Prefer baked helpers " +
+                    "(agentic-azd-up, agentic-azd-deploy, agentic-acr-build, " +
+                    "agentic-npm-install, relocate-node-modules) and avoid " +
+                    "deeply nested bash -lc \"...\" payloads.",
+                    1.0);
+                try
+                {
+                    if (runnerHost is not null)
+                    {
+                        var retryInsights = _memory.GetRelevantInsights(s.RepoUrl)
+                            .Concat(new[] { feedbackInsight }).ToList();
+                        plan = await runnerHost.ExtractPlanAsync(
+                            imageToUse, s.RepoUrl, projectDir, s.AzureLocation,
+                            (lvl, line) => _ = Log(s, lvl, line),
+                            ct,
+                            retryInsights);
+                    }
+                    else
+                    {
+                        plan = await planner.ExtractAsync(
+                            s.RepoUrl, readme, infra, presentFiles, toolchain, ct);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    await Log(s, "err",
+                        $"Re-plan attempt failed: {ex.Message}.");
+                }
+                (ok, reason) = PlanValidator.Validate(plan);
+                if (!ok)
+                {
+                    s.ErrorMessage = reason;
+                    await SetStatus(s, DeploymentStatus.Rejected);
+                    return;
+                }
+                await Log(s, "info", "Re-plan accepted by validator.");
             }
 
             // Guarantee a FRESH resource group on every deploy.

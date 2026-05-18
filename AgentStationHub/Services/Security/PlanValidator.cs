@@ -41,9 +41,11 @@ public static class PlanValidator
     // Detects bash -lc "..." with an unbalanced number of unescaped
     // double quotes inside the string body, which is the LLM-quoting
     // failure mode that produced 'mkdir: cannot create directory' for
-    // an entire week. If we count more than ONE level of nested escape
-    // in a `bash -lc "..."` payload, we reject the step. The Strategist
-    // and Doctor are pushed toward baked helpers instead.
+    // an entire week. We use a generous threshold (>=8 escaped quotes)
+    // so the rule only fires on truly pathological multi-level
+    // nesting — moderately quote-heavy commands (e.g. az queries with
+    // a couple of inline strings) are allowed through, since they
+    // usually work fine when the Strategist emits them.
     private static (bool Ok, string? Reason) ValidateNoMultilevelQuoting(string cmd)
     {
         // Look for `bash -lc "..."` (or sh -c) and count `\"` escapes.
@@ -53,9 +55,9 @@ public static class PlanValidator
         int escapedQuotes = 0;
         for (int i = rest; i < cmd.Length - 1; i++)
             if (cmd[i] == '\\' && cmd[i + 1] == '"') escapedQuotes++;
-        if (escapedQuotes >= 4)
+        if (escapedQuotes >= 8)
             return (false,
-                "Multi-level quoting detected inside bash -lc \"...\" (>=4 escaped quotes). " +
+                "Multi-level quoting detected inside bash -lc \"...\" (>=8 escaped quotes). " +
                 "Use a baked helper (relocate-node-modules / agentic-*) or split the step.");
         return (true, null);
     }
