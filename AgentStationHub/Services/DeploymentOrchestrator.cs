@@ -4439,15 +4439,26 @@ public sealed class DeploymentOrchestrator
 
                                 if (fix is null)
                                 {
-                                    await Log(s, "err",
+                                    // Automatic fall-back to in-sandbox Doctor.
+                                    // The hosted Doctor frequently times out
+                                    // (HTTP 408) or fails to pull its image —
+                                    // failing the whole deploy in that case
+                                    // wastes the user's progress. The local
+                                    // Doctor is always available inside the
+                                    // sandbox and produces comparable
+                                    // remediations.
+                                    await Log(s, "warn",
                                         "[Foundry] hosted Doctor returned no " +
                                         "remediation (auth, HTTP, or agent " +
-                                        "image-pull failure). Fall-back is " +
-                                        "DISABLED — failing the step. Check " +
-                                        "the agent status in the Foundry " +
-                                        "portal or unset Foundry:UseFoundryDoctor " +
-                                        "to use the in-sandbox Doctor.",
-                                        step.Id);
+                                        "image-pull failure). Falling back to " +
+                                        "the in-sandbox Doctor.", step.Id);
+                                    fix = await runnerHost.RemediateAsync(
+                                        imageToUse, projectDir,
+                                        plan with { Steps = steps.ToList() },
+                                        step.Id, stepTail, previousAttempts,
+                                        (lvl, line) => _ = Log(s, lvl, line, step.Id),
+                                        ct,
+                                        _memory.GetRelevantInsights(s.RepoUrl));
                                 }
                             }
                             else

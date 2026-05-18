@@ -100,12 +100,17 @@ public sealed class SandboxSession : IAsyncDisposable
             // the container.
             "--dns", "1.1.1.1",
             "--dns", "8.8.8.8",
-            // Memory / swap — sized for large templates (GPT-RAG
-            // deploys ~15 ARM resources in parallel via Bicep; each
-            // holds state while azd coordinates them).
-            "--memory", "12g",
-            "--memory-swap", "24g",
-            "--memory-swappiness", "90",
+            // Memory / swap — sized to coexist on the 8 GB host VM
+            // alongside the always-on agentichub-app (~4 GB resident).
+            // Earlier values (12 g / 24 g) exceeded total host RAM and
+            // caused the kernel OOM-killer to terminate 'az' mid-
+            // provision (AzureCLICredential: signal: killed). With
+            // 3 g / 6 g the cgroup applies back-pressure inside the
+            // sandbox before the host runs out, and azd provision is
+            // mostly I/O bound so 3 g is sufficient.
+            "--memory", "3g",
+            "--memory-swap", "6g",
+            "--memory-swappiness", "60",
             // Workspace and DooD socket. Workspace mount comes from the
             // per-session named volume (preferred) or a host bind on
             // hosts where the volume couldn't be created � see
