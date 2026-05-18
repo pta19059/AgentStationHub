@@ -841,8 +841,12 @@ public sealed class PlanningTeam
          invent new strategies.)
 
           [DotnetSdkNotFound]
-            Cause: global.json pins SDK X, sandbox has only 8+9.
-            Fix:   bash -lc "sed -i 's/\"version\": \"[0-9.]*\"/\"version\": \"8.0.100\"/' /workspace/global.json"
+            Cause: global.json pins SDK X, sandbox has 8+9+10.
+            Fix:   PREFER rollForward over down-pinning.
+                   bash -lc "jq '.sdk.rollForward=\"latestMajor\"' /workspace/global.json > /tmp/g && mv /tmp/g /workspace/global.json"
+            DO NOT: down-pin to 8.0.100 if the project TargetFramework is
+                    net9.0 or net10.0 — you will get CS0117/CS0121/CS1061
+                    errors because the older SDK lacks newer BCL APIs.
             DO NOT: curl dotnet-install.sh into /workspace.
             DO NOT: remove UserSecretsId from csproj.
 

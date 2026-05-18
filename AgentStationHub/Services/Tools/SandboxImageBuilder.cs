@@ -112,16 +112,18 @@ public static class SandboxImageBuilder
     //             AI-assisted suggest/explain commands are available
     //             in sandbox shells. Auth is via GITHUB_TOKEN env var
     //             passed at container start (or `gh auth login`).
-    private const string LocalTag = "agentichub/sandbox:v41";
+    private const string LocalTag = "agentichub/sandbox:v42";
 
     // Azure Linux (Mariner)-based azure-cli is multi-arch and ships with bash
     // and curl. We install the system toolchain via tdnf (tar, git, python,
-    // jq, zip, unzip) plus .NET SDKs 8+9 (needed so azd's packaging phase
-    // can invoke dotnet user-secrets / restore / build without downloading
-    // an SDK at deploy time to a potentially read-only or noexec-mounted
-    // /workspace - we've hit both cases on arm64 Docker Desktop), then
-    // install Node.js 20 LTS and the Docker CLI from their official
-    // static distributions (multi-arch, pinned versions).
+    // jq, zip, unzip) plus .NET SDKs 8+9 (from tdnf) and 10 (from the
+    // official dotnet-install.sh because Azure Linux 3 doesn't yet have a
+    // dotnet-sdk-10.0 package). Having 10 in the sandbox is required for
+    // modern repos that pin global.json to 10.0.x (e.g. aliencube/open-chat-
+    // playground after the Nov 2025 .NET 10 update) — without it the
+    // Strategist used to down-pin to 8.0.100 and the build broke on .NET 10
+    // language features. Node.js 20 LTS and the Docker CLI come from their
+    // official static distributions (multi-arch, pinned versions).
     private const string Dockerfile =
         // CRITICAL: enables BuildKit heredoc support for `RUN cat > f <<'EOF'`.
         // Without this directive the legacy parser silently produces 0-byte
@@ -133,6 +135,18 @@ public static class SandboxImageBuilder
         "ARG TARGETARCH\n" +
         "RUN tdnf install -y tar ca-certificates git python3-pip jq zip unzip gawk sed grep coreutils " +
         "    dotnet-sdk-8.0 dotnet-sdk-9.0 && tdnf clean all\n" +
+        // .NET 10 SDK from the official installer. Azure Linux 3 doesn't
+        // ship a dotnet-sdk-10.0 tdnf package as of this image build, but
+        // modern repos increasingly require it (aliencube/open-chat-
+        // playground Nov 2025, dotnet/aspire previews, etc.). Installing
+        // into /usr/share/dotnet alongside the tdnf SDKs lets `dotnet`
+        // see all three (8, 9, 10) via the SDK resolver. The installer is
+        // multi-arch and resolves the channel internally.
+        "RUN curl -fsSL https://builds.dotnet.microsoft.com/dotnet/scripts/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && " +
+        "    chmod +x /tmp/dotnet-install.sh && " +
+        "    /tmp/dotnet-install.sh --channel 10.0 --install-dir /usr/share/dotnet --no-path && " +
+        "    rm /tmp/dotnet-install.sh && " +
+        "    dotnet --list-sdks\n" +
         // Node 22 LTS (Jod) from nodejs.org - platform-agnostic, pinned
         // version. Bumped from 20.18 → 22.12 because modern Azure samples
         // (azure-ai-travel-agents, agent-framework starter kits, several
