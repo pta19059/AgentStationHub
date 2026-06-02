@@ -56,3 +56,13 @@ docker-desktop-diagnostics/
 .azure
 sync.tar
 
+# ---- Local scratch / session & deploy artifacts (may leak IDs, IPs, tokens) -
+_*.json
+_q.py
+check_dll.py
+.tmp-*
+sync_err.txt
+body.json
+jit.json
+smoke-payload.json
+
